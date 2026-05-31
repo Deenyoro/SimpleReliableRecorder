@@ -1,0 +1,12 @@
+# SimpleReliableRecorder runtime + build dependencies.
+# Audio capture with system loopback (no virtual cable) plus numerics.
+soundcard>=0.4.2
+soundfile>=0.12.1
+numpy>=1.24
+# Screen capture monitor enumeration.
+screeninfo>=0.8.1
+# Process monitoring for the watchdog.
+psutil>=5.9
+# Packaging.
+pyinstaller>=6.0
+# (ffmpeg is bundled separately at build time, not via pip.)
