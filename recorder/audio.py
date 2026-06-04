@@ -136,7 +136,7 @@ class CaptureSource:
 
     def __init__(self, label, device_id, kind, capture_channels,
                  samplerate=DEFAULT_TARGET_SR, hostapi="", gain=1.0, name="",
-                 track_name=""):
+                 track_name="", muted=False):
         self.label = label
         self.device_id = device_id
         self.kind = kind  # "input" | "loopback"
@@ -148,9 +148,12 @@ class CaptureSource:
         # Short, clean, file-safe role name (e.g. "mic-1", "playback-1"). Set by
         # the caller so output files are readable rather than the raw device id.
         self.track_name = track_name
+        # When muted, the capture loop writes silence for this device so the
+        # track stays continuous and in sync; the file keeps growing.
+        self.muted = bool(muted)
 
     @classmethod
-    def from_device(cls, dev, gain=1.0, track_name=""):
+    def from_device(cls, dev, gain=1.0, track_name="", muted=False):
         ch = min(2, int(dev.get("channels", 2) or 2)) or 1
         return cls(
             label=cls.make_label(dev["name"], dev["kind"]),
@@ -162,6 +165,7 @@ class CaptureSource:
             gain=gain,
             name=dev["name"],
             track_name=track_name,
+            muted=muted,
         )
 
     @staticmethod
@@ -231,8 +235,11 @@ class LevelMonitor:
                     data = rec.record(numframes=frames)
                     if data is None or not len(data):
                         continue
-                    mono = _to_mono(np.asarray(data)) * src.gain
-                    peak = float(np.max(np.abs(mono))) if mono.size else 0.0
+                    if src.muted:
+                        peak = 0.0
+                    else:
+                        mono = _to_mono(np.asarray(data)) * src.gain
+                        peak = float(np.max(np.abs(mono))) if mono.size else 0.0
                     with self._lock:
                         self._levels[src.label] = peak
         except Exception as e:
@@ -246,6 +253,11 @@ class LevelMonitor:
         for s in self.sources:
             if s.label == label:
                 s.gain = float(gain)
+
+    def set_muted(self, label, muted):
+        for s in self.sources:
+            if s.label == label:
+                s.muted = bool(muted)
 
     def stop(self):
         self.running = False
@@ -276,6 +288,8 @@ class AudioRecorder:
         self.recording = False
         self._threads = []
         self.output_files = []
+        self._writers = []          # live SafeWavWriter refs (for segment paths)
+        self._writers_lock = threading.Lock()
 
         self._status_lock = threading.Lock()
         self._stats = {s.label: {
@@ -310,6 +324,14 @@ class AudioRecorder:
             if s.label == label:
                 s.gain = float(gain)
 
+    def set_muted(self, label, muted):
+        """Mute/unmute a device live. Muted devices write silence to keep the
+        track continuous and in sync."""
+        for s in self.sources:
+            if s.label == label:
+                s.muted = bool(muted)
+                log.info("Device %s %s", label, "muted" if muted else "unmuted")
+
     def _set_error(self, label, reason):
         with self._status_lock:
             if label in self._stats:
@@ -321,6 +343,11 @@ class AudioRecorder:
                 self.on_error(label, reason)
             except Exception:
                 log.exception("on_error callback raised")
+
+    def _clear_error(self, label):
+        with self._status_lock:
+            if label in self._stats:
+                self._stats[label]["error"] = None
 
     def _apply_gain(self, data, gain):
         if gain == 1.0:
@@ -369,37 +396,82 @@ class AudioRecorder:
             self._threads.append(t)
 
     def _capture_separate(self, src, path):
+        """Capture one device to its own WAV, surviving transient device errors.
+
+        The writer is opened once and kept alive for the whole take. If the audio
+        stream throws (device unplugged/invalidated/format change), we keep the
+        file open, fill the gap with silence so the timeline stays correct, and
+        retry opening the device until it returns or recording stops. This means
+        a glitched mic no longer kills the track for the rest of the recording.
+        """
         frames = max(256, int(self.target_sr * 0.05))
         writer = None
         try:
-            mic = src.get_microphone()
-            with mic.recorder(samplerate=self.target_sr,
-                              channels=src.capture_channels, blocksize=frames) as rec:
-                writer = SafeWavWriter(path, self.target_sr, src.capture_channels,
-                                       subtype=self.subtype,
-                                       flush_interval=self.flush_seconds)
-                log.info("Writing %s (%d ch @ %d Hz, %s, crash-safe)", path,
-                         src.capture_channels, self.target_sr, self.subtype)
-                with self._status_lock:
-                    self._stats[src.label]["active"] = True
-                while self.recording:
-                    data = np.asarray(rec.record(numframes=frames))
-                    if not len(data):
-                        continue
-                    data = self._apply_gain(data, src.gain)
-                    self._record_peak(src.label, _to_mono(data))
-                    writer.write(data)
-                    self._note_progress(src.label, len(data))
+            writer = SafeWavWriter(
+                path, self.target_sr, src.capture_channels, subtype=self.subtype,
+                flush_interval=self.flush_seconds,
+                on_error=lambda why, lbl=src.label: self._set_error(lbl, why))
+            with self._writers_lock:
+                self._writers.append(writer)
+            log.info("Writing %s (%d ch @ %d Hz, %s, crash-safe)", path,
+                     src.capture_channels, self.target_sr, self.subtype)
+            attempt = 0
+            while self.recording:
+                try:
+                    mic = src.get_microphone()
+                    with mic.recorder(samplerate=self.target_sr,
+                                      channels=src.capture_channels,
+                                      blocksize=frames) as rec:
+                        if attempt > 0:
+                            log.info("Device reconnected [%s]", src.label)
+                            self._clear_error(src.label)
+                        attempt = 0
+                        with self._status_lock:
+                            self._stats[src.label]["active"] = True
+                        while self.recording:
+                            data = np.asarray(rec.record(numframes=frames))
+                            if not len(data):
+                                continue
+                            if src.muted:
+                                data = np.zeros_like(data)
+                            else:
+                                data = self._apply_gain(data, src.gain)
+                            self._record_peak(src.label, _to_mono(data))
+                            writer.write(data)
+                            self._note_progress(src.label, len(data))
+                            with self._status_lock:
+                                self._stats[src.label]["last_write"] = time.monotonic()
+                except Exception as e:
+                    if not self.recording:
+                        break
+                    attempt += 1
                     with self._status_lock:
-                        self._stats[src.label]["last_write"] = time.monotonic()
+                        self._stats[src.label]["active"] = False
+                        self._stats[src.label]["xruns"] += 1
+                    self._set_error(src.label,
+                                    f"device error (reconnecting): {e}")
+                    log.warning("Capture stream lost [%s] attempt %d: %s",
+                                src.label, attempt, e)
+                    # Keep the timeline aligned: write ~0.5s of silence per retry
+                    # so all tracks stay the same length while this one recovers.
+                    self._write_silence(writer, src, 0.5)
+                    time.sleep(0.5)
         except Exception as e:
-            self._set_error(src.label, f"capture/writer failed: {e}")
+            self._set_error(src.label, f"writer failed: {e}")
         finally:
             if writer is not None:
                 writer.close()
             with self._status_lock:
                 if src.label in self._stats:
                     self._stats[src.label]["active"] = False
+
+    def _write_silence(self, writer, src, seconds):
+        try:
+            n = int(self.target_sr * seconds)
+            if n > 0:
+                writer.write(np.zeros((n, src.capture_channels), dtype=np.float32))
+        except Exception:
+            pass
 
     # ---- channels / mixed mode ------------------------------------------ #
     def _start_combined(self):
@@ -423,26 +495,53 @@ class AudioRecorder:
 
     def _capture_buffer(self, src):
         frames = max(256, int(self.target_sr * 0.05))
+        attempt = 0
         try:
-            mic = src.get_microphone()
-            with mic.recorder(samplerate=self.target_sr,
-                              channels=src.capture_channels, blocksize=frames) as rec:
-                with self._status_lock:
-                    self._stats[src.label]["active"] = True
-                while self.recording:
-                    data = np.asarray(rec.record(numframes=frames))
-                    if not len(data):
-                        continue
-                    mono = _to_mono(data) * src.gain
-                    if src.gain != 1.0:
-                        mono = np.clip(mono, -1.0, 1.0)
-                    self._record_peak(src.label, mono)
+            while self.recording:
+                try:
+                    mic = src.get_microphone()
+                    with mic.recorder(samplerate=self.target_sr,
+                                      channels=src.capture_channels,
+                                      blocksize=frames) as rec:
+                        if attempt > 0:
+                            log.info("Device reconnected [%s]", src.label)
+                            self._clear_error(src.label)
+                        attempt = 0
+                        with self._status_lock:
+                            self._stats[src.label]["active"] = True
+                        while self.recording:
+                            data = np.asarray(rec.record(numframes=frames))
+                            if not len(data):
+                                continue
+                            if src.muted:
+                                mono = np.zeros(len(data), dtype=np.float32)
+                            else:
+                                mono = _to_mono(data) * src.gain
+                                if src.gain != 1.0:
+                                    mono = np.clip(mono, -1.0, 1.0)
+                            self._record_peak(src.label, mono)
+                            with self._buf_lock:
+                                self._buffers[src.label] = np.concatenate(
+                                    (self._buffers[src.label], mono))
+                            self._note_progress(src.label, len(data))
+                except Exception as e:
+                    if not self.recording:
+                        break
+                    attempt += 1
+                    with self._status_lock:
+                        self._stats[src.label]["active"] = False
+                        self._stats[src.label]["xruns"] += 1
+                    self._set_error(src.label,
+                                    f"device error (reconnecting): {e}")
+                    log.warning("Capture stream lost [%s] attempt %d: %s",
+                                src.label, attempt, e)
+                    # Push silence into the buffer so the combiner keeps this
+                    # channel aligned with the others while the device recovers.
                     with self._buf_lock:
                         self._buffers[src.label] = np.concatenate(
-                            (self._buffers[src.label], mono))
-                    self._note_progress(src.label, len(data))
-        except Exception as e:
-            self._set_error(src.label, f"capture failed: {e}")
+                            (self._buffers[src.label],
+                             np.zeros(int(self.target_sr * 0.5), dtype=np.float32)))
+                    time.sleep(0.5)
         finally:
             with self._status_lock:
                 if src.label in self._stats:
@@ -453,8 +552,12 @@ class AudioRecorder:
         max_wait = 0.25
         f = None
         try:
+            lbl0 = self.sources[0].label if self.sources else "combiner"
             f = SafeWavWriter(path, self.target_sr, n_ch, subtype=self.subtype,
-                              flush_interval=self.flush_seconds)
+                              flush_interval=self.flush_seconds,
+                              on_error=lambda why: self._set_error(lbl0, why))
+            with self._writers_lock:
+                self._writers.append(f)
             log.info("Writing combined %s (%d ch @ %d Hz, %s, crash-safe)", path,
                      n_ch, self.target_sr, self.subtype)
             last_progress = time.monotonic()
@@ -507,13 +610,28 @@ class AudioRecorder:
             if f is not None:
                 f.close()
 
+    def all_output_files(self):
+        """Every file actually written, including rollover segments (_part2 ...)."""
+        files = []
+        with self._writers_lock:
+            for wf in self._writers:
+                for p in getattr(wf, "paths", []):
+                    if p not in files:
+                        files.append(p)
+        # Fall back to the planned base paths if no writer registered yet.
+        for p in self.output_files:
+            if p not in files:
+                files.append(p)
+        return files
+
     def stop(self):
         if not self.recording:
-            return self.output_files
+            return self.all_output_files()
         log.info("Stopping audio recording...")
         self.recording = False
         for t in self._threads:
             t.join(timeout=6.0)
-        log.info("Audio recording stopped. Files: %s", self.output_files)
+        files = self.all_output_files()
+        log.info("Audio recording stopped. Files: %s", files)
         self._start_time = 0.0
-        return self.output_files
+        return files

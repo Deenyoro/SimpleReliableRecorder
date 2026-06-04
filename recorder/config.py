@@ -23,10 +23,27 @@ DEFAULTS = {
     "audio_output_mode": "separate",
     "audio_target_samplerate": 48000,
     "audio_subtype": "PCM_16",  # PCM_16 (universal) | FLOAT (lossless, no clipping)
-    # Per-device gain, keyed by "<name> [<kind>]". 1.0 = unity.
+    # Per-device gain, keyed by "<name>|<kind>". 1.0 = unity.
     "audio_gains": {},
+    # Per-device mute state, keyed by "<name>|<kind>". True = muted (writes silence).
+    "audio_mutes": {},
     # Show live OBS-style level meters on the device rows (idle + recording).
     "live_levels": True,
+
+    # --- system tray ---
+    "tray_enabled": True,         # show a tray icon (red while recording)
+
+    # --- push to talk / push to mute hotkey ---
+    # hotkey is a single key/combo string understood by the `keyboard` library,
+    # e.g. "f8", "ctrl+space". Empty = disabled.
+    "ptt_enabled": False,
+    "ptt_hotkey": "",
+    # which device the hotkey controls, keyed by "<name>|<kind>"; empty = all mics.
+    "ptt_target": "",
+    # "ptt" (push to talk: held = unmuted, released = muted),
+    # "ptm" (push to mute: held = muted, released = unmuted),
+    # "toggle" (each press flips mute).
+    "ptt_mode": "ptt",
 
     # --- screen ---
     "screen_enabled": False,
@@ -44,6 +61,13 @@ DEFAULTS = {
     # --- output location ---
     "save_folder": "",            # empty => default Videos\SimpleReliableRecorder
     "ask_every_time": False,
+
+    # --- recordings library ---
+    # Persistent list of finished recordings so you can keep recording without
+    # closing the app and combine several into one file later. Each entry:
+    # {name, out_dir, audio:[paths], video:path|"", created:iso}. Entries whose
+    # files were moved/deleted are pruned automatically on load.
+    "recordings": [],
 
     # --- combine ---
     "auto_combine": False,

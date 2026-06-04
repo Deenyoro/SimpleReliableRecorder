@@ -14,7 +14,8 @@ import tkinter as tk
 from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
-from recorder import alerts, combine, ffmpeg_tools, paths, screen as screenmod, watchdog
+from recorder import (alerts, combine, ffmpeg_tools, hotkeys, library, paths,
+                      screen as screenmod, tray, watchdog)
 from recorder.audio import (AudioRecorder, CaptureSource, LevelMonitor,
                             default_devices, list_devices, resolve_selection)
 from recorder.config import ConfigManager
@@ -68,6 +69,29 @@ class App(tk.Tk):
         self.all_devices = self.inputs + self.outputs
         self.encoders = ffmpeg_tools.probe_encoders()
 
+        # Recordings library: prune entries whose files were moved/deleted, keep
+        # the rest so the user can combine past takes without reopening the app.
+        self._library, _pruned = library.prune(self.cfg.get("recordings") or [])
+        # Back-fill recordings that exist on disk but predate the library (or
+        # were made by an older build) by scanning the save folder.
+        try:
+            known_dirs = {e.get("out_dir") for e in self._library}
+            discovered = library.scan_folder(
+                self.cfg.resolved_save_folder(), existing_dirs=known_dirs)
+            if discovered:
+                # Oldest first so newest-first display stays chronological.
+                discovered.sort(key=lambda e: e.get("created", ""))
+                self._library.extend(discovered)
+                _pruned = True
+                log.info("Imported %d existing recording(s) into the library.",
+                         len(discovered))
+        except Exception as e:
+            log.warning("Library scan skipped: %s", e)
+        if _pruned:
+            self.cfg.set("recordings", self._library)
+        self._lib_rows = []
+        self._lib_seq = len(self._library)
+
         # recording state
         self.audio_rec = None
         self.screen_rec = None
@@ -83,18 +107,88 @@ class App(tk.Tk):
         self._device_rows = []
         self.level_monitor = None
         self._save_job = None
+        self._combine_busy = False
 
         self.settings_win = None
+        self.tray = None
+        self.hotkeys = None
         self._make_vars()
         self._build_ui()
         install_inapp_handler(self._enqueue_log)
         self._restore_from_config()
         self._refresh_monitor()
+        self._setup_tray()
+        self._setup_hotkeys()
         self._poll()
         self._meter_loop()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         log.info("GUI ready. %d devices, encoders=%s", len(self.all_devices),
                  self.encoders)
+
+    # ------------------------------------------------------- tray + hotkeys #
+    def _setup_tray(self):
+        if not self.tray_var.get():
+            return
+        self.tray = tray.TrayIcon(
+            on_show=lambda: self.after(0, self._show_window),
+            on_toggle_record=lambda: self.after(0, self._toggle_record),
+            on_quit=lambda: self.after(0, self.on_close),
+            is_recording=lambda: self.recording)
+        self.tray.start()
+
+    def _show_window(self):
+        try:
+            self.deiconify()
+            self.state("normal")
+            self.lift()
+            self.focus_force()
+        except Exception:
+            pass
+
+    def _setup_hotkeys(self):
+        self.hotkeys = hotkeys.HotkeyManager(
+            on_mute_change=lambda target, muted:
+            self.after(0, lambda: self._apply_hotkey_mute(target, muted)))
+        self._reconfigure_hotkeys()
+
+    def _reconfigure_hotkeys(self):
+        if not self.hotkeys:
+            return
+        self.hotkeys.configure(
+            enabled=self.ptt_enabled_var.get(),
+            hotkey=self.ptt_hotkey_var.get().strip(),
+            mode=self.ptt_mode_var.get(),
+            target=self.ptt_target_var.get())
+
+    def _apply_hotkey_mute(self, target, muted):
+        """Mute/unmute the hotkey's target device(s). Empty target = all mics."""
+        for row in self._device_rows:
+            d = row.get_selection()
+            if not d:
+                continue
+            key = f'{d["name"]}|{d["kind"]}'
+            is_target = (target == key) if target else (d["kind"] == "input")
+            if is_target:
+                row.set_muted(muted, notify=True)
+
+    def _populate_ptt_devices(self):
+        """Fill the push-to-talk device dropdown. Maps a friendly label to the
+        '<name>|<kind>' key stored in config; blank = all microphones."""
+        self._ptt_keymap = {"All microphones": ""}
+        values = ["All microphones"]
+        for d in self.all_devices:
+            label = f'{d["name"]} [{d["kind"]}]'
+            key = f'{d["name"]}|{d["kind"]}'
+            self._ptt_keymap[label] = key
+            values.append(label)
+        self.ptt_device_combo["values"] = values
+        cur = self.ptt_target_var.get()
+        match = next((lbl for lbl, k in self._ptt_keymap.items() if k == cur), None)
+        self.ptt_device_combo.set(match or "All microphones")
+
+    def _on_ptt_device_pick(self):
+        label = self.ptt_device_combo.get()
+        self.ptt_target_var.set(self._ptt_keymap.get(label, ""))
 
     # ------------------------------------------------------------------ UI #
     def _make_vars(self):
@@ -121,15 +215,25 @@ class App(tk.Tk):
         self.banner_var = tk.BooleanVar(value=cfg.get("alert_banner"))
         self.taskbar_var = tk.BooleanVar(value=cfg.get("alert_taskbar_flash"))
         self.msgbox_var = tk.BooleanVar(value=cfg.get("alert_messagebox"))
+        self.tray_var = tk.BooleanVar(value=cfg.get("tray_enabled"))
+        self.ptt_enabled_var = tk.BooleanVar(value=cfg.get("ptt_enabled"))
+        self.ptt_hotkey_var = tk.StringVar(value=cfg.get("ptt_hotkey"))
+        self.ptt_target_var = tk.StringVar(value=cfg.get("ptt_target"))
+        self.ptt_mode_var = tk.StringVar(value=cfg.get("ptt_mode"))
         for v in (self.live_levels_var, self.output_mode, self.subtype,
                   self.screen_enabled, self.monitor_var, self.encoder_var,
                   self.container_var, self.codec_var, self.fps_var,
                   self.quality_var, self.reliability_var, self.folder_var,
                   self.ask_var, self.on_stop_var, self.autorestart_var,
                   self.watchdog_var, self.sound_var, self.banner_var,
-                  self.taskbar_var, self.msgbox_var):
+                  self.taskbar_var, self.msgbox_var, self.tray_var,
+                  self.ptt_enabled_var, self.ptt_hotkey_var,
+                  self.ptt_target_var, self.ptt_mode_var):
             v.trace_add("write", lambda *a: self._save_settings())
         self.live_levels_var.trace_add("write", lambda *a: self._refresh_monitor())
+        for v in (self.ptt_enabled_var, self.ptt_hotkey_var,
+                  self.ptt_target_var, self.ptt_mode_var):
+            v.trace_add("write", lambda *a: self._reconfigure_hotkeys())
 
     def _build_ui(self):
         root = ttk.Frame(self, style="TFrame")
@@ -160,6 +264,7 @@ class App(tk.Tk):
 
         self._build_record(right)
         self._build_combine(right)
+        self._build_library(right)
         self._build_log(right)
 
         self.banner = GoldBanner(self, on_ack=self._dismiss_alert,
@@ -319,6 +424,44 @@ class App(tk.Tk):
         ttk.Combobox(f2, textvariable=self.on_stop_var, width=10, state="readonly",
                      values=["ask", "combine", "separate"]).pack(side="left")
 
+        # --- System tray ---
+        tsec = self._section(p, "System tray")
+        ToggleSwitch(tsec, self.tray_var,
+                     text="Show a tray icon (turns red while recording)").pack(
+            anchor="w", pady=3)
+        ttk.Label(tsec, text="Takes effect on next launch.",
+                  style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+
+        # --- Push to talk / push to mute ---
+        psec = self._section(p, "Push to talk / push to mute hotkey")
+        ToggleSwitch(psec, self.ptt_enabled_var,
+                     text="Enable a global hotkey that mutes/unmutes a device").pack(
+            anchor="w", pady=3)
+        pr = ttk.Frame(psec, style="TFrame")
+        pr.pack(fill="x", pady=(8, 0))
+        ttk.Label(pr, text="Hotkey:").pack(side="left")
+        ttk.Entry(pr, textvariable=self.ptt_hotkey_var, width=14).pack(
+            side="left", padx=6)
+        ttk.Label(pr, text="e.g. f8, ctrl+space", style="Muted.TLabel").pack(
+            side="left")
+        pr2 = ttk.Frame(psec, style="TFrame")
+        pr2.pack(fill="x", pady=(8, 0))
+        ttk.Label(pr2, text="Mode:").pack(side="left")
+        ttk.Combobox(pr2, textvariable=self.ptt_mode_var, width=8, state="readonly",
+                     values=["ptt", "ptm", "toggle"]).pack(side="left", padx=6)
+        ttk.Label(pr2, text="Device:").pack(side="left", padx=(10, 0))
+        self.ptt_device_combo = ttk.Combobox(pr2, width=30, state="readonly")
+        self.ptt_device_combo.pack(side="left", padx=6)
+        self._populate_ptt_devices()
+        self.ptt_device_combo.bind("<<ComboboxSelected>>",
+                                   lambda e: self._on_ptt_device_pick())
+        ttk.Label(psec,
+                  text="ptt = hold to talk (released = muted).  "
+                  "ptm = hold to mute.  toggle = press to flip.  "
+                  "Device blank = all microphones.",
+                  style="Muted.TLabel", wraplength=560, justify="left").pack(
+            anchor="w", pady=(6, 0))
+
         # --- Resilience ---
         rsec = self._section(p, "Resilience")
         ToggleSwitch(rsec, self.autorestart_var,
@@ -381,6 +524,201 @@ class App(tk.Tk):
         ttk.Button(inner, text="Open recording folder",
                    command=self._open_output).pack(anchor="w", pady=(8, 0))
 
+    # ----------------------------------------------------- recordings library #
+    def _build_library(self, parent):
+        inner = self._section(parent, "Recordings library")
+        ttk.Label(inner,
+                  text="Past recordings stay listed here so you can keep "
+                  "recording, then tick any and merge them into one file later. "
+                  "Right-click a recording to rename its folder (still tracked). "
+                  "Entries whose files are moved are removed automatically.",
+                  style="Muted.TLabel", wraplength=360, justify="left").pack(
+            anchor="w")
+        self.lib_holder = ScrollFrame(inner)
+        self.lib_holder.configure(height=150)
+        self.lib_holder.pack(fill="x", pady=(8, 0))
+        self.lib_body = self.lib_holder.body
+        self.lib_empty = ttk.Label(inner, text="No saved recordings yet.",
+                                   style="Muted.TLabel")
+        self.lib_empty.pack(anchor="w", pady=(4, 0))
+
+        b = ttk.Frame(inner, style="TFrame")
+        b.pack(fill="x", pady=(8, 0))
+        self.lib_combine_btn = ttk.Button(
+            b, text="Merge selected into one file",
+            command=self._combine_selected_library, state="disabled")
+        self.lib_combine_btn.pack(fill="x", pady=2)
+        b2 = ttk.Frame(inner, style="TFrame")
+        b2.pack(fill="x", pady=(2, 0))
+        ttk.Button(b2, text="Open folder", width=12,
+                   command=self._open_selected_library).pack(side="left")
+        ttk.Button(b2, text="Remove", width=10,
+                   command=self._remove_selected_library).pack(side="left", padx=6)
+        ttk.Button(b2, text="Refresh", width=10,
+                   command=lambda: self._refresh_library(rescan=True)).pack(side="right")
+        self._refresh_library()
+
+    def _add_to_library(self):
+        audio = [a for a in (self.last_outputs.get("audio") or [])
+                 if a and os.path.isfile(a)]
+        video = self.last_outputs.get("video") or ""
+        if not os.path.isfile(video):
+            video = ""
+        if not audio and not video:
+            return
+        self._lib_seq += 1
+        entry = library.make_entry(
+            entry_id=f"rec{self._lib_seq}-{int(self._record_start_mono)}",
+            name=getattr(self, "_session_base", "recording"),
+            out_dir=self.last_outputs.get("out_dir", ""),
+            audio=audio, video=video,
+            created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self._library.append(entry)
+        self.cfg.set("recordings", self._library)
+        self._refresh_library()
+
+    def _refresh_library(self, rescan=False):
+        # Prune anything whose files vanished, then rebuild the checklist.
+        self._library, pruned = library.prune(self._library)
+        if rescan:
+            try:
+                known = {e.get("out_dir") for e in self._library}
+                found = library.scan_folder(self.cfg.resolved_save_folder(),
+                                            existing_dirs=known)
+                if found:
+                    found.sort(key=lambda e: e.get("created", ""))
+                    self._library.extend(found)
+                    pruned = True
+            except Exception as e:
+                log.warning("Library rescan failed: %s", e)
+        if pruned:
+            self.cfg.set("recordings", self._library)
+        for r in self._lib_rows:
+            try:
+                r["frame"].destroy()
+            except Exception:
+                pass
+        self._lib_rows = []
+        for e in reversed(self._library):  # newest first
+            row = ttk.Frame(self.lib_body, style="Card.TFrame", padding=6)
+            row.pack(fill="x", pady=2)
+            var = tk.BooleanVar(value=False)
+            cb = ToggleSwitch(row, var,
+                              text=f'{e["name"]}  ({library.summarize(e)})')
+            cb.pack(anchor="w")
+            # Right-click a row to rename its folder (tracked automatically).
+            for w in (row, cb, getattr(cb, "label", None), getattr(cb, "canvas", None)):
+                if w is not None:
+                    w.bind("<Button-3>", lambda ev, ent=e: self._rename_entry(ent))
+            self._lib_rows.append({"frame": row, "var": var, "entry": e})
+        has = bool(self._library)
+        self.lib_empty.pack_forget() if has else self.lib_empty.pack(
+            anchor="w", pady=(4, 0))
+        self.lib_combine_btn.config(state=("normal" if has else "disabled"))
+
+    def _selected_library_entries(self):
+        return [r["entry"] for r in self._lib_rows if r["var"].get()]
+
+    def _combine_selected_library(self):
+        sel = self._selected_library_entries()
+        if not sel:
+            messagebox.showinfo("Merge recordings",
+                                "Tick at least one recording to merge.")
+            return
+        any_video = any(e.get("video") for e in sel)
+        include_video = False
+        if any_video:
+            if all(e.get("video") for e in sel):
+                include_video = messagebox.askyesno(
+                    "Include video?",
+                    "All selected recordings have video.\n\n"
+                    "Yes = one combined VIDEO file with sound.\n"
+                    "No = one combined AUDIO file only.")
+            else:
+                messagebox.showinfo(
+                    "Audio only",
+                    "Not every selected recording has video, so they will be "
+                    "merged into one audio file.")
+        ext = self.container_var.get() if include_video else "wav"
+        out_dir = sel[0].get("out_dir") or self.cfg.resolved_save_folder()
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out = os.path.join(out_dir, f"SRR_merged_{stamp}.{ext}")
+        sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
+                    for e in sel]
+        self._run_combine(
+            lambda: combine.concat_sessions(sessions, out, include_video), out)
+
+    def _open_selected_library(self):
+        sel = self._selected_library_entries()
+        target = sel[0] if sel else (self._library[-1] if self._library else None)
+        if not target:
+            return
+        d = target.get("out_dir") or ""
+        try:
+            if d and os.path.isdir(d):
+                os.startfile(d)
+        except Exception as e:
+            log.warning("open library folder failed: %s", e)
+
+    def _remove_selected_library(self):
+        sel = self._selected_library_entries()
+        if not sel:
+            return
+        if not messagebox.askyesno(
+                "Remove from list",
+                f"Remove {len(sel)} entr" + ("y" if len(sel) == 1 else "ies")
+                + " from the list?\n\nThis does NOT delete the files on disk."):
+            return
+        sel_ids = {e["id"] for e in sel}
+        self._library = [e for e in self._library if e["id"] not in sel_ids]
+        self.cfg.set("recordings", self._library)
+        self._refresh_library()
+
+    def _rename_entry(self, entry):
+        """Rename a recording's folder on disk via right-click, keeping all of
+        the library's tracked paths pointing at the new location."""
+        from tkinter import simpledialog
+        old_dir = entry.get("out_dir") or ""
+        if not old_dir or not os.path.isdir(old_dir):
+            messagebox.showinfo("Rename", "This recording's folder no longer exists.")
+            self._refresh_library()
+            return
+        parent_dir = os.path.dirname(old_dir)
+        current = os.path.basename(old_dir)
+        new_name = simpledialog.askstring(
+            "Rename recording",
+            "New folder name:", initialvalue=current, parent=self)
+        if not new_name:
+            return
+        # Sanitize to a safe folder name.
+        safe = "".join(c for c in new_name if c.isalnum() or c in " -_.()").strip()
+        if not safe or safe == current:
+            return
+        new_dir = os.path.join(parent_dir, safe)
+        if os.path.exists(new_dir):
+            messagebox.showerror("Rename", f"A folder named '{safe}' already exists.")
+            return
+        try:
+            os.rename(old_dir, new_dir)
+        except Exception as e:
+            messagebox.showerror("Rename failed",
+                                 f"Could not rename the folder:\n{e}")
+            return
+        # Remap every tracked path from old_dir -> new_dir for this entry.
+        def remap(p):
+            if p and os.path.commonpath([os.path.abspath(p), os.path.abspath(old_dir)]) \
+                    == os.path.abspath(old_dir):
+                return os.path.join(new_dir, os.path.relpath(p, old_dir))
+            return p
+        entry["out_dir"] = new_dir
+        entry["name"] = safe
+        entry["audio"] = [remap(a) for a in entry.get("audio", [])]
+        if entry.get("video"):
+            entry["video"] = remap(entry["video"])
+        self.cfg.set("recordings", self._library)
+        self._refresh_library()
+        log.info("Renamed recording folder -> %s", new_dir)
+
     def _build_log(self, parent):
         inner = self._section(parent, "Live log")
         self.log_text = tk.Text(inner, height=16, bg="#141414", fg="#d0d0d0",
@@ -415,16 +753,19 @@ class App(tk.Tk):
 
     def _save_settings(self):
         self._save_job = None
-        sels, gains = [], {}
+        sels, gains, mutes = [], {}, {}
         for row in self._device_rows:
             d = row.get_selection()
             if d:
                 sels.append({"id": d.get("id", ""), "name": d["name"],
                              "kind": d["kind"], "hostapi": d["hostapi"]})
-                gains[f'{d["name"]}|{d["kind"]}'] = round(row.get_gain(), 3)
+                key = f'{d["name"]}|{d["kind"]}'
+                gains[key] = round(row.get_gain(), 3)
+                mutes[key] = row.is_muted()
         self.cfg.update({
             "audio_sources": sels,
             "audio_gains": gains,
+            "audio_mutes": mutes,
             "live_levels": self.live_levels_var.get(),
             "audio_output_mode": self.output_mode.get(),
             "audio_subtype": self.subtype.get(),
@@ -445,6 +786,11 @@ class App(tk.Tk):
             "alert_taskbar_flash": self.taskbar_var.get(),
             "alert_messagebox": self.msgbox_var.get(),
             "watchdog_enabled": self.watchdog_var.get(),
+            "tray_enabled": self.tray_var.get(),
+            "ptt_enabled": self.ptt_enabled_var.get(),
+            "ptt_hotkey": self.ptt_hotkey_var.get().strip(),
+            "ptt_target": self.ptt_target_var.get(),
+            "ptt_mode": self.ptt_mode_var.get(),
         })
 
     # ------------------------------------------------------------- devices #
@@ -454,10 +800,16 @@ class App(tk.Tk):
         gains = self.cfg.get("audio_gains") or {}
         return float(gains.get(f'{preset.get("name")}|{preset.get("kind")}', 1.0))
 
+    def _muted_for(self, preset):
+        if not preset:
+            return False
+        mutes = self.cfg.get("audio_mutes") or {}
+        return bool(mutes.get(f'{preset.get("name")}|{preset.get("kind")}', False))
+
     def _add_row(self, preset=None):
         row = DeviceRow(self.rows_frame, self.all_devices, self._remove_row,
                         on_change=self._on_row_change, preset=preset,
-                        gain=self._gain_for(preset))
+                        gain=self._gain_for(preset), muted=self._muted_for(preset))
         row.pack(fill="x", pady=3)
         self._device_rows.append(row)
         row.combo.bind("<<ComboboxSelected>>",
@@ -475,6 +827,15 @@ class App(tk.Tk):
                 elif self.level_monitor:
                     self.level_monitor.set_gain(label, g)
             self._request_save()
+        elif what == "mute":
+            label = row.current_source_label()
+            m = row.is_muted()
+            if label:
+                if self.recording and self.audio_rec:
+                    self.audio_rec.set_muted(label, m)
+                if self.level_monitor:
+                    self.level_monitor.set_muted(label, m)
+            self._save_settings()
         else:
             self._save_settings()
             self._refresh_monitor()
@@ -639,7 +1000,8 @@ class App(tk.Tk):
             role = "mic" if d["kind"] == "input" else "playback"
             track_name = f"{role}-{counts[d['kind']]}"
             sources.append(CaptureSource.from_device(
-                d, gain=row.get_gain(), track_name=track_name))
+                d, gain=row.get_gain(), track_name=track_name,
+                muted=row.is_muted()))
         return sources
 
     def start_recording(self):
@@ -660,6 +1022,29 @@ class App(tk.Tk):
             out_dir = d
         else:
             out_dir = self.cfg.resolved_save_folder()
+        # Refuse to start on a near-full disk - the worst time to discover it is
+        # mid-recording. Warn (but allow) under 2 GB free.
+        try:
+            import shutil as _sh
+            free_gb = _sh.disk_usage(out_dir if os.path.isdir(out_dir)
+                                     else os.path.dirname(out_dir) or ".").free / 1e9
+            if free_gb < 0.5:
+                messagebox.showerror(
+                    "Not enough disk space",
+                    f"Only {free_gb:.1f} GB free where recordings are saved.\n"
+                    "Free up space or choose another folder before recording.")
+                self._refresh_monitor()
+                return
+            if free_gb < 2.0:
+                if not messagebox.askyesno(
+                        "Low disk space",
+                        f"Only {free_gb:.1f} GB free. Audio uses ~0.7 GB/hour per "
+                        "device and screen recording much more.\n\nRecord anyway?"):
+                    self._refresh_monitor()
+                    return
+        except Exception as e:
+            log.warning("Disk space check skipped: %s", e)
+
         # ISO-style, file-safe session folder + base name (research-backed:
         # YYYY-MM-DD, no spaces or special chars, sorts chronologically).
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -763,6 +1148,17 @@ class App(tk.Tk):
             # Treat as alive during warm-up so encoder spin-up is not flagged.
             st["screen_alive"] = bool(s["alive"]) or warming_up
             st["screen_size"] = s["size"]
+            # frame_age is seconds since ffmpeg last advanced its frame counter.
+            # This is the real liveness signal: it keeps moving even on a static
+            # screen (duplicated frames), whereas file size can sit flat for many
+            # seconds due to output buffering. -1 = no frame reported yet.
+            fa = s.get("frame_age", -1.0)
+            st["screen_frame"] = s.get("frame", 0)
+            st["screen_frame_age"] = fa
+            # Healthy if the process is alive AND it reported a frame recently
+            # (or we're still warming up / haven't seen the first frame yet).
+            st["screen_progressing"] = bool(
+                warming_up or fa < 0 or fa < 8.0)
         else:
             st["screen_enabled"] = False
         return st
@@ -796,6 +1192,7 @@ class App(tk.Tk):
 
         self._set_recording_ui(False)
         self._update_combine_panel()
+        self._add_to_library()
         log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
         self._refresh_monitor()
 
@@ -836,6 +1233,8 @@ class App(tk.Tk):
             self.audio_light.set_state(COLORS["muted"], ": idle")
             self.screen_light.set_state(COLORS["muted"], ": off")
             self.elapsed_lbl.config(text="00:00:00")
+        if self.tray:
+            self.tray.set_recording(on)
 
     # -------------------------------------------------------- error/alert #
     def _on_subsystem_error(self, label, reason):
@@ -1040,23 +1439,42 @@ class App(tk.Tk):
         self._run_combine(lambda: combine.mix_audio_to_stereo(audio, out), out)
 
     def _run_combine(self, fn, out):
-        self.status_lbl.config(text="Combining...")
+        if getattr(self, "_combine_busy", False):
+            messagebox.showinfo("Please wait",
+                                "A combine/merge is already running.")
+            return
+        self._combine_busy = True
+        self.status_lbl.config(text="Combining... (this can take a while for video)")
+        log.info("Combine started -> %s", out)
 
         def work():
-            ok, detail = fn()
+            try:
+                ok, detail = fn()
+            except Exception as e:
+                ok, detail = False, str(e)
             self.after(0, lambda: self._combine_done(ok, out, detail))
-        threading.Thread(target=work, daemon=True).start()
+        threading.Thread(target=work, name="combine", daemon=True).start()
 
     def _combine_done(self, ok, out, detail):
+        self._combine_busy = False
         self.status_lbl.config(text="Idle.")
-        if ok:
+        if ok and os.path.isfile(out):
             log.info("Combined -> %s", out)
+            self._refresh_library()  # the merged file may add a new session folder
             if messagebox.askyesno(
-                    "Done",
-                    f"Saved:\n{os.path.basename(out)}\n\nShow it in the folder?"):
-                self._open_output()
+                    "Merge complete",
+                    f"Saved:\n{out}\n\nShow it in the folder?"):
+                folder = os.path.dirname(out)
+                try:
+                    if os.path.isdir(folder):
+                        os.startfile(folder)
+                except Exception as e:
+                    log.warning("open folder failed: %s", e)
         else:
-            messagebox.showerror("Combine failed", str(detail)[:800])
+            log.error("Combine failed: %s", str(detail)[:800])
+            messagebox.showerror(
+                "Combine failed",
+                "The merge did not complete.\n\n" + str(detail)[-800:])
 
     def _open_output(self):
         d = self.last_outputs.get("out_dir") or self.cfg.resolved_save_folder()
@@ -1075,6 +1493,16 @@ class App(tk.Tk):
             self._save_settings()
         finally:
             self._stop_monitor()
+            if self.hotkeys:
+                try:
+                    self.hotkeys.stop()
+                except Exception:
+                    pass
+            if self.tray:
+                try:
+                    self.tray.stop()
+                except Exception:
+                    pass
             self.destroy()
 
 

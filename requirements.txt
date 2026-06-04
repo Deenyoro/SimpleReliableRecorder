@@ -7,6 +7,11 @@ numpy>=1.24
 screeninfo>=0.8.1
 # Process monitoring for the watchdog.
 psutil>=5.9
+# System tray icon (red while recording).
+pystray>=0.19
+Pillow>=10.0
+# Global push-to-talk / push-to-mute hotkey.
+keyboard>=0.13.5
 # Packaging.
 pyinstaller>=6.0
 # (ffmpeg is bundled separately at build time, not via pip.)

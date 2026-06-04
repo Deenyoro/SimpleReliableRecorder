@@ -239,18 +239,14 @@ def watchdog_main(argv):
                             + (hb.get("audio_detail") or ""))
             elif hb.get("screen_enabled") and not hb.get("screen_alive", False):
                 raise_alert("SCREEN recording stopped (encoder process exited).")
-            elif hb.get("screen_enabled"):
-                size = hb.get("screen_size", 0)
-                if size == prev_screen_size and size >= 0:
-                    screen_stall_count += 1
-                else:
-                    screen_stall_count = 0
-                prev_screen_size = size
-                if screen_stall_count >= max(3, int(stale)):
-                    raise_alert("SCREEN recording stalled (file not growing).")
-                else:
-                    _clear_if_set(session_dir, last_alert_reason)
-                    last_alert_reason = None
+            elif hb.get("screen_enabled") and not hb.get("screen_progressing", True):
+                # The GUI reports screen_progressing using ffmpeg's frame counter
+                # (which keeps advancing even on a static screen). Only alert when
+                # that genuinely stops. We no longer compare on-disk file size,
+                # which can sit flat for many seconds due to output buffering and
+                # caused false "stalled" alarms on idle/static screens.
+                raise_alert("SCREEN recording stalled (encoder stopped producing "
+                            "frames).")
             else:
                 _clear_if_set(session_dir, last_alert_reason)
                 last_alert_reason = None

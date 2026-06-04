@@ -30,6 +30,29 @@ COLORS["accent_dim"] = "#3a8f83"
 
 FONT = "Segoe UI"
 
+# Maps the ttk frame styles we use to their background color, so plain tk
+# widgets (Canvas/Label) placed inside them can match exactly.
+_STYLE_BG = {
+    "Card.TFrame": COLORS["panel2"],
+    "Panel.TFrame": COLORS["panel"],
+    "TFrame": COLORS["bg"],
+}
+
+
+def _widget_bg(widget):
+    """Best-effort background color of a widget (works for tk and ttk frames)."""
+    try:
+        return widget.cget("bg")          # plain tk widgets expose bg
+    except Exception:
+        pass
+    try:
+        style = str(widget.cget("style")) or widget.winfo_class()
+        if style in _STYLE_BG:
+            return _STYLE_BG[style]
+        return ttk.Style().lookup(style, "background") or COLORS["bg"]
+    except Exception:
+        return COLORS["bg"]
+
 
 def apply_dark_theme(root):
     style = ttk.Style(root)
@@ -211,7 +234,10 @@ class ToggleSwitch(tk.Frame):
 
     def __init__(self, parent, variable, text="", command=None,
                  bg=None, width=52, height=28):
-        bg = bg or COLORS["bg"]
+        if bg is None:
+            # Inherit the parent's real background so the switch blends into
+            # cards / panels / the window automatically (no color mismatch).
+            bg = _widget_bg(parent)
         super().__init__(parent, bg=bg)
         self.var = variable
         self.command = command
@@ -306,10 +332,11 @@ class DeviceRow(ttk.Frame):
     """A selectable capture device with a gain fader and a live level meter."""
 
     def __init__(self, parent, devices, on_remove, on_change=None, preset=None,
-                 gain=1.0):
+                 gain=1.0, muted=False):
         super().__init__(parent, style="Card.TFrame", padding=10)
         self.devices = devices
         self.on_change = on_change
+        self.muted = bool(muted)
         self._map = {}
         values = []
         for d in devices:
@@ -319,11 +346,15 @@ class DeviceRow(ttk.Frame):
             self._map[label] = d
             values.append(label)
 
-        # Row 0: device chooser + remove
+        # Row 0: device chooser + mute + remove
         self.var = tk.StringVar()
         self.combo = ttk.Combobox(self, textvariable=self.var, values=values,
-                                  state="readonly", width=50)
-        self.combo.grid(row=0, column=0, columnspan=3, sticky="ew", padx=(0, 8))
+                                  state="readonly", width=46)
+        self.combo.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(0, 8))
+        self.mute_btn = tk.Button(self, text="Mute", width=7, relief="flat",
+                                  font=(FONT, 10, "bold"), cursor="hand2",
+                                  command=self._toggle_mute)
+        self.mute_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
         self.remove_btn = ttk.Button(self, text="Remove", width=8,
                                      command=lambda: on_remove(self))
         self.remove_btn.grid(row=0, column=3, sticky="e")
@@ -368,6 +399,28 @@ class DeviceRow(ttk.Frame):
             if not matched:
                 self.var.set(values[0])
 
+        self._refresh_mute_btn()
+
+    def _refresh_mute_btn(self):
+        if self.muted:
+            self.mute_btn.config(text="Muted", bg=COLORS["red"], fg="#0b0b0b",
+                                 activebackground="#ff7b72")
+        else:
+            self.mute_btn.config(text="Mute", bg=COLORS["panel3"],
+                                 fg=COLORS["fg"], activebackground=COLORS["accent_dim"])
+
+    def _toggle_mute(self):
+        self.set_muted(not self.muted, notify=True)
+
+    def set_muted(self, muted, notify=False):
+        self.muted = bool(muted)
+        self._refresh_mute_btn()
+        if notify and self.on_change:
+            self.on_change("mute", self)
+
+    def is_muted(self):
+        return self.muted
+
     def _on_wheel(self, event):
         step = 10 if event.delta > 0 else -10
         new = min(self.GAIN_MAX, max(0, self.gain_var.get() + step))
@@ -394,7 +447,7 @@ class DeviceRow(ttk.Frame):
         return f'{d["name"]} [{d["kind"]}]'
 
     def set_level(self, peak):
-        self.meter.set_level(peak)
+        self.meter.set_level(0.0 if self.muted else peak)
 
 
 class GoldBanner(tk.Frame):
