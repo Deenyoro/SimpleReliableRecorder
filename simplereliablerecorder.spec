@@ -27,14 +27,22 @@ if os.path.isfile(_ff):
 # These packages ship compiled extensions / data files (numpy, libsndfile via
 # soundfile, the CFFI backends used by soundcard). Collect everything so the
 # frozen app can find them.
-for _pkg in ("numpy", "soundfile", "soundcard"):
+for _pkg in ("numpy", "soundfile", "soundcard", "pystray", "PIL"):
     _d, _b, _h = collect_all(_pkg)
     datas += _d
     binaries += _b
     hiddenimports += _h
 
 hiddenimports += collect_submodules("soundcard")
-hiddenimports += ["cffi", "_cffi_backend", "numpy", "screeninfo", "psutil"]
+hiddenimports += ["cffi", "_cffi_backend", "numpy", "screeninfo", "psutil",
+                  "pystray", "PIL", "PIL.Image", "PIL.ImageDraw", "keyboard"]
+# pystray picks a backend at runtime; ensure the Windows one is bundled.
+if sys.platform == "win32":
+    hiddenimports += ["pystray._win32"]
+elif sys.platform == "darwin":
+    hiddenimports += ["pystray._darwin"]
+else:
+    hiddenimports += ["pystray._xorg", "pystray._appindicator"]
 
 block_cipher = None
 

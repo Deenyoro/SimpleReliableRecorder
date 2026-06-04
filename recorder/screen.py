@@ -8,6 +8,7 @@ AMF / VideoToolbox / CPU with automatic fallback.
 """
 
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -18,6 +19,9 @@ from .ffmpeg_tools import CREATE_NO_WINDOW, _startupinfo
 from .logging_setup import get_logger
 
 log = get_logger("screen")
+
+# Matches ffmpeg progress lines like "frame=  93850 fps=30 ...".
+_FRAME_RE = re.compile(r"frame=\s*(\d+)")
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +119,9 @@ class ScreenRecorder:
         self._stderr_thread = None
         self._stderr_tail = []
         self.recording = False
+        # Liveness from ffmpeg's frame counter (advances even on a static screen).
+        self._frame = 0
+        self._frame_time = 0.0
 
     # -- encoder chain (auto fallback) ------------------------------------ #
     def _encoder_chain(self):
@@ -214,6 +221,18 @@ class ScreenRecorder:
                 self._stderr_tail.append(text + "\n")
                 if len(self._stderr_tail) > 200:
                     self._stderr_tail = self._stderr_tail[-200:]
+                # ffmpeg emits "frame=  NNN ..." progress lines. This counter
+                # always advances while capture is healthy (even on a static
+                # screen, via duplicated frames), unlike on-disk file size which
+                # can sit flat for many seconds due to output buffering. We use
+                # it as the true liveness signal for the watchdog.
+                m = _FRAME_RE.search(text)
+                if m:
+                    try:
+                        self._frame = int(m.group(1))
+                        self._frame_time = time.time()
+                    except Exception:
+                        pass
                 low = text.lower()
                 if "error" in low or "failed" in low or "unable" in low:
                     log.error("ffmpeg: %s", text)
@@ -250,10 +269,14 @@ class ScreenRecorder:
                 size = os.path.getsize(self._record_path)
         except Exception:
             pass
+        # Seconds since ffmpeg last reported a new frame (-1 = none seen yet).
+        frame_age = (time.time() - self._frame_time) if self._frame_time else -1.0
         return {
             "recording": self.recording,
             "alive": alive,
             "size": size,
+            "frame": self._frame,
+            "frame_age": frame_age,
             "encoder": self.active_family,
             "path": self._record_path,
         }

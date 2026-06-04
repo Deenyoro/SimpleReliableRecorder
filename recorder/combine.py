@@ -105,3 +105,84 @@ def mix_audio_to_stereo(audio_paths, out_path):
                 f"{inputs}amix=inputs={n}:normalize=0[aout]",
                 "-map", "[aout]", "-ac", "2", out_path]
     return _run(cmd)
+
+
+def concat_sessions(sessions, out_path, include_video=False):
+    """Join several recording sessions end to end into one file.
+
+    `sessions` is a list of dicts: {"audio": [wav,...], "video": path|""}.
+    Within each session the audio tracks are mixed to stereo; sessions are then
+    concatenated in order. If include_video is True and every session has a
+    video, the videos are concatenated and the mixed audio muxed alongside.
+    Re-encodes (the inputs have different start times / codecs), so this is a
+    one-off convenience export; the originals are never touched.
+    """
+    sessions = [s for s in sessions if s and
+                ([a for a in s.get("audio", []) if a and os.path.isfile(a)]
+                 or (include_video and os.path.isfile(s.get("video", ""))))]
+    if not sessions:
+        return False, "no usable sessions selected"
+
+    ff = ffmpeg_tools.ffmpeg_exe()
+    cmd = [ff, "-hide_banner", "-y"]
+    # Build the input list and remember each input's index.
+    idx = 0
+    seg_audio_idx = []   # list of (list-of-audio-input-indexes) per session
+    seg_video_idx = []   # video input index per session (or None)
+    do_video = include_video and all(os.path.isfile(s.get("video", ""))
+                                     for s in sessions)
+    for s in sessions:
+        a_idx = []
+        for a in s.get("audio", []):
+            if a and os.path.isfile(a):
+                cmd += ["-i", a]
+                a_idx.append(idx); idx += 1
+        seg_audio_idx.append(a_idx)
+        if do_video:
+            cmd += ["-i", s["video"]]
+            seg_video_idx.append(idx); idx += 1
+        else:
+            seg_video_idx.append(None)
+
+    filt = []
+    seg_audio_labels = []
+    for si, a_idx in enumerate(seg_audio_idx):
+        if not a_idx:
+            # No audio in this session: synthesize silence so the concat aligns.
+            lbl = f"sa{si}"
+            filt.append(f"anullsrc=channel_layout=stereo:sample_rate=48000[{lbl}]")
+            seg_audio_labels.append(lbl)
+            continue
+        if len(a_idx) == 1:
+            src = f"[{a_idx[0]}:a]"
+            lbl = f"sa{si}"
+            filt.append(f"{src}aformat=sample_rates=48000:channel_layouts=stereo[{lbl}]")
+        else:
+            ins = "".join(f"[{i}:a]" for i in a_idx)
+            lbl = f"sa{si}"
+            filt.append(f"{ins}amix=inputs={len(a_idx)}:normalize=0,"
+                        f"aformat=sample_rates=48000:channel_layouts=stereo[{lbl}]")
+        seg_audio_labels.append(lbl)
+
+    if do_video:
+        # Concatenate video+audio pairs together.
+        vlabels = []
+        for si in range(len(sessions)):
+            vi = seg_video_idx[si]
+            vlbl = f"sv{si}"
+            filt.append(f"[{vi}:v]scale=trunc(iw/2)*2:trunc(ih/2)*2,"
+                        f"setsar=1,format=yuv420p[{vlbl}]")
+            vlabels.append(vlbl)
+        pairs = "".join(f"[{vlabels[i]}][{seg_audio_labels[i]}]"
+                        for i in range(len(sessions)))
+        filt.append(f"{pairs}concat=n={len(sessions)}:v=1:a=1[vout][aout]")
+        cmd += ["-filter_complex", ";".join(filt),
+                "-map", "[vout]", "-map", "[aout]",
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                "-c:a", "aac", "-b:a", "256k", out_path]
+    else:
+        ins = "".join(f"[{lbl}]" for lbl in seg_audio_labels)
+        filt.append(f"{ins}concat=n={len(seg_audio_labels)}:v=0:a=1[aout]")
+        cmd += ["-filter_complex", ";".join(filt),
+                "-map", "[aout]", out_path]
+    return _run(cmd)
