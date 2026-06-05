@@ -107,6 +107,94 @@ def mix_audio_to_stereo(audio_paths, out_path):
     return _run(cmd)
 
 
+# Output formats offered by the Convert dialog. Maps a friendly label to
+# (extension, has_video, audio_codec, extra ffmpeg args). Audio-only formats
+# drop any video; video formats re-encode/copy as needed.
+CONVERT_FORMATS = {
+    "MP4 (H.264 + AAC)":      ("mp4", True,  "aac",      ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart"]),
+    "MKV (H.264 + AAC)":      ("mkv", True,  "aac",      ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20"]),
+    "WebM (VP9 + Opus)":      ("webm", True, "libopus",  ["-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32"]),
+    "MOV (H.264 + AAC)":      ("mov", True,  "aac",      ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-movflags", "+faststart"]),
+    "MP3 (audio only)":       ("mp3", False, "libmp3lame", ["-b:a", "256k"]),
+    "AAC / M4A (audio only)": ("m4a", False, "aac",      ["-b:a", "256k", "-movflags", "+faststart"]),
+    "FLAC (audio only)":      ("flac", False, "flac",    []),
+    "WAV (audio only)":       ("wav", False, "pcm_s16le", []),
+    "Opus (audio only)":      ("opus", False, "libopus", ["-b:a", "192k"]),
+}
+
+
+def convert(entry, out_path, fmt_label, audio_mode="mix"):
+    """Convert a single recording (one library entry) to another format.
+
+    entry: {"audio": [wav,...], "video": path|""}
+    fmt_label: a key of CONVERT_FORMATS.
+    audio_mode: "mix" (sum all audio into one stereo track) or
+                "tracks" (keep each audio source as its own track in the file).
+    For audio-only formats the video is ignored. Originals are never modified.
+    """
+    spec = CONVERT_FORMATS.get(fmt_label)
+    if not spec:
+        return False, f"unknown format: {fmt_label}"
+    ext, has_video, acodec, vargs = spec
+
+    audio = [a for a in entry.get("audio", []) if a and os.path.isfile(a)]
+    video = entry.get("video", "")
+    has_v = bool(video) and os.path.isfile(video)
+    want_video = has_video and has_v
+    if not audio and not want_video:
+        return False, "nothing to convert (no audio, and no video for this format)"
+
+    ff = ffmpeg_tools.ffmpeg_exe()
+    cmd = [ff, "-hide_banner", "-y"]
+    a_start = 0
+    if want_video:
+        cmd += ["-i", video]
+        a_start = 1
+    for a in audio:
+        cmd += ["-i", a]
+
+    n = len(audio)
+    filt = []
+    if n > 1 and (audio_mode == "mix" or not has_video):
+        ins = "".join(f"[{a_start + i}:a]" for i in range(n))
+        filt.append(f"{ins}amix=inputs={n}:normalize=0[aout]")
+
+    if want_video:
+        cmd += vargs
+        if n == 0:
+            cmd += ["-map", "0:v:0"]
+        elif audio_mode == "tracks":
+            cmd += ["-map", "0:v:0"]
+            for i in range(n):
+                cmd += ["-map", f"{a_start + i}:a:0"]
+            cmd += ["-c:a", acodec, "-b:a", "256k"]
+        else:  # mix
+            if n > 1:
+                cmd += ["-filter_complex", filt[0], "-map", "0:v:0", "-map", "[aout]"]
+            else:
+                cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+            cmd += ["-c:a", acodec]
+            if acodec not in ("flac", "pcm_s16le"):
+                cmd += ["-b:a", "256k"]
+    else:
+        # Audio-only output.
+        if n == 0:
+            return False, "no audio to convert"
+        if audio_mode == "tracks" and n > 1:
+            # Merge into one multichannel stream so all sources are preserved.
+            ins = "".join(f"[{a_start + i}:a]" for i in range(n))
+            cmd += ["-filter_complex", f"{ins}amerge=inputs={n}[aout]",
+                    "-map", "[aout]"]
+        elif n > 1:
+            cmd += ["-filter_complex", filt[0], "-map", "[aout]"]
+        else:
+            cmd += ["-map", f"{a_start}:a:0"]
+        cmd += ["-c:a", acodec] + vargs
+
+    cmd += [out_path]
+    return _run(cmd)
+
+
 def concat_sessions(sessions, out_path, include_video=False):
     """Join several recording sessions end to end into one file.
 
