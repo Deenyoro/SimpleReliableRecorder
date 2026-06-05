@@ -29,13 +29,21 @@ def available():
 
 
 def _make_image(recording):
-    """Draw a 64x64 tray icon: a ring with a center dot (red while recording)."""
+    """Draw a 64x64 tray icon. Recording is unmistakable: a solid bright-red
+    filled disc. Idle is a hollow gold ring with a muted center, so the two
+    states read clearly even at 16x16 in the notification area."""
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
-    ring = (255, 193, 7, 255)          # gold ring (brand color)
-    dot = (239, 83, 80, 255) if recording else (120, 124, 132, 255)
-    d.ellipse([6, 6, 58, 58], outline=ring, width=5)
-    d.ellipse([20, 20, 44, 44], fill=dot)
+    if recording:
+        # Solid red disc with a white center dot - obvious "REC" indicator.
+        d.ellipse([4, 4, 60, 60], fill=(229, 32, 32, 255),
+                  outline=(255, 255, 255, 255), width=3)
+        d.ellipse([24, 24, 40, 40], fill=(255, 255, 255, 255))
+    else:
+        # Idle: gold ring, dark center.
+        d.ellipse([6, 6, 58, 58], fill=(40, 44, 52, 255),
+                  outline=(255, 193, 7, 255), width=5)
+        d.ellipse([26, 26, 38, 38], fill=(120, 124, 132, 255))
     return img
 
 
@@ -96,17 +104,25 @@ class TrayIcon:
 
     def set_recording(self, recording):
         recording = bool(recording)
-        if recording == self._recording:
-            return
         self._recording = recording
-        if self._icon is not None:
-            try:
-                self._icon.icon = _make_image(recording)
-                self._icon.title = ("SimpleReliableRecorder - RECORDING"
-                                    if recording else "SimpleReliableRecorder")
-                self._icon.update_menu()
-            except Exception:
-                log.debug("Tray update failed", exc_info=True)
+        if self._icon is None:
+            return
+        # Update the title first (cheap, always works), then the icon image,
+        # then the menu - each guarded separately so one failure does not block
+        # the others. pystray repaints when .icon is reassigned.
+        try:
+            self._icon.title = ("SimpleReliableRecorder - RECORDING"
+                                if recording else "SimpleReliableRecorder")
+        except Exception:
+            log.debug("Tray title update failed", exc_info=True)
+        try:
+            self._icon.icon = _make_image(recording)
+        except Exception:
+            log.debug("Tray icon image update failed", exc_info=True)
+        try:
+            self._icon.update_menu()
+        except Exception:
+            log.debug("Tray menu update failed", exc_info=True)
 
     def stop(self):
         if self._icon is not None:

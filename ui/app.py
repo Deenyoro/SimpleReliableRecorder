@@ -67,6 +67,11 @@ class App(tk.Tk):
                 self.iconbitmap(ip)
             except Exception:
                 pass
+        # Build normal + recording (red) window icons. Swapping the window icon
+        # is what makes the TASKBAR button turn red while recording on Windows.
+        self._icon_normal = None
+        self._icon_recording = None
+        self._build_window_icons()
 
         self.cfg = ConfigManager()
         self.inputs, self.outputs = list_devices()
@@ -139,6 +144,43 @@ class App(tk.Tk):
             on_quit=lambda: self.after(0, self.on_close),
             is_recording=lambda: self.recording)
         self.tray.start()
+
+    def _build_window_icons(self):
+        """Create the normal and recording (red) window/taskbar icons via PIL."""
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except Exception as e:
+            log.warning("Window icon images unavailable: %s", e)
+            return
+
+        def make(recording):
+            img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            if recording:
+                d.ellipse([4, 4, 60, 60], fill=(229, 32, 32, 255),
+                          outline=(255, 255, 255, 255), width=3)
+                d.ellipse([24, 24, 40, 40], fill=(255, 255, 255, 255))
+            else:
+                d.ellipse([6, 6, 58, 58], fill=(40, 44, 52, 255),
+                          outline=(255, 193, 7, 255), width=5)
+                d.ellipse([24, 24, 40, 40], fill=(255, 193, 7, 255))
+            return ImageTk.PhotoImage(img)
+
+        try:
+            self._icon_normal = make(False)
+            self._icon_recording = make(True)
+            self.iconphoto(True, self._icon_normal)
+        except Exception as e:
+            log.warning("Could not set window icon: %s", e)
+
+    def _set_taskbar_recording(self, recording):
+        """Swap the window/taskbar icon to the red recording variant."""
+        icon = self._icon_recording if recording else self._icon_normal
+        if icon is not None:
+            try:
+                self.iconphoto(True, icon)
+            except Exception:
+                log.debug("taskbar icon swap failed", exc_info=True)
 
     def _maximize(self):
         # Prefer the native maximized state; fall back to filling the work area
@@ -558,6 +600,10 @@ class App(tk.Tk):
             command=lambda: self._combine_selected_library("mix"),
             state="disabled")
         self.lib_btn_mix.pack(fill="x", pady=2)
+        self.lib_btn_convert = ttk.Button(
+            b, text="Convert to...  (MP4, MP3, MKV, WAV ...)",
+            command=self._convert_selected_library, state="disabled")
+        self.lib_btn_convert.pack(fill="x", pady=2)
 
         b2 = ttk.Frame(inner, style="TFrame")
         b2.pack(fill="x", pady=(2, 0))
@@ -641,7 +687,8 @@ class App(tk.Tk):
         n = len(sel)
         if n == 0:
             self.lib_sel_lbl.config(text="Tick recordings above to combine them.")
-            for btn in (self.lib_btn_video, self.lib_btn_multi, self.lib_btn_mix):
+            for btn in (self.lib_btn_video, self.lib_btn_multi, self.lib_btn_mix,
+                        self.lib_btn_convert):
                 btn.config(state="disabled")
             return
         all_video = all(e.get("video") for e in sel)
@@ -654,6 +701,8 @@ class App(tk.Tk):
         self.lib_btn_multi.config(state=("normal" if total_audio >= 2 else "disabled"))
         # Mix: any audio present.
         self.lib_btn_mix.config(state=("normal" if total_audio >= 1 else "disabled"))
+        # Convert: one recording at a time (per-take format export).
+        self.lib_btn_convert.config(state=("normal" if n == 1 else "disabled"))
 
     def _selected_library_entries(self):
         return [r["entry"] for r in self._lib_rows if r["var"].get()]
@@ -708,6 +757,106 @@ class App(tk.Tk):
             out = os.path.join(out_dir, f"SRR_mixed_{stamp}.wav")
             self._run_combine(
                 lambda: combine.mix_audio_to_stereo(audio, out), out)
+
+    def _convert_selected_library(self):
+        """Convert one selected recording to another format via a dialog."""
+        sel = self._selected_library_entries()
+        if len(sel) != 1:
+            messagebox.showinfo("Convert",
+                                "Select exactly one recording to convert.")
+            return
+        entry = sel[0]
+        n_audio = len([a for a in entry.get("audio", []) if a])
+        has_video = bool(entry.get("video"))
+        choice = self._convert_dialog(n_audio, has_video)
+        if not choice:
+            return
+        fmt_label, audio_mode = choice
+        spec = combine.CONVERT_FORMATS[fmt_label]
+        ext = spec[0]
+        out_dir = entry.get("out_dir") or self.cfg.resolved_save_folder()
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out = os.path.join(out_dir, f"{entry['name']}_converted_{stamp}.{ext}")
+        self._run_combine(
+            lambda: combine.convert(entry, out, fmt_label, audio_mode), out)
+
+    def _convert_dialog(self, n_audio, has_video):
+        """Modal dialog to pick an output format and audio handling.
+        Returns (fmt_label, audio_mode) or None if cancelled."""
+        win = tk.Toplevel(self)
+        win.title("Convert recording")
+        win.configure(bg=COLORS["bg"])
+        win.transient(self)
+        win.grab_set()
+        try:
+            ip = paths.icon_path()
+            if ip:
+                win.iconbitmap(ip)
+        except Exception:
+            pass
+
+        result = {"value": None}
+        frm = ttk.Frame(win, style="TFrame")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+
+        ttk.Label(frm, text="Convert to format:", style="Header.TLabel").pack(
+            anchor="w")
+        fmt_var = tk.StringVar(value="MP4 (H.264 + AAC)")
+        labels = list(combine.CONVERT_FORMATS.keys())
+        fmt_combo = ttk.Combobox(frm, textvariable=fmt_var, values=labels,
+                                 state="readonly", width=34)
+        fmt_combo.pack(anchor="w", pady=(4, 10))
+
+        ttk.Label(frm, text="Audio handling:", style="Header.TLabel").pack(
+            anchor="w")
+        mode_var = tk.StringVar(value="mix")
+        SegmentedControl(frm, mode_var, [
+            ("mix", "Mix all audio into one stereo track"),
+            ("tracks", "Keep each audio source as its own track"),
+        ]).pack(fill="x", pady=(4, 8))
+
+        info = ttk.Label(frm, style="Muted.TLabel", justify="left",
+                         wraplength=360)
+        info.pack(anchor="w", pady=(0, 10))
+
+        def describe(*_):
+            ext, has_v, _ac, _va = combine.CONVERT_FORMATS[fmt_var.get()]
+            if has_v and has_video:
+                txt = f"Output: one .{ext} video with the audio included."
+            elif has_v and not has_video:
+                txt = (f".{ext} is a video format but this recording has no "
+                       "video, so an audio-only file will be made.")
+            else:
+                txt = f"Output: one .{ext} audio file (video is ignored)."
+            if n_audio < 2:
+                txt += "  (Only one audio track, so the audio handling choice " \
+                       "has no effect.)"
+            info.config(text=txt)
+        fmt_var.trace_add("write", describe)
+        describe()
+
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x")
+
+        def ok():
+            result["value"] = (fmt_var.get(), mode_var.get())
+            win.destroy()
+
+        ttk.Button(btns, text="Convert", style="Accent.TButton",
+                   command=ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=(0, 8))
+
+        win.update_idletasks()
+        # Center over the main window.
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        win.wait_window()
+        return result["value"]
 
     def _open_selected_library(self):
         sel = self._selected_library_entries()
@@ -1270,6 +1419,7 @@ class App(tk.Tk):
             self.elapsed_lbl.config(text="00:00:00")
         if self.tray:
             self.tray.set_recording(on)
+        self._set_taskbar_recording(on)
 
     # -------------------------------------------------------- error/alert #
     def _on_subsystem_error(self, label, reason):
