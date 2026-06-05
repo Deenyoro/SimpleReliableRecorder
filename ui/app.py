@@ -44,19 +44,23 @@ class App(tk.Tk):
         try:
             sw = self.winfo_screenwidth()
             sh = self.winfo_screenheight()
-            w = min(1280, int(sw * 0.8))
-            h = min(900, int(sh * 0.85))
+            # A single monitor's height; with vertically stacked monitors
+            # winfo_screenheight can report the combined height, so clamp it.
+            mon_h = sh if sh < 2000 else sh // 2
+            # Proportional to the screen (no hard pixel cap) so it is never tiny
+            # on a wide/high-DPI display even if maximizing does not take.
+            w = max(1100, int(sw * 0.66))
+            h = max(760, int(mon_h * 0.85))
             x = max(0, (sw - w) // 2)
-            y = max(0, (sh - h) // 3)
+            y = max(0, (mon_h - h) // 3)
             self.geometry(f"{w}x{h}+{x}+{y}")
-            self.minsize(min(900, sw - 40), min(640, sh - 80))
+            self.minsize(min(1000, sw - 40), min(700, mon_h - 80))
         except Exception:
-            self.geometry("1100x820")
-            self.minsize(900, 640)
-        try:
-            self.state("zoomed")  # start maximized on Windows
-        except Exception:
-            pass
+            self.geometry("1280x860")
+            self.minsize(1000, 700)
+        # Maximize after the window is actually mapped - calling zoomed during
+        # __init__ is unreliable on multi-monitor / high-DPI Windows.
+        self.after(60, self._maximize)
         ip = paths.icon_path()
         if ip:
             try:
@@ -135,6 +139,19 @@ class App(tk.Tk):
             on_quit=lambda: self.after(0, self.on_close),
             is_recording=lambda: self.recording)
         self.tray.start()
+
+    def _maximize(self):
+        # Prefer the native maximized state; fall back to filling the work area
+        # if 'zoomed' is unavailable on this platform/runner.
+        try:
+            self.state("zoomed")
+            return
+        except Exception:
+            pass
+        try:
+            self.attributes("-zoomed", True)  # some X11/Tk builds
+        except Exception:
+            pass
 
     def _show_window(self):
         try:
@@ -263,7 +280,6 @@ class App(tk.Tk):
         self._build_screen(left)
 
         self._build_record(right)
-        self._build_combine(right)
         self._build_library(right)
         self._build_log(right)
 
@@ -498,42 +514,21 @@ class App(tk.Tk):
         self.status_lbl = ttk.Label(inner, text="Idle.", style="Muted.TLabel")
         self.status_lbl.pack(anchor="w", pady=(6, 0))
 
-    def _build_combine(self, parent):
-        inner = self._section(parent, "After recording")
-        ttk.Label(inner,
-                  text="Every device is saved as its own track first (safest). "
-                  "Optionally combine them below - originals are always kept.",
-                  style="Muted.TLabel", wraplength=360, justify="left").pack(
-            anchor="w")
-        self.combine_info = ttk.Label(inner, text="No recording yet.",
-                                      style="Muted.TLabel")
-        self.combine_info.pack(anchor="w", pady=(6, 0))
-
-        b = ttk.Frame(inner, style="TFrame")
-        b.pack(fill="x", pady=(8, 0))
-        self.btn_av = ttk.Button(b, text="Make one video with sound",
-                                 command=self._combine_av, state="disabled")
-        self.btn_av.pack(fill="x", pady=2)
-        self.btn_merge = ttk.Button(
-            b, text="Combine audio into one multitrack file",
-            command=self._combine_merge, state="disabled")
-        self.btn_merge.pack(fill="x", pady=2)
-        self.btn_mix = ttk.Button(b, text="Mix all audio into one stereo file",
-                                  command=self._combine_mix, state="disabled")
-        self.btn_mix.pack(fill="x", pady=2)
-        ttk.Button(inner, text="Open recording folder",
-                   command=self._open_output).pack(anchor="w", pady=(8, 0))
-
     # ----------------------------------------------------- recordings library #
     def _build_library(self, parent):
         inner = self._section(parent, "Recordings library")
-        ttk.Label(inner,
-                  text="Past recordings stay listed here so you can keep "
-                  "recording, then tick any and merge them into one file later. "
-                  "Right-click a recording to rename its folder (still tracked). "
-                  "Entries whose files are moved are removed automatically.",
-                  style="Muted.TLabel", wraplength=360, justify="left").pack(
-            anchor="w")
+        desc = ttk.Label(
+            inner, style="Muted.TLabel", justify="left",
+            text="Past recordings stay listed here so you can keep recording, "
+            "then tick any and merge them into one file with the buttons below. "
+            "Right-click a recording to rename its folder (still tracked). "
+            "Entries whose files are moved are removed automatically.")
+        desc.pack(fill="x", anchor="w")
+        # Wrap the text to the actual panel width instead of a fixed value, so it
+        # fills the column rather than hugging the left edge.
+        desc.bind("<Configure>",
+                  lambda e, w=desc: w.configure(wraplength=max(200, e.width - 4)))
+
         self.lib_holder = ScrollFrame(inner)
         self.lib_holder.configure(height=150)
         self.lib_holder.pack(fill="x", pady=(8, 0))
@@ -542,12 +537,28 @@ class App(tk.Tk):
                                    style="Muted.TLabel")
         self.lib_empty.pack(anchor="w", pady=(4, 0))
 
+        self.lib_sel_lbl = ttk.Label(inner, text="Nothing selected.",
+                                     style="Muted.TLabel")
+        self.lib_sel_lbl.pack(anchor="w", pady=(8, 0))
+
         b = ttk.Frame(inner, style="TFrame")
-        b.pack(fill="x", pady=(8, 0))
-        self.lib_combine_btn = ttk.Button(
-            b, text="Merge selected into one file",
-            command=self._combine_selected_library, state="disabled")
-        self.lib_combine_btn.pack(fill="x", pady=2)
+        b.pack(fill="x", pady=(4, 0))
+        self.lib_btn_video = ttk.Button(
+            b, text="Make one video with sound",
+            command=lambda: self._combine_selected_library("video"),
+            state="disabled")
+        self.lib_btn_video.pack(fill="x", pady=2)
+        self.lib_btn_multi = ttk.Button(
+            b, text="Combine audio into one multitrack file",
+            command=lambda: self._combine_selected_library("multitrack"),
+            state="disabled")
+        self.lib_btn_multi.pack(fill="x", pady=2)
+        self.lib_btn_mix = ttk.Button(
+            b, text="Mix all audio into one stereo file",
+            command=lambda: self._combine_selected_library("mix"),
+            state="disabled")
+        self.lib_btn_mix.pack(fill="x", pady=2)
+
         b2 = ttk.Frame(inner, style="TFrame")
         b2.pack(fill="x", pady=(2, 0))
         ttk.Button(b2, text="Open folder", width=12,
@@ -558,7 +569,7 @@ class App(tk.Tk):
                    command=lambda: self._refresh_library(rescan=True)).pack(side="right")
         self._refresh_library()
 
-    def _add_to_library(self):
+    def _add_to_library(self, select_new=False):
         audio = [a for a in (self.last_outputs.get("audio") or [])
                  if a and os.path.isfile(a)]
         video = self.last_outputs.get("video") or ""
@@ -576,6 +587,13 @@ class App(tk.Tk):
         self._library.append(entry)
         self.cfg.set("recordings", self._library)
         self._refresh_library()
+        # Auto-tick the recording that was just made so its actions are ready.
+        if select_new:
+            for r in self._lib_rows:
+                if r["entry"].get("id") == entry["id"]:
+                    r["var"].set(True)
+                    break
+            self._update_library_buttons()
 
     def _refresh_library(self, rescan=False):
         # Prune anything whose files vanished, then rebuild the checklist.
@@ -604,7 +622,8 @@ class App(tk.Tk):
             row.pack(fill="x", pady=2)
             var = tk.BooleanVar(value=False)
             cb = ToggleSwitch(row, var,
-                              text=f'{e["name"]}  ({library.summarize(e)})')
+                              text=f'{e["name"]}  ({library.summarize(e)})',
+                              command=self._update_library_buttons)
             cb.pack(anchor="w")
             # Right-click a row to rename its folder (tracked automatically).
             for w in (row, cb, getattr(cb, "label", None), getattr(cb, "canvas", None)):
@@ -614,39 +633,81 @@ class App(tk.Tk):
         has = bool(self._library)
         self.lib_empty.pack_forget() if has else self.lib_empty.pack(
             anchor="w", pady=(4, 0))
-        self.lib_combine_btn.config(state=("normal" if has else "disabled"))
+        self._update_library_buttons()
+
+    def _update_library_buttons(self):
+        """Light the library action buttons based on what is currently ticked."""
+        sel = self._selected_library_entries()
+        n = len(sel)
+        if n == 0:
+            self.lib_sel_lbl.config(text="Tick recordings above to combine them.")
+            for btn in (self.lib_btn_video, self.lib_btn_multi, self.lib_btn_mix):
+                btn.config(state="disabled")
+            return
+        all_video = all(e.get("video") for e in sel)
+        total_audio = sum(len(e.get("audio", [])) for e in sel)
+        word = "recording" if n == 1 else "recordings"
+        self.lib_sel_lbl.config(text=f"{n} {word} selected.")
+        # Video: only when every selected take has a video.
+        self.lib_btn_video.config(state=("normal" if all_video else "disabled"))
+        # Multitrack: needs at least two audio tracks across the selection.
+        self.lib_btn_multi.config(state=("normal" if total_audio >= 2 else "disabled"))
+        # Mix: any audio present.
+        self.lib_btn_mix.config(state=("normal" if total_audio >= 1 else "disabled"))
 
     def _selected_library_entries(self):
         return [r["entry"] for r in self._lib_rows if r["var"].get()]
 
-    def _combine_selected_library(self):
+    def _all_selected_audio(self, sel):
+        files = []
+        for e in sel:
+            for a in e.get("audio", []):
+                if a and os.path.isfile(a) and a not in files:
+                    files.append(a)
+        return files
+
+    def _combine_selected_library(self, mode):
+        """mode: 'video' (one video with mixed sound), 'multitrack' (one
+        multichannel WAV), or 'mix' (one stereo mix). Acts on ticked rows."""
         sel = self._selected_library_entries()
         if not sel:
-            messagebox.showinfo("Merge recordings",
-                                "Tick at least one recording to merge.")
+            messagebox.showinfo("Combine recordings",
+                                "Tick at least one recording first.")
             return
-        any_video = any(e.get("video") for e in sel)
-        include_video = False
-        if any_video:
-            if all(e.get("video") for e in sel):
-                include_video = messagebox.askyesno(
-                    "Include video?",
-                    "All selected recordings have video.\n\n"
-                    "Yes = one combined VIDEO file with sound.\n"
-                    "No = one combined AUDIO file only.")
-            else:
-                messagebox.showinfo(
-                    "Audio only",
-                    "Not every selected recording has video, so they will be "
-                    "merged into one audio file.")
-        ext = self.container_var.get() if include_video else "wav"
         out_dir = sel[0].get("out_dir") or self.cfg.resolved_save_folder()
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out = os.path.join(out_dir, f"SRR_merged_{stamp}.{ext}")
-        sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
-                    for e in sel]
-        self._run_combine(
-            lambda: combine.concat_sessions(sessions, out, include_video), out)
+
+        if mode == "video":
+            if not all(e.get("video") for e in sel):
+                messagebox.showinfo(
+                    "Need video",
+                    "Every ticked recording must have a video for this. "
+                    "Untick the audio-only ones, or use an audio option instead.")
+                return
+            ext = self.container_var.get()
+            out = os.path.join(out_dir, f"SRR_merged_{stamp}.{ext}")
+            sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
+                        for e in sel]
+            self._run_combine(
+                lambda: combine.concat_sessions(sessions, out, True), out)
+        elif mode == "multitrack":
+            audio = self._all_selected_audio(sel)
+            if len(audio) < 2:
+                messagebox.showinfo("Need more tracks",
+                                    "Select recordings with at least two audio "
+                                    "tracks between them.")
+                return
+            out = os.path.join(out_dir, f"SRR_multitrack_{stamp}.wav")
+            self._run_combine(
+                lambda: combine.merge_audio_to_channels(audio, out), out)
+        else:  # mix
+            audio = self._all_selected_audio(sel)
+            if not audio:
+                messagebox.showinfo("No audio", "No audio in the selection.")
+                return
+            out = os.path.join(out_dir, f"SRR_mixed_{stamp}.wav")
+            self._run_combine(
+                lambda: combine.mix_audio_to_stereo(audio, out), out)
 
     def _open_selected_library(self):
         sel = self._selected_library_entries()
@@ -1191,35 +1252,9 @@ class App(tk.Tk):
             self.screen_rec = None
 
         self._set_recording_ui(False)
-        self._update_combine_panel()
-        self._add_to_library()
+        self._add_to_library(select_new=True)
         log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
         self._refresh_monitor()
-
-        video = self.last_outputs.get("video")
-        audio = self.last_outputs.get("audio") or []
-        if video and audio:
-            action = self.on_stop_var.get()
-            if action == "combine":
-                self._combine_av(auto=True)
-            elif action == "ask":
-                self.after(300, self._prompt_combine)
-
-    def _prompt_combine(self):
-        video = self.last_outputs.get("video")
-        audio = self.last_outputs.get("audio") or []
-        if not (video and audio):
-            return
-        yes = messagebox.askyesno(
-            "Make one video with sound?",
-            "Your recording is saved safely as separate tracks:\n\n"
-            f"  - {os.path.basename(video)}  (screen)\n"
-            f"  - {len(audio)} audio track" + ("s" if len(audio) != 1 else "")
-            + "\n\n"
-            "Make a single video file with the sound mixed in now?\n"
-            "Your original separate tracks are always kept.")
-        if yes:
-            self._combine_av(auto=True)
 
     def _set_recording_ui(self, on):
         if on:
@@ -1394,49 +1429,8 @@ class App(tk.Tk):
             self._raise_gold_alert(alert.get("reason", "Recording problem detected."))
 
     # ----------------------------------------------------------- combine #
-    def _update_combine_panel(self):
-        audio = [a for a in (self.last_outputs.get("audio") or []) if a]
-        video = self.last_outputs.get("video")
-        parts = []
-        if audio:
-            parts.append(f"{len(audio)} audio track" + ("s" if len(audio) != 1 else ""))
-        if video:
-            parts.append("1 screen video")
-        if parts:
-            self.combine_info.config(text="Last recording: " + " + ".join(parts) + ".")
-        else:
-            self.combine_info.config(text="No recording yet.")
-        self.btn_av.config(state=("normal" if (video and audio) else "disabled"))
-        self.btn_merge.config(state=("normal" if len(audio) >= 2 else "disabled"))
-        self.btn_mix.config(state=("normal" if audio else "disabled"))
-
     def _combine_base(self):
         return getattr(self, "_session_base", None) or "SRR_recording"
-
-    def _combine_av(self, auto=False):
-        video = self.last_outputs.get("video")
-        audio = self.last_outputs.get("audio") or []
-        out_dir = self.last_outputs.get("out_dir")
-        if not video or not audio:
-            if not auto:
-                messagebox.showinfo("Combine", "Need both video and audio.")
-            return
-        out = os.path.join(out_dir,
-                           f"{self._combine_base()}_video-with-audio."
-                           + self.container_var.get())
-        self._run_combine(lambda: combine.combine_av(video, audio, out, "mix"), out)
-
-    def _combine_merge(self):
-        audio = self.last_outputs.get("audio") or []
-        out_dir = self.last_outputs.get("out_dir")
-        out = os.path.join(out_dir, f"{self._combine_base()}_audio-multitrack.wav")
-        self._run_combine(lambda: combine.merge_audio_to_channels(audio, out), out)
-
-    def _combine_mix(self):
-        audio = self.last_outputs.get("audio") or []
-        out_dir = self.last_outputs.get("out_dir")
-        out = os.path.join(out_dir, f"{self._combine_base()}_audio-mixed.wav")
-        self._run_combine(lambda: combine.mix_audio_to_stereo(audio, out), out)
 
     def _run_combine(self, fn, out):
         if getattr(self, "_combine_busy", False):
@@ -1475,13 +1469,6 @@ class App(tk.Tk):
             messagebox.showerror(
                 "Combine failed",
                 "The merge did not complete.\n\n" + str(detail)[-800:])
-
-    def _open_output(self):
-        d = self.last_outputs.get("out_dir") or self.cfg.resolved_save_folder()
-        try:
-            os.startfile(d)
-        except Exception as e:
-            log.warning("open folder failed: %s", e)
 
     # ------------------------------------------------------------- close #
     def on_close(self):
