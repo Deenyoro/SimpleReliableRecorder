@@ -683,10 +683,11 @@ class App(tk.Tk):
                               text=f'{e["name"]}  ({library.summarize(e)})',
                               command=self._update_library_buttons)
             cb.pack(anchor="w")
-            # Right-click a row to rename its folder (tracked automatically).
+            # Right-click a row for a context menu (rename / open / show).
             for w in (row, cb, getattr(cb, "label", None), getattr(cb, "canvas", None)):
                 if w is not None:
-                    w.bind("<Button-3>", lambda ev, ent=e: self._rename_entry(ent))
+                    w.bind("<Button-3>",
+                           lambda ev, ent=e: self._show_library_menu(ev, ent))
             self._lib_rows.append({"frame": row, "var": var, "entry": e})
         has = bool(self._library)
         self.lib_empty.pack_forget() if has else self.lib_empty.pack(
@@ -896,9 +897,60 @@ class App(tk.Tk):
         self.cfg.set("recordings", self._library)
         self._refresh_library()
 
+    # --- library right-click context menu -------------------------------- #
+    def _show_library_menu(self, event, entry):
+        menu = tk.Menu(self, tearoff=0, bg=COLORS["panel2"], fg=COLORS["fg"],
+                       activebackground=COLORS["accent"], activeforeground="#06120f",
+                       bd=0)
+        menu.add_command(label="Rename...",
+                         command=lambda: self._rename_entry(entry))
+        menu.add_command(label="Open folder",
+                         command=lambda: self._open_entry_folder(entry))
+        menu.add_command(label="Show folder location",
+                         command=lambda: self._reveal_entry_folder(entry))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _open_entry_folder(self, entry):
+        d = entry.get("out_dir") or ""
+        if not d or not os.path.isdir(d):
+            messagebox.showinfo("Open folder",
+                                "This recording's folder no longer exists.")
+            self._refresh_library()
+            return
+        try:
+            os.startfile(d)
+        except Exception as e:
+            log.warning("open folder failed: %s", e)
+
+    def _reveal_entry_folder(self, entry):
+        """Show the recording's folder highlighted in the file manager."""
+        d = entry.get("out_dir") or ""
+        if not d or not os.path.isdir(d):
+            messagebox.showinfo("Show folder location",
+                                "This recording's folder no longer exists.")
+            self._refresh_library()
+            return
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(d)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", d])
+            else:
+                subprocess.Popen(["xdg-open", os.path.dirname(d) or d])
+        except Exception as e:
+            log.warning("reveal folder failed: %s", e)
+            try:
+                os.startfile(os.path.dirname(d) or d)
+            except Exception:
+                pass
+
     def _rename_entry(self, entry):
-        """Rename a recording's folder on disk via right-click, keeping all of
-        the library's tracked paths pointing at the new location."""
+        """Rename a recording's folder AND every file inside it to match, so the
+        folder and its tracks share one name. Keeps all library-tracked paths
+        pointing at the renamed files. Non-destructive otherwise."""
         from tkinter import simpledialog
         old_dir = entry.get("out_dir") or ""
         if not old_dir or not os.path.isdir(old_dir):
@@ -906,15 +958,19 @@ class App(tk.Tk):
             self._refresh_library()
             return
         parent_dir = os.path.dirname(old_dir)
-        current = os.path.basename(old_dir)
+        old_base = os.path.basename(old_dir)
         new_name = simpledialog.askstring(
             "Rename recording",
-            "New folder name:", initialvalue=current, parent=self)
+            "New name (applies to the folder and every track inside):",
+            initialvalue=old_base, parent=self)
         if not new_name:
             return
-        # Sanitize to a safe folder name.
+        # Sanitize to a safe, cross-platform name (no reserved chars).
         safe = "".join(c for c in new_name if c.isalnum() or c in " -_.()").strip()
-        if not safe or safe == current:
+        safe = safe.rstrip(". ")  # Windows dislikes trailing dot/space
+        while "  " in safe:
+            safe = safe.replace("  ", " ")
+        if not safe or safe == old_base:
             return
         new_dir = os.path.join(parent_dir, safe)
         if os.path.exists(new_dir):
@@ -926,12 +982,55 @@ class App(tk.Tk):
             messagebox.showerror("Rename failed",
                                  f"Could not rename the folder:\n{e}")
             return
-        # Remap every tracked path from old_dir -> new_dir for this entry.
+
+        # Rename every file inside so its name matches the new folder name,
+        # preserving the descriptive suffix/extension. Handles ALL of this app's
+        # naming conventions:
+        #   <base>_mic-1.wav, <base>_playback-1.wav, <base>_part2.wav,
+        #   <base>_channels.wav, <base>_mix.wav, <base>_screen.mkv,
+        #   <base>_converted_<stamp>.<ext>  (start with the old base)
+        #   SRR_merged_<stamp>.<ext>, SRR_multitrack_<stamp>.wav,
+        #   SRR_mixed_<stamp>.wav        (aggregate exports - swap the SRR token)
+        name_map = {}  # old filename -> new filename (within new_dir)
+
+        def new_filename(fname):
+            stem, ext = os.path.splitext(fname)
+            if stem == old_base:
+                return safe + ext
+            if stem.startswith(old_base + "_"):
+                return safe + stem[len(old_base):] + ext
+            for tok in ("SRR_merged", "SRR_multitrack", "SRR_mixed"):
+                if stem == tok or stem.startswith(tok + "_") or stem.startswith(tok):
+                    return safe + stem[len("SRR"):] + ext
+            return None  # leave anything else untouched
+
+        try:
+            for fname in os.listdir(new_dir):
+                full = os.path.join(new_dir, fname)
+                if not os.path.isfile(full):
+                    continue
+                nf = new_filename(fname)
+                if not nf or nf == fname:
+                    continue
+                target = os.path.join(new_dir, nf)
+                if os.path.exists(target):
+                    continue  # never clobber an existing file
+                try:
+                    os.rename(full, target)
+                    name_map[fname] = nf
+                except Exception as e:
+                    log.warning("Could not rename '%s' -> '%s': %s", fname, nf, e)
+        except Exception as e:
+            log.warning("Rename pass over folder failed: %s", e)
+
+        # Remap tracked paths: move into new_dir and apply the filename map.
         def remap(p):
-            if p and os.path.commonpath([os.path.abspath(p), os.path.abspath(old_dir)]) \
-                    == os.path.abspath(old_dir):
-                return os.path.join(new_dir, os.path.relpath(p, old_dir))
-            return p
+            if not p:
+                return p
+            base = os.path.basename(p)
+            base = name_map.get(base, base)
+            return os.path.join(new_dir, base)
+
         entry["out_dir"] = new_dir
         entry["name"] = safe
         entry["audio"] = [remap(a) for a in entry.get("audio", [])]
@@ -939,7 +1038,8 @@ class App(tk.Tk):
             entry["video"] = remap(entry["video"])
         self.cfg.set("recordings", self._library)
         self._refresh_library()
-        log.info("Renamed recording folder -> %s", new_dir)
+        log.info("Renamed recording '%s' -> '%s' (%d file(s) renamed)",
+                 old_base, safe, len(name_map))
 
     def _build_log(self, parent):
         inner = self._section(parent, "Live log")
