@@ -738,6 +738,11 @@ class App(tk.Tk):
             return
         out_dir = sel[0].get("out_dir") or self.cfg.resolved_save_folder()
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        # Base the output name on the recording when one is selected, so a merge
+        # of "Daytona-DHS" becomes "Daytona-DHS_<kind>_<stamp>" rather than a
+        # generic SRR_ name. For multi-selection there is no single name, so use
+        # the first entry's name as the prefix.
+        prefix = (sel[0].get("name") or "SRR").strip() or "SRR"
 
         if mode == "video":
             if not all(e.get("video") for e in sel):
@@ -747,7 +752,7 @@ class App(tk.Tk):
                     "Untick the audio-only ones, or use an audio option instead.")
                 return
             ext = self.container_var.get()
-            out = os.path.join(out_dir, f"SRR_merged_{stamp}.{ext}")
+            out = os.path.join(out_dir, f"{prefix}_merged_{stamp}.{ext}")
             sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
                         for e in sel]
             self._run_combine(
@@ -759,7 +764,7 @@ class App(tk.Tk):
                                     "Select recordings with at least two audio "
                                     "tracks between them.")
                 return
-            out = os.path.join(out_dir, f"SRR_multitrack_{stamp}.wav")
+            out = os.path.join(out_dir, f"{prefix}_multitrack_{stamp}.wav")
             self._run_combine(
                 lambda: combine.merge_audio_to_channels(audio, out), out)
         else:  # mix
@@ -767,7 +772,7 @@ class App(tk.Tk):
             if not audio:
                 messagebox.showinfo("No audio", "No audio in the selection.")
                 return
-            out = os.path.join(out_dir, f"SRR_mixed_{stamp}.wav")
+            out = os.path.join(out_dir, f"{prefix}_mixed_{stamp}.wav")
             self._run_combine(
                 lambda: combine.mix_audio_to_stereo(audio, out), out)
 
