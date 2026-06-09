@@ -20,8 +20,11 @@ from .logging_setup import get_logger
 
 log = get_logger("screen")
 
-# Matches ffmpeg progress lines like "frame=  93850 fps=30 ...".
-_FRAME_RE = re.compile(r"frame=\s*(\d+)")
+# Keys from ffmpeg's machine-readable -progress output (key=value per line).
+# out_time_us is the encoded timestamp in microseconds; it advances on every
+# progress tick while encoding is healthy, for every encoder. frame is a useful
+# secondary counter. Each block ends with "progress=continue" (or "end").
+_PROG_RE = re.compile(r"^(frame|out_time_us|out_time_ms|total_size|progress)=(.+)$")
 
 
 # --------------------------------------------------------------------------- #
@@ -117,11 +120,15 @@ class ScreenRecorder:
         self.proc = None
         self.active_family = None
         self._stderr_thread = None
+        self._progress_thread = None
         self._stderr_tail = []
         self.recording = False
-        # Liveness from ffmpeg's frame counter (advances even on a static screen).
+        # Liveness from ffmpeg's -progress stream. out_time_us advances on every
+        # 1s tick while encoding is healthy, for every encoder. _progress_time is
+        # when we last received ANY progress block.
         self._frame = 0
-        self._frame_time = 0.0
+        self._out_time_us = -1
+        self._progress_time = 0.0
 
     # -- encoder chain (auto fallback) ------------------------------------ #
     def _encoder_chain(self):
@@ -172,6 +179,12 @@ class ScreenRecorder:
     def _build_cmd(self, family):
         enc = ffmpeg_tools.encoder_name(family, self.codec)
         cmd = [ffmpeg_tools.ffmpeg_exe(), "-hide_banner", "-y"]
+        # Machine-readable progress on stdout, on a fixed 1s timer. This is the
+        # authoritative liveness signal and works for EVERY encoder (NVENC, QSV,
+        # AMF, VideoToolbox, CPU) - unlike the human "frame=" stats on stderr,
+        # which hardware encoders emit rarely or not at all. -nostats silences
+        # the unreliable stderr stats so stderr carries only real errors.
+        cmd += ["-progress", "pipe:1", "-stats_period", "1", "-nostats"]
         cmd += self._input_args()
         cmd += ["-c:v", enc]
         cmd += ffmpeg_tools.quality_flags(family, self.quality)
@@ -192,7 +205,7 @@ class ScreenRecorder:
         log.info("Screen capture attempt (encoder=%s): %s", family, " ".join(cmd))
         try:
             self.proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW,
                 startupinfo=_startupinfo())
         except Exception as e:
@@ -200,9 +213,14 @@ class ScreenRecorder:
             return False
 
         self._stderr_tail = []
+        self._out_time_us = -1
+        self._progress_time = 0.0
         self._stderr_thread = threading.Thread(
             target=self._drain_stderr, name="ffmpeg-stderr", daemon=True)
         self._stderr_thread.start()
+        self._progress_thread = threading.Thread(
+            target=self._drain_progress, name="ffmpeg-progress", daemon=True)
+        self._progress_thread.start()
 
         time.sleep(1.3)
         if self.proc.poll() is not None:
@@ -213,6 +231,8 @@ class ScreenRecorder:
         return True
 
     def _drain_stderr(self):
+        # With -nostats, stderr now carries only the banner, stream info, and
+        # real warnings/errors. Keep a tail for diagnostics on failure.
         try:
             for line in iter(self.proc.stderr.readline, b""):
                 if not line:
@@ -221,23 +241,41 @@ class ScreenRecorder:
                 self._stderr_tail.append(text + "\n")
                 if len(self._stderr_tail) > 200:
                     self._stderr_tail = self._stderr_tail[-200:]
-                # ffmpeg emits "frame=  NNN ..." progress lines. This counter
-                # always advances while capture is healthy (even on a static
-                # screen, via duplicated frames), unlike on-disk file size which
-                # can sit flat for many seconds due to output buffering. We use
-                # it as the true liveness signal for the watchdog.
-                m = _FRAME_RE.search(text)
-                if m:
-                    try:
-                        self._frame = int(m.group(1))
-                        self._frame_time = time.time()
-                    except Exception:
-                        pass
                 low = text.lower()
                 if "error" in low or "failed" in low or "unable" in low:
                     log.error("ffmpeg: %s", text)
                 else:
                     log.debug("ffmpeg: %s", text)
+        except Exception:
+            pass
+
+    def _drain_progress(self):
+        # Parse ffmpeg's machine-readable -progress stream from stdout. Every
+        # block is several key=value lines terminated by "progress=continue".
+        # Receiving ANY block means ffmpeg is alive and encoding; out_time_us
+        # advancing confirms real forward progress. Works for all encoders.
+        try:
+            for line in iter(self.proc.stdout.readline, b""):
+                if not line:
+                    break
+                text = line.decode("utf-8", "replace").strip()
+                m = _PROG_RE.match(text)
+                if not m:
+                    continue
+                key, val = m.group(1), m.group(2).strip()
+                if key == "frame":
+                    try:
+                        self._frame = int(val)
+                    except Exception:
+                        pass
+                elif key == "out_time_us":
+                    try:
+                        self._out_time_us = int(val)
+                    except Exception:
+                        pass
+                elif key == "progress":
+                    # End of a progress block - stamp the time we got an update.
+                    self._progress_time = time.time()
         except Exception:
             pass
 
@@ -269,14 +307,16 @@ class ScreenRecorder:
                 size = os.path.getsize(self._record_path)
         except Exception:
             pass
-        # Seconds since ffmpeg last reported a new frame (-1 = none seen yet).
-        frame_age = (time.time() - self._frame_time) if self._frame_time else -1.0
+        # Seconds since ffmpeg last emitted a -progress block (-1 = none yet).
+        progress_age = ((time.time() - self._progress_time)
+                        if self._progress_time else -1.0)
         return {
             "recording": self.recording,
             "alive": alive,
             "size": size,
             "frame": self._frame,
-            "frame_age": frame_age,
+            "out_time_us": self._out_time_us,
+            "progress_age": progress_age,
             "encoder": self.active_family,
             "path": self._record_path,
         }

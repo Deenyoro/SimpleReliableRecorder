@@ -55,16 +55,36 @@ class HeartbeatWriter:
 
     def _loop(self):
         path = os.path.join(self.session_dir, HEARTBEAT_FILE)
+        tmp = path + ".tmp"
         while not self._stop.is_set():
             try:
                 payload = self.status_fn()
                 payload["wall_time"] = time.time()
-                tmp = path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh)
-                os.replace(tmp, path)
+                data = json.dumps(payload)
+                # Atomic write (tmp + rename) is preferred, but antivirus or the
+                # Downloads folder can briefly lock the target and make os.replace
+                # raise PermissionError. Retry a couple times, then fall back to a
+                # direct overwrite so wall_time never goes stale (a stale heartbeat
+                # would make the watchdog falsely think the app has hung).
+                wrote = False
+                for _ in range(3):
+                    try:
+                        with open(tmp, "w", encoding="utf-8") as fh:
+                            fh.write(data)
+                        os.replace(tmp, path)
+                        wrote = True
+                        break
+                    except Exception:
+                        time.sleep(0.05)
+                if not wrote:
+                    try:
+                        with open(path, "w", encoding="utf-8") as fh:
+                            fh.write(data)
+                        wrote = True
+                    except Exception as e:
+                        log.debug("heartbeat write failed: %s", e)
             except Exception as e:
-                log.debug("heartbeat write failed: %s", e)
+                log.debug("heartbeat status failed: %s", e)
             self._stop.wait(self.interval)
 
     def stop(self):
@@ -238,16 +258,21 @@ def watchdog_main(argv):
                 raise_alert("AUDIO recording stopped (no audio written recently). "
                             + (hb.get("audio_detail") or ""))
             elif hb.get("screen_enabled") and not hb.get("screen_alive", False):
-                raise_alert("SCREEN recording stopped (encoder process exited).")
+                # The encoder process is gone. Require it to stay gone for a
+                # couple of polls so a momentary auto-restart gap is not flagged.
+                screen_stall_count += 1
+                if screen_stall_count >= 2:
+                    raise_alert("SCREEN recording stopped (encoder process exited).")
             elif hb.get("screen_enabled") and not hb.get("screen_progressing", True):
-                # The GUI reports screen_progressing using ffmpeg's frame counter
-                # (which keeps advancing even on a static screen). Only alert when
-                # that genuinely stops. We no longer compare on-disk file size,
-                # which can sit flat for many seconds due to output buffering and
-                # caused false "stalled" alarms on idle/static screens.
-                raise_alert("SCREEN recording stalled (encoder stopped producing "
-                            "frames).")
+                # screen_progressing is computed in the GUI from ffmpeg's machine
+                # readable -progress stream (out_time advancing) OR the output file
+                # growing - both encoder agnostic. Only a genuine stall (neither
+                # advancing) gets here, and we still require it to persist.
+                screen_stall_count += 1
+                if screen_stall_count >= 2:
+                    raise_alert("SCREEN recording stalled (no encoder progress).")
             else:
+                screen_stall_count = 0
                 _clear_if_set(session_dir, last_alert_reason)
                 last_alert_reason = None
         else:

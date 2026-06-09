@@ -93,8 +93,13 @@ def default_recordings_dir():
 
 
 def ffmpeg_path():
-    """Path to the bundled ffmpeg.exe, falling back to a PATH lookup."""
-    bundled = resource_path("ffmpeg", "ffmpeg.exe")
+    """Path to the bundled ffmpeg binary, falling back to a PATH lookup.
+
+    The binary is named ffmpeg.exe on Windows and ffmpeg elsewhere (matching how
+    build.py stages it), so screen recording works on macOS and Linux too.
+    """
+    name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+    bundled = resource_path("ffmpeg", name)
     if os.path.isfile(bundled):
         return bundled
     # Source-run convenience / fallback: use system ffmpeg if present.

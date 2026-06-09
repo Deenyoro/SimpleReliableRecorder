@@ -115,13 +115,30 @@ class ConfigManager:
     def save(self):
         with self._lock:
             try:
-                tmp = self.path + ".tmp"
-                with open(tmp, "w", encoding="utf-8") as fh:
-                    json.dump(self.data, fh, indent=2)
-                os.replace(tmp, self.path)
-                log.debug("Config saved to %s", self.path)
+                data = json.dumps(self.data, indent=2)
             except Exception as e:
-                log.exception("Failed to save config: %s", e)
+                log.exception("Failed to serialize config: %s", e)
+                return
+            tmp = self.path + ".tmp"
+            # Atomic write with retry, then direct-write fallback. Antivirus or
+            # cloud-sync can briefly lock the target and make os.replace raise
+            # PermissionError; that must not produce a scary error or lose state.
+            import time as _t
+            for _ in range(3):
+                try:
+                    with open(tmp, "w", encoding="utf-8") as fh:
+                        fh.write(data)
+                    os.replace(tmp, self.path)
+                    log.debug("Config saved to %s", self.path)
+                    return
+                except Exception:
+                    _t.sleep(0.05)
+            try:
+                with open(self.path, "w", encoding="utf-8") as fh:
+                    fh.write(data)
+                log.debug("Config saved (direct) to %s", self.path)
+            except Exception as e:
+                log.warning("Could not save config: %s", e)
 
     def get(self, key, default=None):
         with self._lock:
