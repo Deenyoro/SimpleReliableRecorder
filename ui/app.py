@@ -117,6 +117,7 @@ class App(tk.Tk):
         self.level_monitor = None
         self._save_job = None
         self._combine_busy = False
+        self._closing = False
 
         self.settings_win = None
         self.tray = None
@@ -135,13 +136,24 @@ class App(tk.Tk):
                  self.encoders)
 
     # ------------------------------------------------------- tray + hotkeys #
+    def _safe_after(self, fn):
+        """Schedule fn on the Tk thread, ignoring it if we're shutting down or
+        the interpreter is already gone (prevents TclError from tray/hotkey
+        threads firing into a destroyed window)."""
+        if getattr(self, "_closing", False):
+            return
+        try:
+            self.after(0, fn)
+        except Exception:
+            pass
+
     def _setup_tray(self):
         if not self.tray_var.get():
             return
         self.tray = tray.TrayIcon(
-            on_show=lambda: self.after(0, self._show_window),
-            on_toggle_record=lambda: self.after(0, self._toggle_record),
-            on_quit=lambda: self.after(0, self.on_close),
+            on_show=lambda: self._safe_after(self._show_window),
+            on_toggle_record=lambda: self._safe_after(self._toggle_record),
+            on_quit=lambda: self._safe_after(self.on_close),
             is_recording=lambda: self.recording)
         self.tray.start()
 
@@ -207,7 +219,7 @@ class App(tk.Tk):
     def _setup_hotkeys(self):
         self.hotkeys = hotkeys.HotkeyManager(
             on_mute_change=lambda target, muted:
-            self.after(0, lambda: self._apply_hotkey_mute(target, muted)))
+            self._safe_after(lambda: self._apply_hotkey_mute(target, muted)))
         self._reconfigure_hotkeys()
 
     def _reconfigure_hotkeys(self):
@@ -1266,6 +1278,13 @@ class App(tk.Tk):
         self.session_dir = os.path.join(paths.data_dir(), "session")
         os.makedirs(self.session_dir, exist_ok=True)
         watchdog.clear_alert(self.session_dir)
+        # Re-arm alerting and clear any leftover banner from a previous take.
+        self.alerting = False
+        try:
+            if self.banner.winfo_manager():
+                self.banner.stop()
+        except Exception:
+            pass
         self.last_outputs = {"out_dir": out_dir, "audio": [], "video": None}
 
         if sources:
@@ -1323,6 +1342,9 @@ class App(tk.Tk):
             log.info("Background watchdog process disabled in settings.")
 
         self._record_start_mono = time.monotonic()
+        # Reset screen liveness tracking for the new take.
+        self._screen_last_size = -1
+        self._screen_last_grow = time.monotonic()
         self.recording = True
         self._set_recording_ui(True)
         log.info("RECORDING STARTED -> %s", out_dir)
@@ -1357,18 +1379,33 @@ class App(tk.Tk):
             st["screen_enabled"] = True
             # Treat as alive during warm-up so encoder spin-up is not flagged.
             st["screen_alive"] = bool(s["alive"]) or warming_up
-            st["screen_size"] = s["size"]
-            # frame_age is seconds since ffmpeg last advanced its frame counter.
-            # This is the real liveness signal: it keeps moving even on a static
-            # screen (duplicated frames), whereas file size can sit flat for many
-            # seconds due to output buffering. -1 = no frame reported yet.
-            fa = s.get("frame_age", -1.0)
+            size = s["size"]
+            st["screen_size"] = size
+            pa = s.get("progress_age", -1.0)
             st["screen_frame"] = s.get("frame", 0)
-            st["screen_frame_age"] = fa
-            # Healthy if the process is alive AND it reported a frame recently
-            # (or we're still warming up / haven't seen the first frame yet).
-            st["screen_progressing"] = bool(
-                warming_up or fa < 0 or fa < 8.0)
+            st["screen_progress_age"] = pa
+
+            # Liveness uses TWO independent signals, OR'd together, so a single
+            # signal's blind spot can never cause a false stall:
+            #   1. ffmpeg's machine-readable -progress stream (out_time advancing
+            #      on a 1s timer). Authoritative and works for EVERY encoder
+            #      (NVENC, QSV, AMF, VideoToolbox, CPU), unlike the human-readable
+            #      "frame=" stats that hardware encoders emit rarely.
+            #   2. the output file growing on disk - a backstop in case progress
+            #      output is ever delayed.
+            # Healthy if EITHER advanced within the window. We only flag a stall
+            # when both have been quiet, well beyond the 1s progress period.
+            now = time.monotonic()
+            last_size = getattr(self, "_screen_last_size", -1)
+            last_grow = getattr(self, "_screen_last_grow", now)
+            if size > last_size:
+                last_grow = now
+                self._screen_last_size = size
+            self._screen_last_grow = last_grow
+            size_age = now - last_grow
+            progress_ok = (pa < 0) or (pa < 8.0)
+            size_ok = size_age < 12.0
+            st["screen_progressing"] = bool(warming_up or progress_ok or size_ok)
         else:
             st["screen_enabled"] = False
         return st
@@ -1424,7 +1461,7 @@ class App(tk.Tk):
     # -------------------------------------------------------- error/alert #
     def _on_subsystem_error(self, label, reason):
         self._log_queue.put((f"SUBSYSTEM ERROR [{label}]: {reason}", 40))
-        self.after(0, lambda: self._raise_gold_alert(f"[{label}] {reason}"))
+        self._safe_after(lambda: self._raise_gold_alert(f"[{label}] {reason}"))
 
     def _raise_gold_alert(self, reason):
         if self.alerting and self.banner.winfo_manager():
@@ -1524,6 +1561,8 @@ class App(tk.Tk):
 
     # --------------------------------------------------------- poll loops #
     def _poll(self):
+        if getattr(self, "_closing", False):
+            return
         try:
             self._drain_log()
             if self.recording:
@@ -1531,14 +1570,18 @@ class App(tk.Tk):
                 self._check_watchdog_alert()
         except Exception as e:
             log.debug("poll error: %s", e)
-        self.after(400, self._poll)
+        if not getattr(self, "_closing", False):
+            self.after(400, self._poll)
 
     def _meter_loop(self):
+        if getattr(self, "_closing", False):
+            return
         try:
             self._update_meters()
         except Exception as e:
             log.debug("meter error: %s", e)
-        self.after(70, self._meter_loop)
+        if not getattr(self, "_closing", False):
+            self.after(70, self._meter_loop)
 
     def _update_meters(self):
         levels = {}
@@ -1596,7 +1639,7 @@ class App(tk.Tk):
                 ok, detail = fn()
             except Exception as e:
                 ok, detail = False, str(e)
-            self.after(0, lambda: self._combine_done(ok, out, detail))
+            self._safe_after(lambda: self._combine_done(ok, out, detail))
         threading.Thread(target=work, name="combine", daemon=True).start()
 
     def _combine_done(self, ok, out, detail):
@@ -1629,6 +1672,9 @@ class App(tk.Tk):
                 self.stop_recording()
             self._save_settings()
         finally:
+            # Stop the after() poll/meter loops cleanly so they don't fire on a
+            # destroyed window (which would raise TclError during shutdown).
+            self._closing = True
             self._stop_monitor()
             if self.hotkeys:
                 try:
