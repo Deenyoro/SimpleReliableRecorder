@@ -9,6 +9,7 @@ AMF / VideoToolbox / CPU with automatic fallback.
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -160,12 +161,15 @@ class ScreenRecorder:
                 "-i", "desktop",
             ]
         if sys.platform == "darwin":  # macOS avfoundation
+            # Numeric avfoundation indices count cameras first (0 is usually
+            # the FaceTime camera), which would silently record the webcam.
+            # ffmpeg also matches -i by device NAME, so use the screen's name.
             scr = max(0, m["number"] - 1)
             return [
                 "-f", "avfoundation",
                 "-framerate", str(self.framerate),
                 "-capture_cursor", "1",
-                "-i", f"{scr}:none",
+                "-i", f"{self._avfoundation_screen(scr)}:none",
             ]
         # Linux X11
         disp = os.environ.get("DISPLAY", ":0.0")
@@ -175,6 +179,26 @@ class ScreenRecorder:
             "-video_size", f'{m["width"]}x{m["height"]}',
             "-i", f'{disp}+{m["x"]},{m["y"]}',
         ]
+
+    @staticmethod
+    def _avfoundation_screen(scr_idx):
+        """Resolve the avfoundation device for screen scr_idx (0-based).
+
+        Prefer mapping via `-list_devices true` so the exact device name is
+        used; fall back to the conventional "Capture screen N" name, which
+        ffmpeg also matches.
+        """
+        name = f"Capture screen {scr_idx}"
+        try:
+            rc, out = ffmpeg_tools.run_capture(
+                ["-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                timeout=10)
+            screens = re.findall(r"\[\d+\]\s+(Capture screen \d+)", out)
+            if screens and scr_idx < len(screens):
+                name = screens[scr_idx]
+        except Exception as e:
+            log.debug("avfoundation device listing failed: %s", e)
+        return name
 
     def _build_cmd(self, family):
         enc = ffmpeg_tools.encoder_name(family, self.codec)
@@ -202,11 +226,17 @@ class ScreenRecorder:
 
     def _spawn(self, family):
         cmd = self._build_cmd(family)
-        log.info("Screen capture attempt (encoder=%s): %s", family, " ".join(cmd))
+        log.info("Screen capture attempt (encoder=%s, capture=%s): %s",
+                 family, self.capture_method, " ".join(cmd))
+        flags = CREATE_NO_WINDOW
+        if sys.platform == "win32":
+            # Own process group so stop() can send CTRL_BREAK_EVENT to ffmpeg
+            # without hitting our own process.
+            flags |= subprocess.CREATE_NEW_PROCESS_GROUP
         try:
             self.proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW,
+                stderr=subprocess.PIPE, creationflags=flags,
                 startupinfo=_startupinfo())
         except Exception as e:
             log.exception("Failed to launch ffmpeg for %s: %s", family, e)
@@ -214,33 +244,53 @@ class ScreenRecorder:
 
         self._stderr_tail = []
         self._out_time_us = -1
-        self._progress_time = 0.0
+        # Until the first -progress block lands, age is measured from spawn so
+        # an ffmpeg that never produces a frame reads as stalled, not healthy.
+        self._progress_time = time.time()
+        # Bind each drain thread to ITS process and tail so a fallback respawn
+        # never has the old attempt's threads writing into the new attempt.
         self._stderr_thread = threading.Thread(
-            target=self._drain_stderr, name="ffmpeg-stderr", daemon=True)
+            target=self._drain_stderr, args=(self.proc, self._stderr_tail),
+            name="ffmpeg-stderr", daemon=True)
         self._stderr_thread.start()
         self._progress_thread = threading.Thread(
-            target=self._drain_progress, name="ffmpeg-progress", daemon=True)
+            target=self._drain_progress, args=(self.proc,),
+            name="ffmpeg-progress", daemon=True)
         self._progress_thread.start()
 
-        time.sleep(1.3)
+        # Confirm the process survives startup. Poll instead of one long sleep
+        # so a fast failure doesn't freeze the caller for the full window.
+        deadline = time.monotonic() + 1.3
+        while self.proc.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.1)
         if self.proc.poll() is not None:
             tail = "".join(self._stderr_tail[-15:])
             log.warning("Encoder %s exited early (rc=%s):\n%s",
                         family, self.proc.returncode, tail)
+            self._close_pipes(self.proc)
             return False
         return True
 
-    def _drain_stderr(self):
+    @staticmethod
+    def _close_pipes(proc):
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:
+                pass
+
+    def _drain_stderr(self, proc, tail):
         # With -nostats, stderr now carries only the banner, stream info, and
         # real warnings/errors. Keep a tail for diagnostics on failure.
         try:
-            for line in iter(self.proc.stderr.readline, b""):
+            for line in iter(proc.stderr.readline, b""):
                 if not line:
                     break
                 text = line.decode("utf-8", "replace").rstrip()
-                self._stderr_tail.append(text + "\n")
-                if len(self._stderr_tail) > 200:
-                    self._stderr_tail = self._stderr_tail[-200:]
+                tail.append(text + "\n")
+                if len(tail) > 200:
+                    del tail[:-200]
                 low = text.lower()
                 if "error" in low or "failed" in low or "unable" in low:
                     log.error("ffmpeg: %s", text)
@@ -249,14 +299,14 @@ class ScreenRecorder:
         except Exception:
             pass
 
-    def _drain_progress(self):
+    def _drain_progress(self, proc):
         # Parse ffmpeg's machine-readable -progress stream from stdout. Every
         # block is several key=value lines terminated by "progress=continue".
         # Receiving ANY block means ffmpeg is alive and encoding; out_time_us
         # advancing confirms real forward progress. Works for all encoders.
         try:
-            for line in iter(self.proc.stdout.readline, b""):
-                if not line:
+            for line in iter(proc.stdout.readline, b""):
+                if not line or proc is not self.proc:
                     break
                 text = line.decode("utf-8", "replace").strip()
                 m = _PROG_RE.match(text)
@@ -283,17 +333,27 @@ class ScreenRecorder:
         os.makedirs(os.path.dirname(self._record_path) or ".", exist_ok=True)
         chain = self._encoder_chain()
         log.info("Screen recorder encoder chain: %s -> %s", self.encoder_family, chain)
+        # Capture methods to try per encoder. A ddagrab failure must not burn
+        # the encoder attempt: retry the SAME encoder with gdigrab before
+        # advancing the chain (otherwise a cpu-only chain dies entirely when
+        # ddagrab is the broken part).
+        methods = [self.capture_method]
+        if sys.platform == "win32" and self.capture_method == "ddagrab":
+            methods.append("gdigrab")
         for family in chain:
-            if self._spawn(family):
-                self.active_family = family
-                self.recording = True
-                log.info("Screen recording started (encoder=%s) -> %s",
-                         family, self._record_path)
-                return family
-            # On the first failure on Windows, drop ddagrab to gdigrab.
-            if sys.platform == "win32" and self.capture_method == "ddagrab":
-                log.warning("ddagrab failed; switching to gdigrab.")
-                self.capture_method = "gdigrab"
+            for method in list(methods):
+                self.capture_method = method
+                if self._spawn(family):
+                    self.active_family = family
+                    self.recording = True
+                    log.info("Screen recording started (encoder=%s, capture=%s) -> %s",
+                             family, method, self._record_path)
+                    return family
+                if len(methods) > 1 and method == methods[0]:
+                    log.warning("%s failed for %s; retrying with %s.",
+                                method, family, methods[1])
+                    # Don't keep offering the failed method to later encoders.
+                    methods.remove(method)
         msg = "All screen encoders failed: " + "".join(self._stderr_tail[-10:])
         if self.on_error:
             self.on_error("screen", msg)
@@ -307,9 +367,11 @@ class ScreenRecorder:
                 size = os.path.getsize(self._record_path)
         except Exception:
             pass
-        # Seconds since ffmpeg last emitted a -progress block (-1 = none yet).
+        # Seconds since ffmpeg last emitted a -progress block (measured from
+        # spawn until the first block arrives, so a stream that never produces
+        # a frame keeps aging). -1 ONLY when there is no live process.
         progress_age = ((time.time() - self._progress_time)
-                        if self._progress_time else -1.0)
+                        if (alive and self._progress_time) else -1.0)
         return {
             "recording": self.recording,
             "alive": alive,
@@ -336,12 +398,27 @@ class ScreenRecorder:
                 try:
                     self.proc.wait(timeout=8)
                 except subprocess.TimeoutExpired:
-                    log.warning("ffmpeg did not exit on 'q'; terminating.")
-                    self.proc.terminate()
-                    try:
-                        self.proc.wait(timeout=4)
-                    except subprocess.TimeoutExpired:
-                        self.proc.kill()
+                    # Escalate gracefully: CTRL_BREAK -> terminate -> kill.
+                    if sys.platform == "win32":
+                        log.warning("ffmpeg did not exit on 'q'; sending CTRL_BREAK.")
+                        try:
+                            self.proc.send_signal(signal.CTRL_BREAK_EVENT)
+                            self.proc.wait(timeout=4)
+                        except Exception:
+                            pass
+                    if self.proc.poll() is None:
+                        log.warning("ffmpeg still running; terminating.")
+                        self.proc.terminate()
+                        try:
+                            self.proc.wait(timeout=4)
+                        except subprocess.TimeoutExpired:
+                            self.proc.kill()
+            # Always wait the process out so the remux below never races the
+            # dying process's open handle on the output file.
+            try:
+                self.proc.wait(timeout=5)
+            except Exception:
+                pass
         except Exception as e:
             log.exception("Error stopping screen recorder: %s", e)
 
@@ -371,12 +448,22 @@ class ScreenRecorder:
                                  creationflags=CREATE_NO_WINDOW,
                                  startupinfo=_startupinfo(), timeout=120)
             if res.returncode == 0 and os.path.isfile(self.final_path):
-                try:
-                    os.remove(self._record_path)
-                except Exception:
-                    pass
-                log.info("Hybrid remux complete -> %s", self.final_path)
-                return True
+                # Sanity-check the result before destroying the crash-safe
+                # original: a truncated remux can succeed with rc=0.
+                src_size = (os.path.getsize(self._record_path)
+                            if os.path.isfile(self._record_path) else 0)
+                final_size = os.path.getsize(self.final_path)
+                if final_size > 0 and final_size >= 0.6 * src_size:
+                    try:
+                        os.remove(self._record_path)
+                    except Exception:
+                        pass
+                    log.info("Hybrid remux complete -> %s", self.final_path)
+                    return True
+                log.warning("Hybrid remux output looks suspect (%d bytes vs %d "
+                            "source); keeping the fragmented original.",
+                            final_size, src_size)
+                return False
             log.error("Hybrid remux failed (rc=%s): %s", res.returncode,
                       (res.stderr or "")[-500:])
         except Exception as e:

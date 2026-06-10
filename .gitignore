@@ -10,6 +10,9 @@ __pycache__/
 ffmpeg/
 *.exe
 
+# Inno Setup output (built in CI)
+installer/installer_out/
+
 # Runtime data, logs, recordings
 _data/
 data/

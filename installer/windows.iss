@@ -12,6 +12,9 @@
 #define MyAppPublisher "Deenyoro"
 
 [Setup]
+; AppId is an opaque identifier string, not a real GUID. It is how Windows and
+; Inno Setup recognise an existing install for upgrades/uninstall, so it must
+; NEVER change across releases (changing it would orphan previous installs).
 AppId={{8E2C4F1A-7B3D-4C9E-9A21-SRR0RECORDER01}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}

@@ -42,6 +42,9 @@ _MAX_DATA_BYTES = 0xFFFFFFFF - (1 << 20)  # ~4 GiB minus 1 MiB headroom
 class SafeWavWriter:
     def __init__(self, path, samplerate, channels, subtype="PCM_16",
                  flush_interval=2.0, on_error=None):
+        if subtype not in ("PCM_16", "FLOAT"):
+            raise ValueError(
+                f"Unsupported WAV subtype {subtype!r} (expected 'PCM_16' or 'FLOAT')")
         self.base_path = path
         self.sr = int(samplerate)
         self.ch = max(1, int(channels))
@@ -50,6 +53,7 @@ class SafeWavWriter:
         self.bits = 16 if subtype == "PCM_16" else 32
         self.fmt_code = 1 if subtype == "PCM_16" else 3  # PCM or IEEE float
         self.on_error = on_error
+        self._fsync_warned = False
 
         self._block_align = self.ch * self.bits // 8
         # Largest data payload we allow per segment (block aligned).
@@ -149,8 +153,13 @@ class SafeWavWriter:
         self._f.flush()
         try:
             os.fsync(self._f.fileno())
-        except Exception:
-            pass
+        except Exception as e:
+            # Without fsync the crash-safety window widens; say so once rather
+            # than spamming every flush or hiding it entirely.
+            if not self._fsync_warned:
+                self._fsync_warned = True
+                log.warning("fsync failed for %s (crash-safety window may be "
+                            "wider than flush interval): %s", self.base_path, e)
 
     def flush(self):
         with self._lock:

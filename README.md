@@ -6,20 +6,20 @@ power loss costs at most a couple of seconds, never the whole take.
 
 If recording ever stops it is impossible to miss: a flashing gold bar drops
 across the bottom of the window, the taskbar flashes, an alert sound plays, and
-an independent watchdog process raises an OS message box even if the app itself
-hangs. Every alert channel (sound, gold banner, taskbar flash, watchdog popup)
+an independent watchdog process raises an OS alert even if the app itself
+hangs. Every alert channel (sound, gold banner, taskbar flash, watchdog alert)
 and the background watchdog can be turned on or off in Settings.
 
 ## Features
 
-- **Audio**: any number of microphones plus system-playback devices via WASAPI
-  loopback (no virtual cable needed). Add more with the **+** buttons.
+- **Audio**: any number of microphones plus system-playback devices (WASAPI
+  loopback on Windows, no virtual cable needed). Add more with the **+** buttons.
 - **Save modes**:
   - Separate file per device (default, safest)
   - Separate channels in one file (mic = ch1, playback = ch2, ...)
   - Single mixed file
-- **Per-device gain + live OBS-style level meters** so you can balance every
-  source before and during recording.
+- **Per-device gain + live level meters** so you can balance every source
+  before and during recording.
 - **Screen recording** (optional, fully independent): pick a monitor from a
   dropdown (**Identify screens** shows a big number on each display). Encoders:
   NVIDIA NVENC, Intel Quick Sync, AMD AMF, Apple VideoToolbox, or CPU, with
@@ -30,6 +30,15 @@ and the background watchdog can be turned on or off in Settings.
 - **Resilience**: in-process monitors plus a separate watchdog process and
   heartbeat files, with optional auto-restart on failure.
 - **Immense logging**: rotating logs in the data folder plus a live in-app log.
+
+## Platform notes
+
+- **Windows**: system playback is captured via WASAPI loopback; everything
+  works out of the box.
+- **macOS**: microphone capture works natively, but capturing system playback
+  (loopback) requires a virtual audio device such as BlackHole.
+- **Linux**: screen capture uses X11. On Wayland sessions it requires
+  XWayland; native Wayland capture (portals) is not supported.
 
 ## Download
 

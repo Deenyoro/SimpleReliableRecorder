@@ -1,30 +1,55 @@
-"""SimpleReliableRecorder — entry point.
+"""SimpleReliableRecorder - entry point.
 
 Routes between two roles of the same executable:
-  * default            -> launches the GUI.
-  * --watchdog A B C D -> runs the independent watcher process (no window),
-                          where A=session_dir B=gui_pid C=stale_seconds D=sound.
+  * default                -> launches the GUI.
+  * --watchdog A B C D E   -> runs the independent watcher process (no window),
+                              where A=session_dir B=gui_pid C=stale_seconds
+                              D=sound E=messagebox.
 
 Keeping both roles in one file means the whole app ships as a single EXE.
 """
 
+import multiprocessing
 import sys
 
 
+def _safe_setup_logging(tag):
+    """setup_logging that can never kill a console=False exe.
+
+    A read-only APPDATA or an AV lock on the log folder must degrade to
+    'no file logs', not to a silent instant exit with zero feedback.
+    """
+    try:
+        from recorder.logging_setup import setup_logging
+        return setup_logging(tag=tag), None
+    except Exception:
+        import logging
+        import traceback
+        err = traceback.format_exc()
+        log = logging.getLogger("srr")
+        log.addHandler(logging.NullHandler())
+        try:
+            log.warning("setup_logging failed; continuing without file logs:\n%s",
+                        err)
+        except Exception:
+            pass
+        return log, err
+
+
 def main():
+    multiprocessing.freeze_support()
     argv = sys.argv[1:]
 
     if argv and argv[0] == "--watchdog":
-        # Watcher role: minimal, no GUI.
-        from recorder.logging_setup import setup_logging
+        # Watcher role: minimal, no GUI. Argument validation lives in
+        # watchdog_main itself; pass everything through unchanged.
+        _safe_setup_logging("watchdog")
         from recorder.watchdog import watchdog_main
-        setup_logging(tag="watchdog")
         watchdog_main(argv[1:])
         return
 
     # GUI role.
-    from recorder.logging_setup import setup_logging
-    log = setup_logging(tag="gui")
+    log, logging_err = _safe_setup_logging("gui")
     try:
         from ui.app import run
         run()
@@ -34,7 +59,11 @@ def main():
         try:
             import tkinter.messagebox as mb
             import traceback
-            mb.showerror("SimpleReliableRecorder crashed", traceback.format_exc())
+            detail = traceback.format_exc()
+            if logging_err:
+                detail = ("(logging also failed to initialize:\n"
+                          + logging_err + ")\n\n" + detail)
+            mb.showerror("SimpleReliableRecorder crashed", detail)
         except Exception:
             pass
         raise

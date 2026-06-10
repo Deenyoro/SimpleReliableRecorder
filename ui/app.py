@@ -7,6 +7,7 @@ off that core flow.
 
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -118,6 +119,18 @@ class App(tk.Tk):
         self._save_job = None
         self._combine_busy = False
         self._closing = False
+        # Re-entrancy latches: dialogs inside start_recording pump the Tk event
+        # loop, so a queued second click / tray / hotkey event could re-enter.
+        self._starting = False
+        self._finalizing = False
+        self._toggle_ts = 0.0
+        # Alert bookkeeping (dedup + rate limiting so retry loops can't strobe).
+        self._last_alert_reason = ""
+        self._last_alert_fx = 0.0
+        self._last_wd_reason = ""
+        self._last_wd_time = 0.0
+        self._poll_err_ts = {}
+        self._hotkey_job = None
 
         self.settings_win = None
         self.tray = None
@@ -146,6 +159,20 @@ class App(tk.Tk):
             self.after(0, fn)
         except Exception:
             pass
+
+    def report_callback_exception(self, exc, val, tb):
+        """Tk swallows callback exceptions into stderr - which is None in a
+        windowed build. Log them, and if a recording is running surface the
+        failure loudly instead of letting a broken button look like success."""
+        try:
+            log.error("UI callback error", exc_info=(exc, val, tb))
+        except Exception:
+            pass
+        if self.recording and not getattr(self, "_closing", False):
+            try:
+                self._raise_gold_alert(f"Internal UI error: {val}")
+            except Exception:
+                pass
 
     def _setup_tray(self):
         if not self.tray_var.get():
@@ -222,17 +249,36 @@ class App(tk.Tk):
             self._safe_after(lambda: self._apply_hotkey_mute(target, muted)))
         self._reconfigure_hotkeys()
 
+    def _request_hotkey_reconfig(self, delay=700):
+        """Coalesce hotkey setting changes so typing 'f8' doesn't bind 'f'."""
+        if self._hotkey_job:
+            try:
+                self.after_cancel(self._hotkey_job)
+            except Exception:
+                pass
+        self._hotkey_job = self.after(delay, self._reconfigure_hotkeys)
+
     def _reconfigure_hotkeys(self):
+        self._hotkey_job = None
         if not self.hotkeys:
             return
-        self.hotkeys.configure(
+        ok = self.hotkeys.configure(
             enabled=self.ptt_enabled_var.get(),
             hotkey=self.ptt_hotkey_var.get().strip(),
             mode=self.ptt_mode_var.get(),
-            target=self.ptt_target_var.get())
+            target=self.ptt_target_var.get(),
+            # Seed toggle mode with the real current mute state so the first
+            # press actually flips it instead of being a no-op.
+            initial_state=lambda: self._hotkey_target_muted(
+                self.ptt_target_var.get()))
+        if self.ptt_enabled_var.get() and not ok:
+            log.warning("Hotkey '%s' could not be registered - "
+                        "push-to-talk is INACTIVE.",
+                        self.ptt_hotkey_var.get().strip())
 
-    def _apply_hotkey_mute(self, target, muted):
-        """Mute/unmute the hotkey's target device(s). Empty target = all mics."""
+    def _hotkey_target_muted(self, target):
+        """True when every device the hotkey targets is currently muted."""
+        any_target = False
         for row in self._device_rows:
             d = row.get_selection()
             if not d:
@@ -240,7 +286,35 @@ class App(tk.Tk):
             key = f'{d["name"]}|{d["kind"]}'
             is_target = (target == key) if target else (d["kind"] == "input")
             if is_target:
-                row.set_muted(muted, notify=True)
+                any_target = True
+                if not row.is_muted():
+                    return False
+        return any_target
+
+    def _apply_hotkey_mute(self, target, muted):
+        """Mute/unmute the hotkey's target device(s). Empty target = all mics.
+
+        Hotkey mutes are a transient overlay: they never overwrite a mute the
+        user set by hand, releasing the key only unmutes rows the hotkey muted,
+        and _save_settings does not persist them - so a recording made next
+        week can't silently start with muted mics because PTT was tried once.
+        """
+        for row in self._device_rows:
+            d = row.get_selection()
+            if not d:
+                continue
+            key = f'{d["name"]}|{d["kind"]}'
+            is_target = (target == key) if target else (d["kind"] == "input")
+            if not is_target:
+                continue
+            if muted:
+                if not row.is_muted():
+                    row._hotkey_muted = True
+                    row.set_muted(True, notify=True)
+            else:
+                if getattr(row, "_hotkey_muted", False):
+                    row._hotkey_muted = False
+                    row.set_muted(False, notify=True)
 
     def _populate_ptt_devices(self):
         """Fill the push-to-talk device dropdown. Maps a friendly label to the
@@ -302,9 +376,12 @@ class App(tk.Tk):
                   self.ptt_target_var, self.ptt_mode_var):
             v.trace_add("write", lambda *a: self._save_settings())
         self.live_levels_var.trace_add("write", lambda *a: self._refresh_monitor())
+        # Debounced: rebinding on every keystroke of the hotkey field would
+        # briefly register single-character global hotkeys and (in ptt mode)
+        # mute the mics the moment the user types the first letter.
         for v in (self.ptt_enabled_var, self.ptt_hotkey_var,
                   self.ptt_target_var, self.ptt_mode_var):
-            v.trace_add("write", lambda *a: self._reconfigure_hotkeys())
+            v.trace_add("write", lambda *a: self._request_hotkey_reconfig())
 
     def _build_ui(self):
         root = ttk.Frame(self, style="TFrame")
@@ -424,7 +501,7 @@ class App(tk.Tk):
         ttk.Button(bottom, text="Open logs folder",
                    command=lambda: os.startfile(paths.logs_dir())).pack(side="left")
         ttk.Button(bottom, text="Close", style="Accent.TButton",
-                   command=win.destroy).pack(side="right")
+                   command=lambda: _on_settings_close()).pack(side="right")
 
         scroll = ScrollFrame(win)
         scroll.pack(fill="both", expand=True, padx=12, pady=(12, 0))
@@ -554,6 +631,13 @@ class App(tk.Tk):
 
         def _on_settings_close():
             self._save_settings()
+            # Commit any pending (debounced) hotkey change right away.
+            if self._hotkey_job:
+                try:
+                    self.after_cancel(self._hotkey_job)
+                except Exception:
+                    pass
+                self._reconfigure_hotkeys()
             self.settings_win = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_settings_close)
@@ -575,7 +659,8 @@ class App(tk.Tk):
             inner, style="Muted.TLabel", justify="left",
             text="Past recordings stay listed here so you can keep recording, "
             "then tick any and merge them into one file with the buttons below. "
-            "Right-click a recording to rename its folder (still tracked). "
+            "Double-click a recording to rename it (folder + every track); "
+            "right-click for more options. "
             "Entries whose files are moved are removed automatically.")
         desc.pack(fill="x", anchor="w")
         # Wrap the text to the actual panel width instead of a fixed value, so it
@@ -654,6 +739,15 @@ class App(tk.Tk):
             self._update_library_buttons()
 
     def _refresh_library(self, rescan=False):
+        # Remember which entries are ticked so a refresh (e.g. right after a
+        # long merge finishes) doesn't make the user re-find their selection.
+        ticked = set()
+        for r in self._lib_rows:
+            try:
+                if r["var"].get():
+                    ticked.add(r["entry"].get("id"))
+            except Exception:
+                pass
         # Prune anything whose files vanished, then rebuild the checklist.
         self._library, pruned = library.prune(self._library)
         if rescan:
@@ -662,8 +756,10 @@ class App(tk.Tk):
                 found = library.scan_folder(self.cfg.resolved_save_folder(),
                                             existing_dirs=known)
                 if found:
-                    found.sort(key=lambda e: e.get("created", ""))
                     self._library.extend(found)
+                    # Keep the whole list chronological so back-filled old
+                    # recordings don't show up above yesterday's takes.
+                    self._library.sort(key=lambda e: e.get("created") or "")
                     pruned = True
             except Exception as e:
                 log.warning("Library rescan failed: %s", e)
@@ -678,7 +774,7 @@ class App(tk.Tk):
         for e in reversed(self._library):  # newest first
             row = ttk.Frame(self.lib_body, style="Card.TFrame", padding=6)
             row.pack(fill="x", pady=2)
-            var = tk.BooleanVar(value=False)
+            var = tk.BooleanVar(value=(e.get("id") in ticked))
             cb = ToggleSwitch(row, var,
                               text=f'{e["name"]}  ({library.summarize(e)})',
                               command=self._update_library_buttons)
@@ -688,6 +784,10 @@ class App(tk.Tk):
                 if w is not None:
                     w.bind("<Button-3>",
                            lambda ev, ent=e: self._show_library_menu(ev, ent))
+            # Double-click the row background renames directly (kept off the
+            # toggle itself so it doesn't fight with ticking).
+            row.bind("<Double-Button-1>",
+                     lambda ev, ent=e: self._rename_entry(ent))
             self._lib_rows.append({"frame": row, "var": var, "entry": e})
         has = bool(self._library)
         self.lib_empty.pack_forget() if has else self.lib_empty.pack(
@@ -752,7 +852,8 @@ class App(tk.Tk):
                     "Untick the audio-only ones, or use an audio option instead.")
                 return
             ext = self.container_var.get()
-            out = os.path.join(out_dir, f"{prefix}_merged_{stamp}.{ext}")
+            out = self._unique_path(
+                os.path.join(out_dir, f"{prefix}_merged_{stamp}.{ext}"))
             sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
                         for e in sel]
             self._run_combine(
@@ -764,7 +865,8 @@ class App(tk.Tk):
                                     "Select recordings with at least two audio "
                                     "tracks between them.")
                 return
-            out = os.path.join(out_dir, f"{prefix}_multitrack_{stamp}.wav")
+            out = self._unique_path(
+                os.path.join(out_dir, f"{prefix}_multitrack_{stamp}.wav"))
             self._run_combine(
                 lambda: combine.merge_audio_to_channels(audio, out), out)
         else:  # mix
@@ -772,7 +874,8 @@ class App(tk.Tk):
             if not audio:
                 messagebox.showinfo("No audio", "No audio in the selection.")
                 return
-            out = os.path.join(out_dir, f"{prefix}_mixed_{stamp}.wav")
+            out = self._unique_path(
+                os.path.join(out_dir, f"{prefix}_mixed_{stamp}.wav"))
             self._run_combine(
                 lambda: combine.mix_audio_to_stereo(audio, out), out)
 
@@ -794,7 +897,8 @@ class App(tk.Tk):
         ext = spec[0]
         out_dir = entry.get("out_dir") or self.cfg.resolved_save_folder()
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out = os.path.join(out_dir, f"{entry['name']}_converted_{stamp}.{ext}")
+        out = self._unique_path(
+            os.path.join(out_dir, f"{entry['name']}_converted_{stamp}.{ext}"))
         self._run_combine(
             lambda: combine.convert(entry, out, fmt_label, audio_mode), out)
 
@@ -849,8 +953,12 @@ class App(tk.Tk):
             if n_audio < 2:
                 txt += "  (Only one audio track, so the audio handling choice " \
                        "has no effect.)"
+            elif mode_var.get() == "tracks" and ext == "mp3" and n_audio > 2:
+                txt += ("  Note: MP3 holds at most 2 channels - with "
+                        f"{n_audio} sources pick 'Mix' or another format.")
             info.config(text=txt)
         fmt_var.trace_add("write", describe)
+        mode_var.trace_add("write", describe)
         describe()
 
         btns = ttk.Frame(frm, style="TFrame")
@@ -957,6 +1065,12 @@ class App(tk.Tk):
         folder and its tracks share one name. Keeps all library-tracked paths
         pointing at the renamed files. Non-destructive otherwise."""
         from tkinter import simpledialog
+        if getattr(self, "_combine_busy", False):
+            messagebox.showinfo(
+                "Please wait",
+                "A merge/convert is running - rename when it finishes so its "
+                "output isn't pulled out from under it.")
+            return
         old_dir = entry.get("out_dir") or ""
         if not old_dir or not os.path.isdir(old_dir):
             messagebox.showinfo("Rename", "This recording's folder no longer exists.")
@@ -975,14 +1089,36 @@ class App(tk.Tk):
         safe = safe.rstrip(". ")  # Windows dislikes trailing dot/space
         while "  " in safe:
             safe = safe.replace("  ", " ")
-        if not safe or safe == old_base:
+        if not safe:
+            messagebox.showinfo(
+                "Rename", "That name has no usable characters - use letters, "
+                "numbers, spaces, - _ . ( ).")
+            return
+        if safe.split(".")[0].upper() in (
+                "CON", "PRN", "AUX", "NUL",
+                "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+                "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
+                "LPT8", "LPT9"):
+            messagebox.showinfo("Rename",
+                                f"'{safe}' is a reserved name on Windows - "
+                                "pick another.")
+            return
+        if safe == old_base:
             return
         new_dir = os.path.join(parent_dir, safe)
-        if os.path.exists(new_dir):
+        case_only = safe.lower() == old_base.lower()
+        if os.path.exists(new_dir) and not case_only:
             messagebox.showerror("Rename", f"A folder named '{safe}' already exists.")
             return
         try:
-            os.rename(old_dir, new_dir)
+            if case_only:
+                # NTFS is case-insensitive: go through a temp name so a
+                # capitalization fix ("daytona" -> "Daytona") works.
+                tmp = new_dir + ".renaming-tmp"
+                os.rename(old_dir, tmp)
+                os.rename(tmp, new_dir)
+            else:
+                os.rename(old_dir, new_dir)
         except Exception as e:
             messagebox.showerror("Rename failed",
                                  f"Could not rename the folder:\n{e}")
@@ -1009,6 +1145,7 @@ class App(tk.Tk):
                     return safe + stem[len("SRR"):] + ext
             return None  # leave anything else untouched
 
+        failures = []
         try:
             for fname in os.listdir(new_dir):
                 full = os.path.join(new_dir, fname)
@@ -1018,15 +1155,30 @@ class App(tk.Tk):
                 if not nf or nf == fname:
                     continue
                 target = os.path.join(new_dir, nf)
-                if os.path.exists(target):
+                file_case_only = nf.lower() == fname.lower()
+                if os.path.exists(target) and not file_case_only:
                     continue  # never clobber an existing file
                 try:
-                    os.rename(full, target)
+                    if file_case_only:
+                        tmp = target + ".renaming-tmp"
+                        os.rename(full, tmp)
+                        os.rename(tmp, target)
+                    else:
+                        os.rename(full, target)
                     name_map[fname] = nf
                 except Exception as e:
                     log.warning("Could not rename '%s' -> '%s': %s", fname, nf, e)
+                    failures.append(fname)
         except Exception as e:
             log.warning("Rename pass over folder failed: %s", e)
+        if failures:
+            messagebox.showwarning(
+                "Some files kept their old names",
+                "The folder was renamed, but these files are open in another "
+                "program and kept their old names:\n\n  "
+                + "\n  ".join(failures[:8])
+                + ("\n  ..." if len(failures) > 8 else "")
+                + "\n\nClose the program using them and rename again.")
 
         # Remap tracked paths: move into new_dir and apply the filename map.
         def remap(p):
@@ -1088,7 +1240,9 @@ class App(tk.Tk):
                              "kind": d["kind"], "hostapi": d["hostapi"]})
                 key = f'{d["name"]}|{d["kind"]}'
                 gains[key] = round(row.get_gain(), 3)
-                mutes[key] = row.is_muted()
+                # Hotkey (PTT) mutes are transient - never persist them.
+                mutes[key] = row.is_muted() and not getattr(
+                    row, "_hotkey_muted", False)
         self.cfg.update({
             "audio_sources": sels,
             "audio_gains": gains,
@@ -1101,7 +1255,7 @@ class App(tk.Tk):
             "screen_encoder": self.encoder_var.get(),
             "screen_container": self.container_var.get(),
             "screen_codec": self.codec_var.get(),
-            "screen_framerate": int(self.fps_var.get()),
+            "screen_framerate": self._fps(),
             "screen_quality": self.quality_var.get(),
             "screen_reliability": self.reliability_var.get(),
             "save_folder": self.folder_var.get(),
@@ -1119,6 +1273,16 @@ class App(tk.Tk):
             "ptt_target": self.ptt_target_var.get(),
             "ptt_mode": self.ptt_mode_var.get(),
         })
+
+    def _fps(self):
+        """Screen FPS, tolerant of a blank/partial Spinbox (IntVar.get raises
+        TclError on non-integer text, which would otherwise kill the autosave
+        trace or the screen start)."""
+        try:
+            v = int(self.fps_var.get())
+        except Exception:
+            return 30
+        return max(1, min(120, v))
 
     # ------------------------------------------------------------- devices #
     def _gain_for(self, preset):
@@ -1301,6 +1465,12 @@ class App(tk.Tk):
 
     # ---------------------------------------------------------- recording #
     def _toggle_record(self):
+        # Debounce: a double-click must not stop the take it just started
+        # (or start a second one the instant the user stops).
+        now = time.monotonic()
+        if now - self._toggle_ts < 0.5:
+            return
+        self._toggle_ts = now
         if self.recording:
             self.stop_recording()
         else:
@@ -1332,6 +1502,17 @@ class App(tk.Tk):
         return sources
 
     def start_recording(self):
+        # Latch against re-entry: the dialogs below pump the Tk event loop, so
+        # a double-click / tray click / hotkey could start a second session.
+        if self.recording or self._starting or self._finalizing:
+            return
+        self._starting = True
+        try:
+            self._start_recording_inner()
+        finally:
+            self._starting = False
+
+    def _start_recording_inner(self):
         sources = self._gather_sources()
         if not sources and not self.screen_enabled.get():
             messagebox.showwarning("Nothing selected",
@@ -1402,11 +1583,19 @@ class App(tk.Tk):
                 self.last_outputs["audio"] = list(self.audio_rec.output_files)
             except Exception as e:
                 log.exception("Audio start failed: %s", e)
-                messagebox.showerror("Audio error", f"Could not start audio:\n{e}")
+                # If capture threads were already spawned, shut them down so
+                # they don't keep the devices open and write orphan files.
+                try:
+                    if self.audio_rec:
+                        self.audio_rec.stop()
+                except Exception:
+                    pass
                 self.audio_rec = None
+                messagebox.showerror("Audio error", f"Could not start audio:\n{e}")
                 self._refresh_monitor()
                 return
 
+        screen_error = None
         if self.screen_enabled.get():
             try:
                 mons = list_monitors()
@@ -1421,7 +1610,7 @@ class App(tk.Tk):
                 self.screen_rec = ScreenRecorder(
                     mon, vpath, encoder_family=self.encoder_var.get(),
                     codec=self.codec_var.get(), container=ext,
-                    framerate=int(self.fps_var.get()), quality=self.quality_var.get(),
+                    framerate=self._fps(), quality=self.quality_var.get(),
                     capture_method=self.cfg.get("screen_capture_method"),
                     on_error=self._on_subsystem_error, available=self.encoders,
                     reliability=self.reliability_var.get())
@@ -1431,7 +1620,29 @@ class App(tk.Tk):
             except Exception as e:
                 log.exception("Screen start failed: %s", e)
                 self.screen_rec = None
-                self._raise_gold_alert(f"Screen recording failed to start: {e}")
+                screen_error = str(e)
+
+        if self.audio_rec is None and self.screen_rec is None:
+            # NOTHING actually started. Never enter the recording state - a red
+            # button over zero capture is the worst possible lie this app can
+            # tell. Surface the failure and bail out cleanly.
+            self.status_lbl.config(text="Idle.")
+            messagebox.showerror(
+                "Recording did NOT start",
+                "Screen recording failed to start and no audio devices are "
+                "selected.\n\n" + (screen_error or "Unknown error.")
+                + "\n\nNothing is being recorded.")
+            self._refresh_monitor()
+            return
+
+        # Reset liveness tracking BEFORE the heartbeat thread starts, so its
+        # first write can never be computed from the previous take's state
+        # (that race produced a stale heartbeat the watchdog could alert on).
+        self._record_start_mono = time.monotonic()
+        self._screen_last_size = -1
+        self._screen_last_grow = time.monotonic()
+        self._restart_cooldown = {}
+        self.recording = True
 
         self.heartbeat = watchdog.HeartbeatWriter(self.session_dir,
                                                   self._heartbeat_status)
@@ -1446,13 +1657,13 @@ class App(tk.Tk):
             self.wd_proc = None
             log.info("Background watchdog process disabled in settings.")
 
-        self._record_start_mono = time.monotonic()
-        # Reset screen liveness tracking for the new take.
-        self._screen_last_size = -1
-        self._screen_last_grow = time.monotonic()
-        self.recording = True
         self._set_recording_ui(True)
         log.info("RECORDING STARTED -> %s", out_dir)
+        if screen_error:
+            # Raised after recording=True so the auto-restart path can act
+            # on a start-time screen failure too (audio is still running).
+            self._raise_gold_alert(
+                f"Screen recording failed to start: {screen_error}")
 
     # Seconds after pressing record during which subsystems are still spinning
     # up; no "stopped" alert is raised in this window (prevents a false alarm the
@@ -1508,20 +1719,31 @@ class App(tk.Tk):
                 self._screen_last_size = size
             self._screen_last_grow = last_grow
             size_age = now - last_grow
-            progress_ok = (pa < 0) or (pa < 8.0)
+            # progress_age is stamped at spawn, so -1 means "no live process"
+            # - that is NOT healthy (outside warm-up). An ffmpeg that never
+            # produces its first frame must trip the stall alarm, not hide.
+            progress_ok = (0.0 <= pa < 8.0)
             size_ok = size_age < 12.0
             st["screen_progressing"] = bool(warming_up or progress_ok or size_ok)
         else:
             st["screen_enabled"] = False
         return st
 
-    def stop_recording(self):
-        if not self.recording:
+    def stop_recording(self, blocking=False):
+        """Stop the take. The fast parts (heartbeat/watchdog teardown) happen
+        inline; the slow parts (audio writer flush, ffmpeg 'q' + remux, which
+        can take minutes for a long MP4) run on a worker thread so the window
+        never goes 'Not responding' right after the user hits STOP - that's
+        exactly when a panicked user would End-Task the app mid-finalize.
+        blocking=True (used by on_close) finalizes synchronously instead."""
+        if not self.recording or self._finalizing:
             return
         log.info("Stopping recording...")
         self.recording = False
+        self._finalizing = True
         if self.heartbeat:
             self.heartbeat.stop()
+            self.heartbeat = None
         if self.session_dir:
             watchdog.write_stop_flag(self.session_dir)
         if self.wd_proc:
@@ -1529,23 +1751,57 @@ class App(tk.Tk):
                 self.wd_proc.terminate()
             except Exception:
                 pass
-        if self.audio_rec:
-            try:
-                self.last_outputs["audio"] = self.audio_rec.stop()
-            except Exception as e:
-                log.exception("audio stop error: %s", e)
-            self.audio_rec = None
-        if self.screen_rec:
-            try:
-                self.last_outputs["video"] = self.screen_rec.stop()
-            except Exception as e:
-                log.exception("screen stop error: %s", e)
-            self.screen_rec = None
-
+            self.wd_proc = None
+        arec, srec = self.audio_rec, self.screen_rec
+        self.audio_rec = None
+        self.screen_rec = None
         self._set_recording_ui(False)
-        self._add_to_library(select_new=True)
-        log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
-        self._refresh_monitor()
+        self.record_btn.config(state="disabled")
+        self.status_lbl.config(text="Finalizing recording...")
+
+        def finalize():
+            audio_files, video_path = None, None
+            if arec:
+                try:
+                    audio_files = arec.stop()
+                except Exception as e:
+                    log.exception("audio stop error: %s", e)
+            if srec:
+                try:
+                    video_path = srec.stop()
+                except Exception as e:
+                    log.exception("screen stop error: %s", e)
+            return audio_files, video_path
+
+        def done(audio_files, video_path):
+            # Merge instead of replace: restart segments collected earlier in
+            # last_outputs must survive (they used to be silently dropped).
+            if audio_files:
+                merged = list(self.last_outputs.get("audio") or [])
+                for f in audio_files:
+                    if f and f not in merged:
+                        merged.append(f)
+                self.last_outputs["audio"] = merged
+            if video_path:
+                self.last_outputs["video"] = video_path
+            self._finalizing = False
+            try:
+                self.record_btn.config(state="normal")
+                self.status_lbl.config(text="Idle.")
+            except Exception:
+                pass
+            self._add_to_library(select_new=True)
+            log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
+            self._refresh_monitor()
+
+        if blocking:
+            a, v = finalize()
+            done(a, v)
+        else:
+            def work():
+                a, v = finalize()
+                self._safe_after(lambda: done(a, v))
+            threading.Thread(target=work, name="finalize", daemon=True).start()
 
     def _set_recording_ui(self, on):
         if on:
@@ -1568,29 +1824,48 @@ class App(tk.Tk):
         self._log_queue.put((f"SUBSYSTEM ERROR [{label}]: {reason}", 40))
         self._safe_after(lambda: self._raise_gold_alert(f"[{label}] {reason}"))
 
+    def _root_hwnd(self):
+        """Top-level window handle. winfo_id() on a Tk root is the CHILD hwnd,
+        and FlashWindowEx on a child does not flash the taskbar button."""
+        try:
+            import ctypes
+            h = ctypes.windll.user32.GetAncestor(self.winfo_id(), 2)  # GA_ROOT
+            return h or self.winfo_id()
+        except Exception:
+            return self.winfo_id()
+
     def _raise_gold_alert(self, reason):
-        if self.alerting and self.banner.winfo_manager():
-            self.banner.show(reason)
-            return
+        now = time.monotonic()
+        first = not self.alerting
+        new_reason = reason != self._last_alert_reason
         self.alerting = True
-        log.error("GOLD ALERT: %s", reason)
+        self._last_alert_reason = reason
+        if first or new_reason:
+            log.error("GOLD ALERT: %s", reason)
         if self.banner_var.get():
             self.banner.show(reason)
-        if self.sound_var.get():
-            alerts.beep()
-        if self.taskbar_var.get():
-            try:
-                alerts.flash_taskbar(self.winfo_id())
-            except Exception:
-                pass
-        if self.autorestart_var.get() and self.recording:
-            self.after(500, self._auto_restart_failed)
+        # Rate-limit the loud channels so a device retry loop (every 0.5s)
+        # can't strobe the beep/flash - and so they keep working even when the
+        # banner channel is switched off (the old dedup keyed on the banner
+        # being visible, which silenced everything else with it).
+        if first or new_reason or (now - self._last_alert_fx) > 5.0:
+            self._last_alert_fx = now
+            if self.sound_var.get():
+                alerts.beep()
+            if self.taskbar_var.get():
+                try:
+                    alerts.flash_taskbar(self._root_hwnd())
+                except Exception:
+                    pass
+            if self.autorestart_var.get() and self.recording:
+                self.after(500, self._auto_restart_failed)
 
     def _dismiss_alert(self):
         self.alerting = False
+        self._last_alert_reason = ""
         alerts.stop_beep()
         try:
-            alerts.stop_flash_taskbar(self.winfo_id())
+            alerts.stop_flash_taskbar(self._root_hwnd())
         except Exception:
             pass
         if self.session_dir:
@@ -1612,16 +1887,37 @@ class App(tk.Tk):
                 log.warning("Auto-restarting SCREEN subsystem...")
                 self._restart_screen()
 
+    def _merge_audio_outputs(self, files):
+        """Add finalized file paths into last_outputs['audio'] without dupes."""
+        if not files:
+            return
+        merged = list(self.last_outputs.get("audio") or [])
+        for f in files:
+            if f and f not in merged:
+                merged.append(f)
+        self.last_outputs["audio"] = merged
+
     def _restart_audio(self):
         try:
             sources = self._gather_sources()
             out_dir = self.last_outputs.get("out_dir")
             if not sources or not out_dir:
                 return
-            try:
-                self.audio_rec.stop()
-            except Exception:
-                pass
+            old = self.audio_rec
+            self.audio_rec = None
+            if old is not None:
+                # Stop off the Tk thread (stop() can block seconds per device)
+                # and keep its finalized files - incl. any 4GiB rollover
+                # segments - in last_outputs so the take stays complete.
+                def _stop_old_audio():
+                    try:
+                        files = old.stop()
+                    except Exception:
+                        log.exception("old audio recorder stop failed")
+                        files = []
+                    self._safe_after(lambda: self._merge_audio_outputs(files))
+                threading.Thread(target=_stop_old_audio,
+                                 name="audio-restart-stop", daemon=True).start()
             base = self._combine_base() + "_restart-" + datetime.now().strftime("%H%M%S")
             self._record_start_mono = time.monotonic()  # give the restart grace too
             self.audio_rec = AudioRecorder(
@@ -1642,6 +1938,24 @@ class App(tk.Tk):
                        mons[0] if mons else None)
             if mon is None or not out_dir:
                 return
+            old = self.screen_rec
+            self.screen_rec = None
+            if old is not None:
+                # Finalize the dead recorder's file off-thread: for hybrid MP4
+                # this runs the remux, so the pre-crash segment stays playable
+                # on disk instead of being abandoned as a .recording fragment.
+                def _stop_old_screen():
+                    try:
+                        p = old.stop()
+                    except Exception:
+                        log.exception("old screen recorder stop failed")
+                        p = None
+                    if p:
+                        self._safe_after(
+                            lambda: self.last_outputs.setdefault(
+                                "videos_extra", []).append(p))
+                threading.Thread(target=_stop_old_screen,
+                                 name="screen-restart-stop", daemon=True).start()
             ext = self.container_var.get()
             vpath = os.path.join(
                 out_dir,
@@ -1649,11 +1963,15 @@ class App(tk.Tk):
             self.screen_rec = ScreenRecorder(
                 mon, vpath, encoder_family=self.encoder_var.get(),
                 codec=self.codec_var.get(), container=ext,
-                framerate=int(self.fps_var.get()), quality=self.quality_var.get(),
+                framerate=self._fps(), quality=self.quality_var.get(),
                 capture_method=self.cfg.get("screen_capture_method"),
                 on_error=self._on_subsystem_error, available=self.encoders,
                 reliability=self.reliability_var.get())
             self.screen_rec.start()
+            # Reset growth tracking: the new (smaller) file must not have to
+            # out-grow the old one's byte count before it registers as alive.
+            self._screen_last_size = -1
+            self._screen_last_grow = time.monotonic()
             log.info("Screen subsystem restarted -> %s", vpath)
         except Exception as e:
             log.exception("Screen restart failed: %s", e)
@@ -1662,21 +1980,44 @@ class App(tk.Tk):
         self._dismiss_alert()
         if self.recording:
             self.stop_recording()
-        self.after(400, self.start_recording)
+        # stop_recording finalizes on a worker thread; start once it's done.
+        self._restart_when_ready(time.monotonic() + 30.0)
+
+    def _restart_when_ready(self, deadline):
+        if self._finalizing and time.monotonic() < deadline:
+            self.after(300, lambda: self._restart_when_ready(deadline))
+            return
+        self.start_recording()
 
     # --------------------------------------------------------- poll loops #
     def _poll(self):
         if getattr(self, "_closing", False):
             return
+        # Each step gets its own guard: one repeatedly-failing step (e.g. a
+        # status-light hiccup) must not silently disable ALERT.json polling -
+        # that would kill every alert channel for the rest of the recording.
         try:
             self._drain_log()
-            if self.recording:
-                self._update_status_lights()
-                self._check_watchdog_alert()
         except Exception as e:
-            log.debug("poll error: %s", e)
+            self._poll_err("log", e)
+        if self.recording:
+            try:
+                self._update_status_lights()
+            except Exception as e:
+                self._poll_err("lights", e)
+            try:
+                self._check_watchdog_alert()
+            except Exception as e:
+                self._poll_err("alert", e)
         if not getattr(self, "_closing", False):
             self.after(400, self._poll)
+
+    def _poll_err(self, key, e):
+        """Log poll-step failures visibly, throttled to one per 30s per step."""
+        now = time.monotonic()
+        if now - self._poll_err_ts.get(key, 0.0) > 30.0:
+            self._poll_err_ts[key] = now
+            log.warning("poll step '%s' failing: %s", key, e)
 
     def _meter_loop(self):
         if getattr(self, "_closing", False):
@@ -1723,12 +2064,35 @@ class App(tk.Tk):
         if not self.session_dir:
             return
         alert = watchdog.read_alert(self.session_dir)
-        if alert and not self.alerting:
-            self._raise_gold_alert(alert.get("reason", "Recording problem detected."))
+        if not alert:
+            return
+        # Dedup on content + a window, NOT on self.alerting: gating on the
+        # latched flag meant one early alert suppressed every later (different)
+        # watchdog alert for the rest of the session.
+        reason = alert.get("reason", "Recording problem detected.")
+        now = time.monotonic()
+        if reason == self._last_wd_reason and (now - self._last_wd_time) < 30.0:
+            return
+        self._last_wd_reason = reason
+        self._last_wd_time = now
+        self._raise_gold_alert(reason)
 
     # ----------------------------------------------------------- combine #
     def _combine_base(self):
         return getattr(self, "_session_base", None) or "SRR_recording"
+
+    @staticmethod
+    def _unique_path(path):
+        """Never silently overwrite an existing export (the stamp is only
+        second-granular, so two quick runs can collide)."""
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        for i in range(2, 100):
+            cand = f"{stem}_{i}{ext}"
+            if not os.path.exists(cand):
+                return cand
+        return path
 
     def _run_combine(self, fn, out):
         if getattr(self, "_combine_busy", False):
@@ -1749,7 +2113,13 @@ class App(tk.Tk):
 
     def _combine_done(self, ok, out, detail):
         self._combine_busy = False
-        self.status_lbl.config(text="Idle.")
+        # Don't stomp the status of a recording that started mid-merge.
+        if self.recording:
+            self.status_lbl.config(text="Recording...")
+        elif self._finalizing:
+            self.status_lbl.config(text="Finalizing recording...")
+        else:
+            self.status_lbl.config(text="Idle.")
         if ok and os.path.isfile(out):
             log.info("Combined -> %s", out)
             self._refresh_library()  # the merged file may add a new session folder
@@ -1770,28 +2140,59 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------- close #
     def on_close(self):
+        # The teardown below must ONLY run when the user really is quitting.
+        # (A previous version ran it from a finally: even when the user
+        # answered "No, keep recording" - destroying the window and orphaning
+        # the recording. Never put the cancel return inside that try.)
+        if getattr(self, "_closing", False):
+            return
+        if self.recording:
+            if not messagebox.askyesno("Quit",
+                                       "Recording is active. Stop and quit?"):
+                return
+        if self._combine_busy:
+            if not messagebox.askyesno(
+                    "Quit",
+                    "A merge/convert is still running and will be abandoned "
+                    "if you quit now.\n\nQuit anyway?"):
+                return
+        if self.recording:
+            try:
+                self.stop_recording(blocking=True)
+            except Exception:
+                log.exception("stop during close failed")
+        elif self._finalizing:
+            # A background finalize is still flushing files - wait for it so
+            # quitting can't truncate the recording it just made.
+            deadline = time.monotonic() + 30.0
+            while self._finalizing and time.monotonic() < deadline:
+                try:
+                    self.update()
+                except Exception:
+                    break
+                time.sleep(0.05)
         try:
-            if self.recording:
-                if not messagebox.askyesno("Quit", "Recording is active. Stop and quit?"):
-                    return
-                self.stop_recording()
             self._save_settings()
-        finally:
-            # Stop the after() poll/meter loops cleanly so they don't fire on a
-            # destroyed window (which would raise TclError during shutdown).
-            self._closing = True
-            self._stop_monitor()
-            if self.hotkeys:
-                try:
-                    self.hotkeys.stop()
-                except Exception:
-                    pass
-            if self.tray:
-                try:
-                    self.tray.stop()
-                except Exception:
-                    pass
+        except Exception:
+            pass
+        # Stop the after() poll/meter loops cleanly so they don't fire on a
+        # destroyed window (which would raise TclError during shutdown).
+        self._closing = True
+        self._stop_monitor()
+        if self.hotkeys:
+            try:
+                self.hotkeys.stop()
+            except Exception:
+                pass
+        if self.tray:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
+        try:
             self.destroy()
+        except Exception:
+            pass
 
 
 def _fmt_elapsed(seconds):

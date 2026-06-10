@@ -12,7 +12,7 @@ Two cooperating pieces:
    It tails heartbeat.json and, if recording should be happening but a subsystem
    has gone quiet (or the whole GUI has hung), it writes <session>/ALERT.json
    (which the GUI polls to raise the gold banner) AND shows an OS message box +
-   sound itself — so even a fully-hung GUI cannot hide a recording failure.
+   sound itself - so even a fully-hung GUI cannot hide a recording failure.
 """
 
 import json
@@ -135,6 +135,13 @@ def spawn_watchdog(session_dir, gui_pid, stale_seconds=6, alert_sound=True,
 
     args = ["--watchdog", session_dir, str(gui_pid), str(stale_seconds),
             "1" if alert_sound else "0", "1" if show_messagebox else "0"]
+    # Optional trailing arg: the GUI's process create time, so the watcher can
+    # tell a reused PID from the real GUI. Older arg counts still work.
+    try:
+        import psutil
+        args.append(str(psutil.Process(gui_pid).create_time()))
+    except Exception:
+        pass
     if paths.is_frozen():
         cmd = [sys.executable] + args
     else:
@@ -151,13 +158,122 @@ def spawn_watchdog(session_dir, gui_pid, stale_seconds=6, alert_sound=True,
 
 
 # --------------------------------------------------------------------------- #
-# The watcher process entry point
+# The watcher process: decision logic + entry point
 # --------------------------------------------------------------------------- #
+# Seconds the GUI gets at startup before a missing heartbeat counts against it.
+HB_GRACE_SECONDS = 4.0
+
+
+class WatchdogState:
+    """Per-session counters for the heartbeat decision logic."""
+
+    def __init__(self):
+        self.screen_stall_count = 0
+        self.audio_stall_count = 0
+        self.hb_missing_polls = 0
+        self.hb_stale_polls = 0
+        self.last_hb_raw = None
+        self.last_change_mono = None
+
+
+def evaluate_heartbeat(state, raw, hb, mono_now, stale, in_grace):
+    """One decision step over the latest heartbeat read (polled at ~1s).
+
+    `raw` is the heartbeat file's bytes (None if missing/unreadable), `hb` the
+    parsed dict (None if missing/unparseable), `mono_now` a time.monotonic()
+    stamp from THIS process. Returns (action, reason) with action one of
+    "alert", "clear", "wait". Pure (no I/O, no clocks of its own) so the
+    stall / staleness rules can be exercised directly.
+    """
+    if hb is None:
+        # The GUI process exists but is not reporting. Tolerate transient
+        # write races and slow starts; alert once it stays missing for
+        # (stale + grace) consecutive polls past the startup grace window.
+        state.hb_missing_polls += 1
+        if not in_grace and state.hb_missing_polls >= stale + HB_GRACE_SECONDS:
+            return "alert", "Recorder is running but not reporting (no heartbeat)."
+        return "wait", None
+    state.hb_missing_polls = 0
+
+    # Staleness = the heartbeat CONTENT stopped changing, measured on OUR
+    # monotonic clock. Comparing wall clocks across processes false-alarms on
+    # NTP steps and sleep/resume; unchanged content cannot (every healthy
+    # write bumps wall_time, so healthy bytes always differ).
+    if raw != state.last_hb_raw:
+        state.last_hb_raw = raw
+        state.last_change_mono = mono_now
+
+    if not hb.get("recording", False):
+        # Not recording: nothing to watch.
+        state.screen_stall_count = 0
+        state.audio_stall_count = 0
+        state.hb_stale_polls = 0
+        return "clear", None
+
+    if (state.last_change_mono is not None
+            and mono_now - state.last_change_mono > stale):
+        state.hb_stale_polls += 1
+        if state.hb_stale_polls >= 2:
+            # Static reason so the dedup holds and the beep fires only once.
+            return "alert", ("App not responding - heartbeat not updating "
+                             "while recording.")
+        return "wait", None
+    state.hb_stale_polls = 0
+
+    # The GUI flags the first few seconds after pressing record as a startup
+    # grace window. Never raise a subsystem-stopped alert during it: streams
+    # and encoders are still spinning up and the first disk write may not have
+    # landed yet. Defense in depth alongside the GUI's own grace handling.
+    if hb.get("startup_grace", False):
+        state.screen_stall_count = 0
+        state.audio_stall_count = 0
+        return "clear", None
+
+    if not hb.get("audio_ok", True):
+        # Require the failure to persist for two polls, same as screen, so a
+        # single missed write can never raise a false alarm.
+        state.audio_stall_count += 1
+        if state.audio_stall_count >= 2:
+            return "alert", ("AUDIO recording stopped (no audio written recently). "
+                             + (hb.get("audio_detail") or ""))
+        return "wait", None
+    state.audio_stall_count = 0
+
+    if hb.get("screen_enabled") and not hb.get("screen_alive", False):
+        # The encoder process is gone. Require it to stay gone for a
+        # couple of polls so a momentary auto-restart gap is not flagged.
+        state.screen_stall_count += 1
+        if state.screen_stall_count >= 2:
+            return "alert", "SCREEN recording stopped (encoder process exited)."
+        return "wait", None
+    if hb.get("screen_enabled") and not hb.get("screen_progressing", True):
+        # screen_progressing is computed in the GUI from ffmpeg's machine
+        # readable -progress stream (out_time advancing) OR the output file
+        # growing - both encoder agnostic. Only a genuine stall (neither
+        # advancing) gets here, and we still require it to persist.
+        state.screen_stall_count += 1
+        if state.screen_stall_count >= 2:
+            return "alert", "SCREEN recording stalled (no encoder progress)."
+        return "wait", None
+    state.screen_stall_count = 0
+    return "clear", None
+
+
 def watchdog_main(argv):
-    """argv = [session_dir, gui_pid, stale_seconds, alert_sound, show_messagebox]"""
+    """argv = [session_dir, gui_pid, stale_seconds, alert_sound,
+    show_messagebox, gui_create_time?] - trailing args are optional."""
+    if not argv:
+        log.error("WATCHDOG: missing arguments (need at least session_dir); "
+                  "exiting.")
+        return 2
     session_dir = argv[0]
-    gui_pid = int(argv[1]) if len(argv) > 1 else 0
-    stale = float(argv[2]) if len(argv) > 2 else 6.0
+    try:
+        gui_pid = int(argv[1]) if len(argv) > 1 else 0
+        stale = float(argv[2]) if len(argv) > 2 else 6.0
+        gui_create_time = float(argv[5]) if len(argv) > 5 else None
+    except (TypeError, ValueError):
+        log.error("WATCHDOG: bad arguments %r; exiting.", argv)
+        return 2
     alert_sound = (argv[3] == "1") if len(argv) > 3 else True
     show_messagebox = (argv[4] == "1") if len(argv) > 4 else True
 
@@ -167,8 +283,7 @@ def watchdog_main(argv):
     hb_path = os.path.join(session_dir, HEARTBEAT_FILE)
     stop_path = os.path.join(session_dir, STOP_FILE)
 
-    prev_screen_size = -1
-    screen_stall_count = 0
+    state = WatchdogState()
     last_alert_reason = None
     box_open = threading.Event()
 
@@ -177,14 +292,26 @@ def watchdog_main(argv):
             return True
         try:
             import psutil
-            return psutil.pid_exists(gui_pid)
+            if not psutil.pid_exists(gui_pid):
+                return False
+            if gui_create_time is not None:
+                try:
+                    # Guard against PID reuse: a different process wearing the
+                    # GUI's old PID must still count as "GUI gone".
+                    ct = psutil.Process(gui_pid).create_time()
+                    if abs(ct - gui_create_time) > 1.0:
+                        return False
+                except Exception:
+                    pass
+            return True
         except Exception:
             # Fallback: assume alive (avoid false alarms without psutil).
             return True
 
-    def raise_alert(reason):
+    def raise_alert(reason, sync=False):
         nonlocal last_alert_reason
         log.error("WATCHDOG ALERT: %s", reason)
+        # ALERT.json first - the GUI banner must never depend on box/sound.
         try:
             with open(os.path.join(session_dir, ALERT_FILE) + ".tmp", "w",
                       encoding="utf-8") as fh:
@@ -193,9 +320,23 @@ def watchdog_main(argv):
                        os.path.join(session_dir, ALERT_FILE))
         except Exception:
             pass
-        if reason == last_alert_reason:
+        if reason == last_alert_reason and not sync:
             return
         last_alert_reason = reason
+        if sync:
+            # Last alert before this process exits: sound and box must run on
+            # THIS thread, otherwise process teardown destroys the box
+            # mid-display and cuts the sound off.
+            if alert_sound:
+                alerts.beep(loop=False)
+            if show_messagebox:
+                alerts.message_box(
+                    "SimpleReliableRecorder - RECORDING STOPPED",
+                    reason + "\n\nRecording may have stopped. Check the app and "
+                    "restart recording immediately.")
+            elif alert_sound:
+                time.sleep(2.5)  # let the async sound finish before exit
+            return
         if alert_sound:
             alerts.beep(loop=False)
         if show_messagebox and not box_open.is_set():
@@ -203,88 +344,49 @@ def watchdog_main(argv):
 
             def _box():
                 alerts.message_box(
-                    "SimpleReliableRecorder — RECORDING STOPPED",
+                    "SimpleReliableRecorder - RECORDING STOPPED",
                     reason + "\n\nRecording may have stopped. Check the app and "
                     "restart recording immediately.")
                 box_open.clear()
             threading.Thread(target=_box, daemon=True).start()
 
-    grace_until = time.time() + 4  # give the GUI a moment to write the first heartbeat
+    grace_until = time.monotonic() + HB_GRACE_SECONDS  # first-heartbeat grace
     while True:
         if os.path.isfile(stop_path):
             log.info("WATCHDOG stop flag seen; exiting.")
             break
         if not gui_alive():
-            raise_alert("The recorder application is no longer running (process gone).")
+            # Re-check once in case it was a transient read before alerting.
             time.sleep(1.0)
-            # keep watching in case it's a transient read
-            if not gui_alive():
-                break
-            continue
+            if gui_alive():
+                continue
+            raise_alert("The recorder application is no longer running "
+                        "(process gone).", sync=True)
+            break
 
-        now = time.time()
+        mono_now = time.monotonic()
+        raw = None
         hb = None
         try:
             if os.path.isfile(hb_path):
-                with open(hb_path, "r", encoding="utf-8") as fh:
-                    hb = json.load(fh)
+                with open(hb_path, "rb") as fh:
+                    raw = fh.read()
+                hb = json.loads(raw.decode("utf-8"))
         except Exception:
             hb = None
 
-        if hb is None:
-            if now > grace_until:
-                # No heartbeat at all after grace: only alert if GUI claims to record.
-                pass
-            time.sleep(1.0)
-            continue
-
-        recording = hb.get("recording", False)
-        wall = hb.get("wall_time", 0)
-        # The GUI flags the first few seconds after pressing record as a startup
-        # grace window. Never raise a subsystem-stopped alert during it: streams
-        # and encoders are still spinning up and the first disk write may not have
-        # landed yet. Defense in depth alongside the GUI's own grace handling.
-        warming_up = bool(hb.get("startup_grace", False))
-
-        if recording:
-            if now - wall > stale:
-                raise_alert(f"App not responding — no heartbeat for "
-                            f"{now - wall:.0f}s while recording.")
-            elif warming_up:
-                # Still spinning up; clear any prior alert and wait.
-                _clear_if_set(session_dir, last_alert_reason)
-                last_alert_reason = None
-            elif not hb.get("audio_ok", True):
-                raise_alert("AUDIO recording stopped (no audio written recently). "
-                            + (hb.get("audio_detail") or ""))
-            elif hb.get("screen_enabled") and not hb.get("screen_alive", False):
-                # The encoder process is gone. Require it to stay gone for a
-                # couple of polls so a momentary auto-restart gap is not flagged.
-                screen_stall_count += 1
-                if screen_stall_count >= 2:
-                    raise_alert("SCREEN recording stopped (encoder process exited).")
-            elif hb.get("screen_enabled") and not hb.get("screen_progressing", True):
-                # screen_progressing is computed in the GUI from ffmpeg's machine
-                # readable -progress stream (out_time advancing) OR the output file
-                # growing - both encoder agnostic. Only a genuine stall (neither
-                # advancing) gets here, and we still require it to persist.
-                screen_stall_count += 1
-                if screen_stall_count >= 2:
-                    raise_alert("SCREEN recording stalled (no encoder progress).")
-            else:
-                screen_stall_count = 0
-                _clear_if_set(session_dir, last_alert_reason)
-                last_alert_reason = None
-        else:
-            # Not recording: clear any stale alert.
+        action, reason = evaluate_heartbeat(
+            state, raw, hb, mono_now, stale, mono_now < grace_until)
+        if action == "alert":
+            raise_alert(reason)
+        elif action == "clear":
             _clear_if_set(session_dir, last_alert_reason)
             last_alert_reason = None
-            prev_screen_size = -1
-            screen_stall_count = 0
 
         time.sleep(1.0)
 
     log.info("WATCHDOG exiting.")
+    return 0
 
 
 def _clear_if_set(session_dir, last_reason):

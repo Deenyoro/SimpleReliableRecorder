@@ -5,8 +5,10 @@ this module provides the low-level Win32/audio bits used by both the GUI and the
 separate watchdog process.
 """
 
+import subprocess
 import sys
 import threading
+import time
 
 from .logging_setup import get_logger
 
@@ -21,10 +23,19 @@ def beep(loop=False):
         try:
             if _IS_WIN:
                 import winsound
-                flags = winsound.SND_ALIAS | winsound.SND_ASYNC
-                if loop:
-                    flags |= winsound.SND_LOOP
-                winsound.PlaySound("SystemExclamation", flags)
+                try:
+                    # SND_NODEFAULT makes PlaySound fail (instead of silently
+                    # doing nothing) when the sound scheme is "No Sounds", so
+                    # we can fall back to an audible tone.
+                    flags = (winsound.SND_ALIAS | winsound.SND_ASYNC
+                             | winsound.SND_NODEFAULT)
+                    if loop:
+                        flags |= winsound.SND_LOOP
+                    winsound.PlaySound("SystemExclamation", flags)
+                except RuntimeError:
+                    for _ in range(3):
+                        winsound.Beep(880, 250)
+                        time.sleep(0.1)
             else:
                 print("\a", end="", flush=True)
         except Exception:
@@ -105,5 +116,28 @@ def message_box(title, text):
                 MB_OK | MB_ICONERROR | MB_TOPMOST | MB_SETFOREGROUND)
         except Exception as e:
             log.error("message_box failed: %s", e)
-    else:
-        log.error("ALERT: %s — %s", title, text)
+        return
+    try:
+        if sys.platform == "darwin":
+            esc_text = str(text).replace("\\", "\\\\").replace('"', '\\"')
+            esc_title = str(title).replace("\\", "\\\\").replace('"', '\\"')
+            script = (f'display dialog "{esc_text}" with title "{esc_title}" '
+                      'buttons {"OK"} with icon caution')
+            subprocess.call(["osascript", "-e", script])
+            return
+        # Linux: best-effort dialog, then a desktop notification.
+        try:
+            subprocess.call(["zenity", "--warning", "--title", str(title),
+                             "--text", str(text)])
+            return
+        except FileNotFoundError:
+            pass
+        try:
+            subprocess.call(["notify-send", "-u", "critical", str(title),
+                             str(text)])
+            return
+        except FileNotFoundError:
+            pass
+    except Exception as e:
+        log.debug("message_box fallback failed: %s", e)
+    log.error("ALERT: %s - %s", title, text)

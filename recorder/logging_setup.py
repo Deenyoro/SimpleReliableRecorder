@@ -31,8 +31,11 @@ def get_logger(name=None):
 
 
 def _add_rotating_file(logger, filepath, level=logging.DEBUG):
+    # delay=True: open the file on first emit, so a locked/unwritable log file
+    # degrades to per-record errors instead of crashing the app at startup.
     handler = logging.handlers.RotatingFileHandler(
-        filepath, maxBytes=8 * 1024 * 1024, backupCount=8, encoding="utf-8"
+        filepath, maxBytes=8 * 1024 * 1024, backupCount=8, encoding="utf-8",
+        delay=True
     )
     handler.setLevel(level)
     handler.setFormatter(logging.Formatter(_FMT, _DATEFMT))
@@ -55,17 +58,20 @@ def setup_logging(level=logging.DEBUG, tag="gui"):
     root.setLevel(logging.DEBUG)
     root.propagate = False
 
-    # Combined log — everything.
+    # Combined log - everything.
     _add_rotating_file(root, os.path.join(ldir, f"app.{tag}.log"))
 
-    # Console (visible when run from a terminal / source).
-    try:
-        ch = logging.StreamHandler(stream=sys.stderr)
-        ch.setLevel(level)
-        ch.setFormatter(logging.Formatter(_FMT, _DATEFMT))
-        root.addHandler(ch)
-    except Exception:
-        pass
+    # Console (visible when run from a terminal / source). Windowed builds
+    # (console=False) have sys.stderr == None; a StreamHandler on that would
+    # fail on every record, so skip it entirely.
+    if sys.stderr is not None:
+        try:
+            ch = logging.StreamHandler(stream=sys.stderr)
+            ch.setLevel(level)
+            ch.setFormatter(logging.Formatter(_FMT, _DATEFMT))
+            root.addHandler(ch)
+        except Exception:
+            pass
 
     # Per-subsystem logs (these also propagate up to the combined log).
     for sub in ("audio", "screen", "watchdog"):

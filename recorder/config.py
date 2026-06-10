@@ -8,7 +8,9 @@ resilience toggles. Same pattern as the Whisper project's ConfigManager.
 import copy
 import json
 import os
+import shutil
 import threading
+import time as _time
 
 from . import paths
 from .logging_setup import get_logger
@@ -106,6 +108,18 @@ class ConfigManager:
                     self.data = merged
                     log.info("Config loaded from %s", self.path)
                 except Exception as e:
+                    # Preserve the corrupt file before defaults overwrite it on
+                    # the next save - it is often hand-recoverable.
+                    backup = self.path + ".corrupt-" + _time.strftime("%Y%m%d-%H%M%S")
+                    try:
+                        shutil.copy2(self.path, backup)
+                        log.warning("CONFIG FILE CORRUPT: %s could not be parsed; "
+                                    "a copy was saved to %s and defaults are in "
+                                    "effect.", self.path, backup)
+                    except Exception:
+                        log.warning("CONFIG FILE CORRUPT: %s could not be parsed "
+                                    "and backing it up to %s also failed.",
+                                    self.path, backup)
                     log.exception("Failed to load config (%s); using defaults", e)
                     self.data = copy.deepcopy(DEFAULTS)
             else:

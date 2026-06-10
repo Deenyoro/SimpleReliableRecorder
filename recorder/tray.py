@@ -9,6 +9,7 @@ Runs the pystray icon on its own thread. All callbacks are marshalled back onto
 the Tk thread by the App via root.after, so this module never touches Tk.
 """
 
+import sys
 import threading
 
 from .logging_setup import get_logger
@@ -66,6 +67,11 @@ class TrayIcon:
             log.warning("Tray icon unavailable (pystray/Pillow not installed): %s",
                         _IMPORT_ERR)
             return False
+        if sys.platform == "darwin":
+            # pystray's AppKit backend must own the main thread, but Tk does;
+            # running it on a worker thread can abort the whole process.
+            log.info("Tray icon not supported on macOS build.")
+            return False
 
         def _menu():
             return pystray.Menu(
@@ -79,16 +85,23 @@ class TrayIcon:
                 pystray.MenuItem("Quit", lambda: self._fire(self.on_quit)),
             )
 
+        def _run():
+            try:
+                self._icon.run()
+            except Exception:
+                log.warning("Tray icon thread failed; tray disabled.",
+                            exc_info=True)
+                self._icon = None
+
         try:
             self._icon = pystray.Icon(
                 "SimpleReliableRecorder",
                 icon=_make_image(False),
                 title="SimpleReliableRecorder",
                 menu=_menu())
-            self._thread = threading.Thread(target=self._icon.run,
-                                            name="tray", daemon=True)
+            self._thread = threading.Thread(target=_run, name="tray", daemon=True)
             self._thread.start()
-            log.info("Tray icon started.")
+            log.info("Tray icon starting.")
             return True
         except Exception as e:
             log.exception("Failed to start tray icon: %s", e)
