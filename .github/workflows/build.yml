@@ -7,8 +7,9 @@ on:
       - "[0-9]+.*"
   workflow_dispatch:
 
+# Least privilege by default; only the release job may write (see below).
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build:
@@ -26,12 +27,15 @@ jobs:
             runner: windows-11-arm
             os: windows
             arch: arm64
+          # Linux builds run on Ubuntu 22.04 (glibc 2.35) so the produced
+          # binaries also run on Ubuntu 22.04 / Debian 12 / RHEL 9. Building
+          # on 24.04 (glibc 2.39) would silently drop support for all of them.
           - label: linux-x64
-            runner: ubuntu-latest
+            runner: ubuntu-22.04
             os: linux
             arch: x64
           - label: linux-arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
             os: linux
             arch: arm64
           - label: macos-x64
@@ -50,8 +54,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
       # ---- ffmpeg staging (per OS) ------------------------------------- #
+      # Policy for every OS: only STATIC, portable builds are acceptable.
+      # If no static source can be staged and verified, the job FAILS -
+      # never fall back to a runner-local (brew/apt) dynamically linked
+      # binary, because that produces a release that only runs in CI.
       - name: Stage ffmpeg (Windows)
         if: matrix.os == 'windows'
         shell: pwsh
@@ -63,10 +72,14 @@ jobs:
             $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
           }
           New-Item -ItemType Directory -Force -Path ffmpeg | Out-Null
-          Invoke-WebRequest -Uri $url -OutFile ff.zip
+          curl.exe -fL --retry 4 --retry-all-errors --connect-timeout 20 --max-time 300 $url -o ff.zip
+          if ($LASTEXITCODE -ne 0) { throw "ffmpeg download failed: $url" }
           Expand-Archive ff.zip -DestinationPath ffx -Force
           $exe = Get-ChildItem ffx -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $exe) { throw "no ffmpeg.exe found in the downloaded archive" }
           Copy-Item $exe.FullName ffmpeg\ffmpeg.exe -Force
+          & ffmpeg\ffmpeg.exe -version | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0) { throw "staged ffmpeg.exe does not run (exit $LASTEXITCODE)" }
 
       - name: Stage ffmpeg (Linux)
         if: matrix.os == 'linux'
@@ -74,8 +87,9 @@ jobs:
           set -e
           mkdir -p ffmpeg
 
-          # Accept a source only if it yields a binary that actually runs.
-          # Retries with timeouts so a single flaky mirror cannot fail the build.
+          # Accept a source only if it yields a STATIC binary that actually
+          # runs. Retries with timeouts so a single flaky mirror cannot fail
+          # the build on its own.
           stage_tarxz() {
             url="$1"
             echo "Trying ffmpeg (tar.xz): $url"
@@ -86,33 +100,27 @@ jobs:
             bin="$(find ffx -name ffmpeg -type f | head -n1)"
             [ -n "$bin" ] || { echo "  no ffmpeg in archive"; return 1; }
             cp "$bin" ffmpeg/ffmpeg && chmod +x ffmpeg/ffmpeg
-            ./ffmpeg/ffmpeg -version >/dev/null 2>&1 || { echo "  binary does not run"; return 1; }
-            return 0
-          }
-          stage_zip() {
-            url="$1"
-            echo "Trying ffmpeg (zip): $url"
-            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
-                 --max-time 300 "$url" -o ff.zip || { echo "  download failed"; return 1; }
-            rm -rf ffz && mkdir ffz
-            unzip -o -q ff.zip -d ffz || { echo "  unzip failed"; return 1; }
-            bin="$(find ffz -name ffmpeg -type f | head -n1)"
-            [ -n "$bin" ] || { echo "  no ffmpeg in archive"; return 1; }
-            cp "$bin" ffmpeg/ffmpeg && chmod +x ffmpeg/ffmpeg
+            # Portability gate: must be statically linked or it will only run
+            # on machines with the exact same shared libraries as this runner.
+            if ! ldd ffmpeg/ffmpeg 2>&1 | grep -q "not a dynamic executable"; then
+              if ! file ffmpeg/ffmpeg | grep -qi "static"; then
+                echo "  rejected: dynamically linked (not portable)"; return 1
+              fi
+            fi
             ./ffmpeg/ffmpeg -version >/dev/null 2>&1 || { echo "  binary does not run"; return 1; }
             return 0
           }
 
           if [ "${{ matrix.arch }}" = "arm64" ]; then
-            # BtbN GitHub releases are served from a fast CDN and are the most
-            # reliable source; johnvansickle is the historical fallback.
             stage_tarxz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
               || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" \
-              || { echo "Falling back to apt ffmpeg."; sudo apt-get update && sudo apt-get install -y ffmpeg && cp "$(command -v ffmpeg)" ffmpeg/ffmpeg && chmod +x ffmpeg/ffmpeg; }
+              || { echo "ERROR: no static ffmpeg source succeeded for linux-arm64." >&2; \
+                   echo "Refusing to ship a dynamically linked fallback; failing the build." >&2; exit 1; }
           else
             stage_tarxz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
               || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
-              || { echo "Falling back to apt ffmpeg."; sudo apt-get update && sudo apt-get install -y ffmpeg && cp "$(command -v ffmpeg)" ffmpeg/ffmpeg && chmod +x ffmpeg/ffmpeg; }
+              || { echo "ERROR: no static ffmpeg source succeeded for linux-x64." >&2; \
+                   echo "Refusing to ship a dynamically linked fallback; failing the build." >&2; exit 1; }
           fi
           ./ffmpeg/ffmpeg -version | head -1
 
@@ -122,47 +130,66 @@ jobs:
           set -e
           mkdir -p ffmpeg
 
-          # Try a download source and only accept it if it yields a binary that
-          # actually runs. Returns non-zero on any problem so the caller can fall
-          # back. This is what makes the step reliable: a flaky mirror serving an
-          # HTML error page (non-empty, so old "-s" checks passed) is rejected
-          # here because the extracted binary won't execute.
-          stage_zip() {
-            url="$1"
-            echo "Trying ffmpeg source: $url"
-            curl -fsSL "$url" -o ff.zip || { echo "  download failed"; return 1; }
+          # Sources are chosen PER ARCH (an x86_64 binary passes "-version"
+          # under Rosetta on Apple Silicon, so a run check alone is not
+          # enough). Each candidate must pass three gates before acceptance:
+          #   1. arch gate:        lipo -archs must report the target arch
+          #   2. portability gate: otool -L may reference only /usr/lib and
+          #                        /System (no /opt/homebrew, /usr/local)
+          #   3. run gate:         ffmpeg -version must exit 0
+          try_source() {
+            url="$1"; expected="$2"
+            echo "Trying ffmpeg source: $url (need $expected)"
+            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
+                 --max-time 300 "$url" -o ff.zip || { echo "  download failed"; return 1; }
             if ! file ff.zip | grep -qi 'zip'; then
               echo "  not a zip archive"; return 1
             fi
             rm -rf ffx && mkdir ffx
             unzip -o -q ff.zip -d ffx || { echo "  unzip failed"; return 1; }
             bin="$(find ffx -name ffmpeg -type f | head -n1)"
-            if [ -z "$bin" ]; then echo "  no ffmpeg in archive"; return 1; fi
-            cp "$bin" ffmpeg/ffmpeg
-            chmod +x ffmpeg/ffmpeg
-            if ! ./ffmpeg/ffmpeg -version >/dev/null 2>&1; then
-              echo "  binary does not run on this arch"; return 1
+            [ -n "$bin" ] || { echo "  no ffmpeg in archive"; return 1; }
+            cp "$bin" ffmpeg/ffmpeg && chmod +x ffmpeg/ffmpeg
+            # Apple Silicon requires at least an ad-hoc signature to execute.
+            codesign --force --sign - ffmpeg/ffmpeg >/dev/null 2>&1 || true
+            if ! lipo -archs ffmpeg/ffmpeg | grep -q "$expected"; then
+              echo "  rejected: wrong arch ($(lipo -archs ffmpeg/ffmpeg 2>/dev/null)), need $expected"
+              return 1
             fi
+            if otool -L ffmpeg/ffmpeg | tail -n +2 | awk '{print $1}' \
+                 | grep -Ev '^(/usr/lib/|/System/)' | grep -q .; then
+              echo "  rejected: links non-system libraries (not portable):"
+              otool -L ffmpeg/ffmpeg | tail -n +2 | awk '{print $1}' \
+                | grep -Ev '^(/usr/lib/|/System/)' | sed 's/^/    /'
+              return 1
+            fi
+            ./ffmpeg/ffmpeg -version >/dev/null 2>&1 || { echo "  binary does not run"; return 1; }
             return 0
           }
 
-          # evermeet is a static, self-contained x86_64 build (runs natively on
-          # the Intel runner, and on Apple Silicon via the preinstalled Rosetta).
-          if stage_zip "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip"; then
-            echo "Staged ffmpeg from evermeet."
-          elif [ "${{ matrix.arch }}" = "arm64" ] && stage_zip "https://www.osxexperts.net/ffmpeg711arm.zip"; then
-            echo "Staged ffmpeg from osxexperts (arm)."
-          elif [ "${{ matrix.arch }}" = "x64" ] && stage_zip "https://www.osxexperts.net/ffmpeg711intel.zip"; then
-            echo "Staged ffmpeg from osxexperts (intel)."
+          staged=0
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            # osxexperts publishes native arm64 static builds; the URL embeds
+            # the ffmpeg version, so try current first then the previous one.
+            for url in \
+              "https://www.osxexperts.net/ffmpeg81arm.zip" \
+              "https://www.osxexperts.net/ffmpeg711arm.zip"; do
+              if try_source "$url" arm64; then staged=1; break; fi
+            done
           else
-            # Guaranteed fallback: Homebrew is preinstalled on every macOS runner
-            # and always provides a native binary for the runner's arch.
-            echo "Falling back to Homebrew ffmpeg."
-            brew install ffmpeg
-            cp "$(brew --prefix ffmpeg)/bin/ffmpeg" ffmpeg/ffmpeg
-            chmod +x ffmpeg/ffmpeg
+            # evermeet ships static x86_64 builds; osxexperts intel is backup.
+            for url in \
+              "https://evermeet.cx/ffmpeg/getrelease/ffmpeg/zip" \
+              "https://www.osxexperts.net/ffmpeg80intel.zip"; do
+              if try_source "$url" x86_64; then staged=1; break; fi
+            done
           fi
-          ./ffmpeg/ffmpeg -version | head -1
+          if [ "$staged" -ne 1 ]; then
+            echo "ERROR: could not stage a static ${{ matrix.arch }} ffmpeg for macOS." >&2
+            echo "Refusing to fall back to Homebrew (dynamically linked, CI-only); failing the build." >&2
+            exit 1
+          fi
+          echo "Staged: $(./ffmpeg/ffmpeg -version | head -1) [$(lipo -archs ffmpeg/ffmpeg)]"
 
       # ---- Linux GUI deps so PyInstaller/tkinter resolve --------------- #
       - name: Install Linux system deps
@@ -211,11 +238,31 @@ jobs:
         if: matrix.os == 'windows' && matrix.arch == 'x64'
         shell: pwsh
         run: |
-          $ver = "${{ github.ref_name }}".TrimStart("v")
-          if (-not $ver) { $ver = "0.0.0" }
+          $ErrorActionPreference = "Stop"
+          # Version: a tag like v1.2.3 or 1.2.3 -> strip ONE leading "v";
+          # anything else (workflow_dispatch from a branch, odd tags) -> a
+          # safe placeholder so ISCC never receives an invalid value.
+          $ref = "${{ github.ref_name }}"
+          if ("${{ github.ref_type }}" -eq "tag" -and $ref -match '^v?[0-9][0-9A-Za-z.\-]*$') {
+            $ver = $ref -replace '^v', ''
+          } else {
+            $ver = "0.0.0-dev"
+          }
+          Write-Host "Installer version: $ver"
           choco install innosetup --no-progress -y
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "/DMyAppVersion=$ver" installer\windows.iss
+          # Resolve ISCC.exe wherever the package put it (PATH first, then
+          # both Program Files trees) instead of hardcoding one location.
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) {
+            $candidates = @(
+              (Join-Path ${env:ProgramFiles(x86)} "Inno Setup 6\ISCC.exe"),
+              (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe")
+            )
+            $iscc = $candidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw "ISCC.exe not found after installing Inno Setup" }
+          & $iscc "/DMyAppVersion=$ver" installer\windows.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
           New-Item -ItemType Directory -Force -Path out | Out-Null
           Copy-Item installer\installer_out\*.exe out\ -Force
 
@@ -244,7 +291,7 @@ jobs:
         with:
           path: dist_all
       - name: Publish to GitHub Releases
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist_all/**/*
           generate_release_notes: true

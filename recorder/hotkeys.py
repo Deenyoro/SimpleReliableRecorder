@@ -36,37 +36,69 @@ class HotkeyManager:
     def __init__(self, on_mute_change):
         # on_mute_change(target: str, muted: bool) -> None
         self.on_mute_change = on_mute_change
-        self._hook = None
+        self._hooks = []        # everything registered with the keyboard lib
         self._hotkey = ""
         self._mode = "ptt"
         self._target = ""
         self._held = False
         self._toggle_state = False
+        # True while a mute we asserted is in effect on the target, so teardown
+        # can release it instead of leaving the device silently muted forever.
+        self._asserted_mute = False
         self._lock = threading.Lock()
 
-    def configure(self, enabled, hotkey, mode, target):
-        """Apply (or clear) the hotkey binding. Safe to call repeatedly."""
+    def configure(self, enabled, hotkey, mode, target, initial_state=None):
+        """Apply (or clear) the hotkey binding. Safe to call repeatedly.
+
+        initial_state (optional): for mode "toggle", seeds the starting mute
+        state so the first press is never a no-op when the device is already
+        muted. Accepts a bool or a zero-arg callable returning one; the default
+        None keeps the previous behavior (assume unmuted).
+        """
         self.clear()
         if not enabled or not hotkey or not _AVAILABLE:
             if enabled and not _AVAILABLE:
                 log.warning("Hotkeys unavailable (keyboard lib not installed): %s",
                             _IMPORT_ERR)
             return False
+        # Validate before touching any state: an unparseable string must leave
+        # us cleanly unbound with nothing emitted.
+        try:
+            steps = _kb.parse_hotkey(hotkey)
+        except Exception:
+            log.warning("Invalid hotkey '%s'; hotkey disabled", hotkey)
+            return False
+        is_combo = len(steps) > 1 or len(steps[0]) > 1
         self._hotkey = hotkey
         self._mode = mode
         self._target = target or ""
         self._held = False
         self._toggle_state = False
+        if mode == "toggle" and initial_state is not None:
+            try:
+                seed = initial_state() if callable(initial_state) else initial_state
+                self._toggle_state = bool(seed)
+            except Exception:
+                log.exception("hotkey initial_state callback failed")
         try:
             if mode == "toggle":
                 # Fire once per physical press.
-                self._hook = _kb.add_hotkey(hotkey, self._on_toggle,
-                                            suppress=False, trigger_on_release=False)
+                self._hooks.append(_kb.add_hotkey(hotkey, self._on_toggle,
+                                                  suppress=False,
+                                                  trigger_on_release=False))
+            elif is_combo:
+                # hook_key only accepts a single key, so combos like
+                # "ctrl+space" get both edges via paired add_hotkey calls.
+                self._hooks.append(_kb.add_hotkey(
+                    hotkey, lambda: self._on_hold_edge(True), suppress=False))
+                self._hooks.append(_kb.add_hotkey(
+                    hotkey, lambda: self._on_hold_edge(False), suppress=False,
+                    trigger_on_release=True))
             else:
                 # Need both edges for press-and-hold behavior, so hook the key
                 # directly rather than add_hotkey (which only signals press).
-                self._key = _kb.hook_key(hotkey, self._on_edge, suppress=False)
-                self._hook = self._key
+                self._hooks.append(_kb.hook_key(hotkey, self._on_edge,
+                                                suppress=False))
             # Emit the initial resting state so the device starts correct.
             if mode == "ptt":
                 self._emit(True)    # resting muted until held
@@ -77,7 +109,7 @@ class HotkeyManager:
             return True
         except Exception as e:
             log.exception("Failed to bind hotkey '%s': %s", hotkey, e)
-            self._hook = None
+            self._unhook_all()
             return False
 
     def _on_toggle(self):
@@ -89,6 +121,9 @@ class HotkeyManager:
     def _on_edge(self, event):
         # event.event_type is 'down' or 'up'
         down = getattr(event, "event_type", None) == "down"
+        self._on_hold_edge(down)
+
+    def _on_hold_edge(self, down):
         with self._lock:
             if down == self._held:
                 return  # ignore key-repeat / duplicate edges
@@ -99,22 +134,30 @@ class HotkeyManager:
             self._emit(down)         # held -> muted
 
     def _emit(self, muted):
+        self._asserted_mute = bool(muted)
         if self.on_mute_change:
             try:
                 self.on_mute_change(self._target, bool(muted))
             except Exception:
                 log.exception("hotkey mute callback failed")
 
-    def clear(self):
-        if self._hook is not None:
+    def _unhook_all(self):
+        hooks, self._hooks = self._hooks, []
+        for hook in hooks:
             try:
-                _kb.unhook(self._hook)
+                _kb.unhook(hook)
             except Exception:
                 try:
-                    _kb.remove_hotkey(self._hook)
+                    _kb.remove_hotkey(hook)
                 except Exception:
                     pass
-            self._hook = None
+
+    def clear(self):
+        self._unhook_all()
+        # Release any mute we put in place (e.g. ptt's resting state) so
+        # disabling the hotkey can never leave the device recording silence.
+        if self._asserted_mute:
+            self._emit(False)
 
     def stop(self):
         self.clear()

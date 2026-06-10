@@ -41,7 +41,9 @@ def resource_path(*parts):
 def _is_writable(path):
     try:
         os.makedirs(path, exist_ok=True)
-        test = os.path.join(path, ".write_test")
+        # Per-pid probe name so concurrent GUI + watchdog probes of the same
+        # folder never delete each other's test file.
+        test = os.path.join(path, f".write_test-{os.getpid()}")
         with open(test, "w") as fh:
             fh.write("ok")
         os.remove(test)
@@ -50,25 +52,49 @@ def _is_writable(path):
         return False
 
 
+def _fallback_data_dir():
+    """Per-user app-data location when no portable folder is writable."""
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    elif sys.platform == "darwin":
+        base = os.path.expanduser(os.path.join("~", "Library",
+                                               "Application Support"))
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser(
+            os.path.join("~", ".config"))
+    return os.path.join(base, APP_NAME)
+
+
+_data_dir_cache = None
+
+
 def data_dir():
     """Writable directory for config + logs.
 
-    Prefer next to the exe (portable). Fall back to %APPDATA%\\SimpleReliableRecorder.
+    Prefer next to the exe (portable). Fall back to the per-user app-data
+    folder (%APPDATA% on Windows). The result is resolved once per process and
+    cached, so a transient lock (cloud sync, antivirus) mid-run can never
+    switch the app to a different config/log location.
     """
+    global _data_dir_cache
+    if _data_dir_cache is not None:
+        return _data_dir_cache
     candidate = exe_dir()
     if _is_writable(candidate) and not is_frozen():
         # In source runs, keep data in the project dir for convenience.
         d = os.path.join(candidate, "_data")
         if _is_writable(d):
+            _data_dir_cache = d
             return d
     # Frozen or non-writable: try next-to-exe portable folder first.
     if is_frozen():
         portable = os.path.join(candidate, "data")
         if _is_writable(portable):
+            _data_dir_cache = portable
             return portable
-    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
-    d = os.path.join(appdata, APP_NAME)
+    d = _fallback_data_dir()
     os.makedirs(d, exist_ok=True)
+    _data_dir_cache = d
     return d
 
 
@@ -79,11 +105,15 @@ def logs_dir():
 
 
 def default_recordings_dir():
-    """Videos\\SimpleReliableRecorder (created on demand)."""
+    """Videos\\SimpleReliableRecorder (created on demand; Movies on macOS)."""
     userprofile = os.environ.get("USERPROFILE") or os.path.expanduser("~")
-    videos = os.path.join(userprofile, "Videos")
-    if not os.path.isdir(videos):
-        videos = userprofile
+    if sys.platform == "darwin":
+        movies = os.path.expanduser(os.path.join("~", "Movies"))
+        videos = movies if os.path.isdir(movies) else userprofile
+    else:
+        videos = os.path.join(userprofile, "Videos")
+        if not os.path.isdir(videos):
+            videos = userprofile
     d = os.path.join(videos, APP_NAME)
     try:
         os.makedirs(d, exist_ok=True)
@@ -101,6 +131,12 @@ def ffmpeg_path():
     name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
     bundled = resource_path("ffmpeg", name)
     if os.path.isfile(bundled):
+        if os.name == "posix":
+            # PyInstaller data extraction can drop the exec bit.
+            try:
+                os.chmod(bundled, 0o755)
+            except Exception:
+                pass
         return bundled
     # Source-run convenience / fallback: use system ffmpeg if present.
     from shutil import which

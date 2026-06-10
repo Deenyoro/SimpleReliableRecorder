@@ -24,6 +24,12 @@ _ff = os.path.join("ffmpeg", _ffname)
 if os.path.isfile(_ff):
     datas.append((_ff, "ffmpeg"))
 
+# App icon: used for the EXE resource (Windows) below, and also bundled as
+# data so paths.icon_path() can resolve assets/icon.ico in the frozen app.
+_icon = os.path.join("assets", "icon.ico")
+if os.path.isfile(_icon):
+    datas.append((_icon, "assets"))
+
 # These packages ship compiled extensions / data files (numpy, libsndfile via
 # soundfile, the CFFI backends used by soundcard). Collect everything so the
 # frozen app can find them.
@@ -44,8 +50,6 @@ elif sys.platform == "darwin":
 else:
     hiddenimports += ["pystray._xorg", "pystray._appindicator"]
 
-block_cipher = None
-
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -56,15 +60,10 @@ a = Analysis(
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
-    win_no_prefer_redirects=False,
-    win_private_assemblies=False,
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
-
-_icon = os.path.join("assets", "icon.ico")
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,

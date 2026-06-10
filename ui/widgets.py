@@ -150,9 +150,26 @@ class ScrollFrame(ttk.Frame):
                          lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
         self.canvas.bind("<Leave>",
                          lambda e: self.canvas.unbind_all("<MouseWheel>"))
+        # If the window is closed with the cursor inside the canvas, <Leave>
+        # never fires and the global wheel binding would point at a dead canvas.
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, event):
+        # <Destroy> fires once per descendant; only act on our own.
+        if event.widget is not self:
+            return
+        try:
+            self.canvas.unbind_all("<MouseWheel>")
+        except Exception:
+            pass
 
     def _wheel(self, e):
-        self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        try:
+            if not self.canvas.winfo_exists():
+                return
+            self.canvas.yview_scroll(int(-e.delta / 120), "units")
+        except tk.TclError:
+            pass
 
 
 class StatusLight(tk.Canvas):
@@ -262,7 +279,21 @@ class ToggleSwitch(tk.Frame):
             self._trace = self.var.trace_add("write", lambda *a: self._draw())
         except Exception:
             self._trace = None
+        # Remove the trace when the widget dies, otherwise the stale callback
+        # raises TclError and aborts every later trace on the same variable.
+        self.bind("<Destroy>", self._on_destroy)
         self._draw()
+
+    def _on_destroy(self, event):
+        # <Destroy> fires once per descendant; only act on our own.
+        if event.widget is not self:
+            return
+        if self._trace is not None:
+            trace, self._trace = self._trace, None
+            try:
+                self.var.trace_remove("write", trace)
+            except Exception:
+                pass
 
     def _on_click(self, _e=None):
         self.var.set(not bool(self.var.get()))
@@ -271,19 +302,24 @@ class ToggleSwitch(tk.Frame):
         return "break"
 
     def _draw(self):
-        c = self.canvas
-        c.delete("all")
-        on = bool(self.var.get())
-        w, h = self._w_sw, self._h_sw
-        pad = 3
-        r = (h - 2 * pad) / 2
-        track = COLORS["accent"] if on else "#3a3f48"
-        c.create_oval(1, pad, 1 + (h - 2 * pad), h - pad, fill=track, outline="")
-        c.create_oval(w - (h - 2 * pad) - 1, pad, w - 1, h - pad,
-                      fill=track, outline="")
-        c.create_rectangle(1 + r, pad, w - 1 - r, h - pad, fill=track, outline="")
-        kx = (w - 1 - r) if on else (1 + r)
-        c.create_oval(kx - r, pad, kx + r, h - pad, fill="#ffffff", outline="")
+        try:
+            if not self.winfo_exists():
+                return
+            c = self.canvas
+            c.delete("all")
+            on = bool(self.var.get())
+            w, h = self._w_sw, self._h_sw
+            pad = 3
+            r = (h - 2 * pad) / 2
+            track = COLORS["accent"] if on else "#3a3f48"
+            c.create_oval(1, pad, 1 + (h - 2 * pad), h - pad, fill=track, outline="")
+            c.create_oval(w - (h - 2 * pad) - 1, pad, w - 1, h - pad,
+                          fill=track, outline="")
+            c.create_rectangle(1 + r, pad, w - 1 - r, h - pad, fill=track, outline="")
+            kx = (w - 1 - r) if on else (1 + r)
+            c.create_oval(kx - r, pad, kx + r, h - pad, fill="#ffffff", outline="")
+        except tk.TclError:
+            pass
 
 
 class SegmentedControl(tk.Frame):
@@ -308,9 +344,23 @@ class SegmentedControl(tk.Frame):
             self._rows[value] = row
         self._refresh()
         try:
-            self.var.trace_add("write", lambda *a: self._refresh())
+            self._trace = self.var.trace_add("write", lambda *a: self._refresh())
         except Exception:
-            pass
+            self._trace = None
+        # Remove the trace when the widget dies, otherwise the stale callback
+        # raises TclError and aborts every later trace on the same variable.
+        self.bind("<Destroy>", self._on_destroy)
+
+    def _on_destroy(self, event):
+        # <Destroy> fires once per descendant; only act on our own.
+        if event.widget is not self:
+            return
+        if self._trace is not None:
+            trace, self._trace = self._trace, None
+            try:
+                self.var.trace_remove("write", trace)
+            except Exception:
+                pass
 
     def _select(self, value):
         self.var.set(value)
@@ -318,14 +368,19 @@ class SegmentedControl(tk.Frame):
             self.command()
 
     def _refresh(self):
-        cur = self.var.get()
-        for value, row in self._rows.items():
-            if value == cur:
-                row.configure(bg=COLORS["accent"], fg="#06120f",
-                              font=(FONT, 11, "bold"))
-            else:
-                row.configure(bg=COLORS["panel3"], fg=COLORS["fg"],
-                              font=(FONT, 11))
+        try:
+            if not self.winfo_exists():
+                return
+            cur = self.var.get()
+            for value, row in self._rows.items():
+                if value == cur:
+                    row.configure(bg=COLORS["accent"], fg="#06120f",
+                                  font=(FONT, 11, "bold"))
+                else:
+                    row.configure(bg=COLORS["panel3"], fg=COLORS["fg"],
+                                  font=(FONT, 11))
+        except tk.TclError:
+            pass
 
 
 class DeviceRow(ttk.Frame):
@@ -459,6 +514,7 @@ class GoldBanner(tk.Frame):
         self.on_restart = on_restart
         self._flash_on = False
         self._flashing = False
+        self._flash_after = None
 
         self.label = tk.Label(self, text="", bg=COLORS["gold"], fg="#1a1a1a",
                               font=(FONT, 13, "bold"), anchor="w", justify="left")
@@ -492,12 +548,21 @@ class GoldBanner(tk.Frame):
             self.on_restart()
 
     def show(self, message):
+        self._cancel_flash()
         self.label.config(text="   RECORDING PROBLEM:   " + message)
         if not self.winfo_manager():
             self.pack(side="bottom", fill="x")
         if not self._flashing:
             self._flashing = True
-            self._flash()
+        self._flash()
+
+    def _cancel_flash(self):
+        if self._flash_after is not None:
+            after_id, self._flash_after = self._flash_after, None
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
 
     def _flash(self):
         if not self._flashing:
@@ -506,10 +571,11 @@ class GoldBanner(tk.Frame):
         col = COLORS["gold_bright"] if self._flash_on else COLORS["gold"]
         self.config(bg=col)
         self.label.config(bg=col)
-        self.after(450, self._flash)
+        self._flash_after = self.after(450, self._flash)
 
     def stop(self):
         self._flashing = False
+        self._cancel_flash()
         try:
             self.pack_forget()
         except Exception:
