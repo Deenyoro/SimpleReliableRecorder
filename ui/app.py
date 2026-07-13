@@ -16,7 +16,7 @@ from datetime import datetime
 from tkinter import filedialog, messagebox, ttk
 
 from recorder import (alerts, combine, ffmpeg_tools, hotkeys, library, paths,
-                      screen as screenmod, tray, watchdog)
+                      screen as screenmod, scrivox_bridge, tray, watchdog)
 from recorder.audio import (AudioRecorder, CaptureSource, LevelMonitor,
                             default_devices, list_devices, resolve_selection)
 from recorder.config import ConfigManager
@@ -118,6 +118,24 @@ class App(tk.Tk):
         self.level_monitor = None
         self._save_job = None
         self._combine_busy = False
+        # FIFO of pending combine/convert jobs: firing several operations (or
+        # converting several ticked recordings) runs them one after another
+        # instead of refusing everything after the first.
+        self._combine_queue = []
+        self._combine_results = []
+        # Output paths promised to queued/running jobs but not on disk yet, so
+        # _unique_path can't hand the same name to two queued jobs.
+        self._pending_out_paths = set()
+        # Fallback lane for UI callbacks whose after() scheduling failed (see
+        # _safe_after); drained by _poll so completions can never be lost.
+        self._ui_calls = queue.Queue()
+        self._transcribe_busy = False
+        # Optional Scrivox integration: when no Scrivox install is found, every
+        # Scrivox-related control stays hidden (users without it never see it).
+        self._scrivox_exe = scrivox_bridge.find_scrivox(
+            self.cfg.get("scrivox_path"))
+        if self._scrivox_exe:
+            log.info("Scrivox detected: %s", self._scrivox_exe)
         self._closing = False
         # Re-entrancy latches: dialogs inside start_recording pump the Tk event
         # loop, so a queued second click / tray / hotkey event could re-enter.
@@ -158,7 +176,15 @@ class App(tk.Tk):
         try:
             self.after(0, fn)
         except Exception:
-            pass
+            # after() from a worker thread can fail while the main thread is
+            # not dispatching events (e.g. a blocking wait loop). Silently
+            # dropping the callback here once left _combine_busy stuck True
+            # forever - every later merge was refused with "already running".
+            # Park the callback instead; _poll runs it on the Tk thread.
+            try:
+                self._ui_calls.put(fn)
+            except Exception:
+                pass
 
     def report_callback_exception(self, exc, val, tb):
         """Tk swallows callback exceptions into stderr - which is None in a
@@ -609,6 +635,28 @@ class App(tk.Tk):
                   style="Muted.TLabel", wraplength=560, justify="left").pack(
             anchor="w", pady=(6, 0))
 
+        # --- Scrivox transcription (hidden when Scrivox is not present) ---
+        if not self._transcribe_busy:
+            self._scrivox_exe = scrivox_bridge.find_scrivox(
+                self.cfg.get("scrivox_path"))
+        if self._scrivox_exe:
+            xsec = self._section(p, "Transcription (Scrivox)")
+            ttk.Label(xsec, text=f"Scrivox detected:  {self._scrivox_exe}",
+                      style="Muted.TLabel", wraplength=560,
+                      justify="left").pack(anchor="w")
+            xrow = ttk.Frame(xsec, style="TFrame")
+            xrow.pack(fill="x", pady=(8, 0))
+            ttk.Button(
+                xrow, text="Open Scrivox",
+                command=lambda: scrivox_bridge.open_scrivox(self._scrivox_exe)
+                ).pack(side="left")
+            ttk.Label(xsec,
+                      text="Transcription options (model, language, speakers, "
+                      "API keys, screen-description detail) are configured "
+                      "inside Scrivox and used automatically here.",
+                      style="Muted.TLabel", wraplength=560,
+                      justify="left").pack(anchor="w", pady=(6, 0))
+
         # --- Resilience ---
         rsec = self._section(p, "Resilience")
         ToggleSwitch(rsec, self.autorestart_var,
@@ -701,6 +749,10 @@ class App(tk.Tk):
             b, text="Convert to...  (MP4, MP3, MKV, WAV ...)",
             command=self._convert_selected_library, state="disabled")
         self.lib_btn_convert.pack(fill="x", pady=2)
+        # Only shown when a Scrivox install is detected (see _refresh_library).
+        self.lib_btn_transcribe = ttk.Button(
+            b, text="Transcribe with Scrivox...",
+            command=self._transcribe_selected_library, state="disabled")
 
         b2 = ttk.Frame(inner, style="TFrame")
         b2.pack(fill="x", pady=(2, 0))
@@ -792,6 +844,18 @@ class App(tk.Tk):
         has = bool(self._library)
         self.lib_empty.pack_forget() if has else self.lib_empty.pack(
             anchor="w", pady=(4, 0))
+        # Re-detect Scrivox on every rebuild so dropping it next to the app (or
+        # installing it) starts working without a restart - and removing it
+        # hides the button again. Cached in the bridge; the Refresh button
+        # (rescan=True) forces a fresh sweep. Never re-detect mid-transcription.
+        if not self._transcribe_busy:
+            self._scrivox_exe = scrivox_bridge.find_scrivox(
+                self.cfg.get("scrivox_path"), force=rescan)
+        if self._scrivox_exe:
+            if not self.lib_btn_transcribe.winfo_manager():
+                self.lib_btn_transcribe.pack(fill="x", pady=2)
+        else:
+            self.lib_btn_transcribe.pack_forget()
         self._update_library_buttons()
 
     def _update_library_buttons(self):
@@ -801,7 +865,7 @@ class App(tk.Tk):
         if n == 0:
             self.lib_sel_lbl.config(text="Tick recordings above to combine them.")
             for btn in (self.lib_btn_video, self.lib_btn_multi, self.lib_btn_mix,
-                        self.lib_btn_convert):
+                        self.lib_btn_convert, self.lib_btn_transcribe):
                 btn.config(state="disabled")
             return
         all_video = all(e.get("video") for e in sel)
@@ -814,8 +878,12 @@ class App(tk.Tk):
         self.lib_btn_multi.config(state=("normal" if total_audio >= 2 else "disabled"))
         # Mix: any audio present.
         self.lib_btn_mix.config(state=("normal" if total_audio >= 1 else "disabled"))
-        # Convert: one recording at a time (per-take format export).
-        self.lib_btn_convert.config(state=("normal" if n == 1 else "disabled"))
+        # Convert: each ticked recording is exported on its own.
+        self.lib_btn_convert.config(state="normal")
+        # Transcribe: anything with audio or video qualifies.
+        has_media = any(e.get("audio") or e.get("video") for e in sel)
+        self.lib_btn_transcribe.config(
+            state=("normal" if has_media else "disabled"))
 
     def _selected_library_entries(self):
         return [r["entry"] for r in self._lib_rows if r["var"].get()]
@@ -879,34 +947,228 @@ class App(tk.Tk):
             self._run_combine(
                 lambda: combine.mix_audio_to_stereo(audio, out), out)
 
-    def _convert_selected_library(self):
-        """Convert one selected recording to another format via a dialog."""
+    # --- Scrivox transcription (only reachable when Scrivox is detected) --- #
+    def _transcribe_selected_library(self):
+        """Transcribe every ticked recording with the detected Scrivox."""
         sel = self._selected_library_entries()
-        if len(sel) != 1:
-            messagebox.showinfo("Convert",
-                                "Select exactly one recording to convert.")
+        if not sel:
+            messagebox.showinfo("Transcribe",
+                                "Tick at least one recording first.")
             return
-        entry = sel[0]
-        n_audio = len([a for a in entry.get("audio", []) if a])
-        has_video = bool(entry.get("video"))
-        choice = self._convert_dialog(n_audio, has_video)
+        self._transcribe_entries(sel)
+
+    def _transcribe_entries(self, entries):
+        if self._transcribe_busy:
+            messagebox.showinfo("Please wait",
+                                "A transcription is already running.")
+            return
+        exe = self._scrivox_exe
+        if not exe or not os.path.isfile(exe):
+            # Scrivox was moved/removed since detection; re-check and hide.
+            self._refresh_library()
+            if not self._scrivox_exe:
+                messagebox.showinfo(
+                    "Scrivox not found",
+                    "Scrivox is no longer where it was detected. Put it back "
+                    "next to this app (or reinstall it) and try again.")
+                return
+            exe = self._scrivox_exe
+        any_video = any(e.get("video") for e in entries)
+        choice = self._transcribe_dialog(len(entries), any_video)
+        if not choice:
+            return
+        want_vision, fmt, ext = choice
+
+        self._transcribe_busy = True
+        n = len(entries)
+        self._transcribe_status(f"Transcribing 1/{n} with Scrivox...")
+        log.info("Transcription started: %d recording(s), vision=%s, fmt=%s",
+                 n, want_vision, fmt)
+
+        def work():
+            results = []
+            for i, e in enumerate(entries):
+                name = e.get("name") or "recording"
+                def status(msg, i=i, name=name):
+                    self._safe_after(lambda: self._transcribe_status(
+                        f"Transcribing {i + 1}/{n} ({name}): {msg}"))
+                # One entry blowing up (e.g. ffmpeg mix timeout raises) must
+                # not kill the worker - that would leave _transcribe_busy
+                # stuck True and block every later transcription.
+                try:
+                    ok, detail = scrivox_bridge.transcribe_entry(
+                        exe, e, want_vision and bool(e.get("video")), fmt, ext,
+                        on_status=status)
+                except Exception as ex:
+                    ok, detail = False, str(ex)
+                results.append((name, ok, detail))
+            self._safe_after(lambda: self._transcribe_done(results))
+        threading.Thread(target=work, name="scrivox", daemon=True).start()
+
+    def _transcribe_status(self, text):
+        # Recording status always wins the label; transcription is background.
+        if not self.recording and not self._finalizing:
+            self.status_lbl.config(text=text)
+
+    def _restore_status(self):
+        """Put the status label back to whatever is still going on, in
+        priority order, so finishing one background job never hides another."""
+        if self.recording:
+            self.status_lbl.config(text="Recording...")
+        elif self._finalizing:
+            self.status_lbl.config(text="Finalizing recording...")
+        elif self._combine_busy:
+            self.status_lbl.config(
+                text="Combining... (this can take a while for video)")
+        elif self._transcribe_busy:
+            self.status_lbl.config(text="Transcribing with Scrivox...")
+        else:
+            self.status_lbl.config(text="Idle.")
+
+    def _transcribe_done(self, results):
+        self._transcribe_busy = False
+        self._restore_status()
+        done = [(n, d) for n, ok, d in results if ok]
+        failed = [(n, d) for n, ok, d in results if not ok]
+        for n, p in done:
+            log.info("Transcript saved: %s", p)
+        for n, d in failed:
+            log.error("Transcription failed for '%s': %s", n, str(d)[:800])
+        if done and not failed:
+            lines = "\n".join(p for _, p in done)
+            if messagebox.askyesno(
+                    "Transcription complete",
+                    f"Saved {len(done)} transcript"
+                    + ("" if len(done) == 1 else "s") + f":\n{lines}"
+                    + "\n\nShow the first one in its folder?"):
+                self._reveal_path(done[0][1])
+        elif done:
+            messagebox.showwarning(
+                "Transcription partly done",
+                f"Saved {len(done)} transcript(s), but "
+                f"{len(failed)} failed:\n\n"
+                + "\n".join(f"{n}: {str(d)[:200]}" for n, d in failed))
+        else:
+            messagebox.showerror(
+                "Transcription failed",
+                "No transcripts were made.\n\n"
+                + "\n".join(f"{n}: {str(d)[:300]}" for n, d in failed))
+
+    def _reveal_path(self, path):
+        try:
+            if sys.platform == "win32":
+                subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", path])
+            else:
+                os.startfile(os.path.dirname(path))
+        except Exception as e:
+            log.warning("reveal transcript failed: %s", e)
+
+    def _transcribe_dialog(self, n_entries, any_video):
+        """Modal dialog for transcription options.
+        Returns (want_vision, fmt, ext) or None if cancelled."""
+        win = tk.Toplevel(self)
+        win.title("Transcribe with Scrivox")
+        win.configure(bg=COLORS["bg"])
+        win.transient(self)
+        win.grab_set()
+        try:
+            ip = paths.icon_path()
+            if ip:
+                win.iconbitmap(ip)
+        except Exception:
+            pass
+
+        result = {"value": None}
+        frm = ttk.Frame(win, style="TFrame")
+        frm.pack(fill="both", expand=True, padx=16, pady=14)
+
+        word = "recording" if n_entries == 1 else "recordings"
+        ttk.Label(frm, text=f"Transcribe {n_entries} {word}:",
+                  style="Header.TLabel").pack(anchor="w")
+
+        mode_var = tk.StringVar(value="audio")
+        options = [("audio", "Transcribe the audio")]
+        if any_video:
+            options.append(("vision",
+                            "Transcribe the audio + describe what's on screen"))
+        SegmentedControl(frm, mode_var, options).pack(fill="x", pady=(6, 10))
+
+        fr = ttk.Frame(frm, style="TFrame")
+        fr.pack(fill="x")
+        ttk.Label(fr, text="Save as:").pack(side="left")
+        fmt_var = tk.StringVar(value="Plain text (.txt)")
+        ttk.Combobox(fr, textvariable=fmt_var, state="readonly", width=22,
+                     values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
+                     ).pack(side="left", padx=6)
+
+        ttk.Label(frm, style="Muted.TLabel", justify="left", wraplength=420,
+                  text="Each transcript is saved next to its recording. The "
+                  "model, language, speaker options and API keys are whatever "
+                  "you set in Scrivox - use the button below to change them."
+                  ).pack(anchor="w", pady=(10, 8))
+
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x")
+
+        def open_settings():
+            if not scrivox_bridge.open_scrivox(self._scrivox_exe):
+                messagebox.showerror("Scrivox", "Could not launch Scrivox.",
+                                     parent=win)
+
+        ttk.Button(btns, text="Open Scrivox settings",
+                   command=open_settings).pack(side="left")
+
+        def ok():
+            fmt, ext = scrivox_bridge.TRANSCRIBE_FORMATS[fmt_var.get()]
+            result["value"] = (mode_var.get() == "vision", fmt, ext)
+            win.destroy()
+
+        ttk.Button(btns, text="Transcribe", style="Accent.TButton",
+                   command=ok).pack(side="right")
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(
+            side="right", padx=(0, 8))
+
+        win.update_idletasks()
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        win.wait_window()
+        return result["value"]
+
+    def _convert_selected_library(self):
+        """Convert the ticked recording(s) to another format via a dialog.
+        Each recording becomes its own output file; several run back to back."""
+        sel = self._selected_library_entries()
+        if not sel:
+            messagebox.showinfo("Convert", "Tick at least one recording first.")
+            return
+        n_audio = max(len([a for a in e.get("audio", []) if a]) for e in sel)
+        has_video = any(e.get("video") for e in sel)
+        choice = self._convert_dialog(n_audio, has_video, n_entries=len(sel))
         if not choice:
             return
         fmt_label, audio_mode = choice
-        spec = combine.CONVERT_FORMATS[fmt_label]
-        ext = spec[0]
-        out_dir = entry.get("out_dir") or self.cfg.resolved_save_folder()
+        ext = combine.CONVERT_FORMATS[fmt_label][0]
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        out = self._unique_path(
-            os.path.join(out_dir, f"{entry['name']}_converted_{stamp}.{ext}"))
-        self._run_combine(
-            lambda: combine.convert(entry, out, fmt_label, audio_mode), out)
+        for entry in sel:
+            out_dir = entry.get("out_dir") or self.cfg.resolved_save_folder()
+            out = self._unique_path(
+                os.path.join(out_dir,
+                             f"{entry['name']}_converted_{stamp}.{ext}"))
+            self._run_combine(
+                lambda e=entry, o=out: combine.convert(e, o, fmt_label,
+                                                       audio_mode), out)
 
-    def _convert_dialog(self, n_audio, has_video):
+    def _convert_dialog(self, n_audio, has_video, n_entries=1):
         """Modal dialog to pick an output format and audio handling.
         Returns (fmt_label, audio_mode) or None if cancelled."""
         win = tk.Toplevel(self)
-        win.title("Convert recording")
+        win.title("Convert recording" + ("" if n_entries == 1 else "s"))
         win.configure(bg=COLORS["bg"])
         win.transient(self)
         win.grab_set()
@@ -1021,6 +1283,11 @@ class App(tk.Tk):
                          command=lambda: self._open_entry_folder(entry))
         menu.add_command(label="Show folder location",
                          command=lambda: self._reveal_entry_folder(entry))
+        if self._scrivox_exe:
+            menu.add_separator()
+            menu.add_command(
+                label="Transcribe with Scrivox...",
+                command=lambda: self._transcribe_entries([entry]))
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
@@ -1070,6 +1337,12 @@ class App(tk.Tk):
                 "Please wait",
                 "A merge/convert is running - rename when it finishes so its "
                 "output isn't pulled out from under it.")
+            return
+        if getattr(self, "_transcribe_busy", False):
+            messagebox.showinfo(
+                "Please wait",
+                "A transcription is running - rename when it finishes so its "
+                "transcript isn't written into a folder that no longer exists.")
             return
         old_dir = entry.get("out_dir") or ""
         if not old_dir or not os.path.isdir(old_dir):
@@ -2000,6 +2273,17 @@ class App(tk.Tk):
             self._drain_log()
         except Exception as e:
             self._poll_err("log", e)
+        # Run any UI callbacks whose direct after() scheduling failed. Each is
+        # guarded on its own so one bad callback can't starve the rest.
+        try:
+            for _ in range(50):
+                fn = self._ui_calls.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    self._poll_err("uicall", e)
+        except queue.Empty:
+            pass
         if self.recording:
             try:
                 self._update_status_lights()
@@ -2081,23 +2365,32 @@ class App(tk.Tk):
     def _combine_base(self):
         return getattr(self, "_session_base", None) or "SRR_recording"
 
-    @staticmethod
-    def _unique_path(path):
+    def _unique_path(self, path):
         """Never silently overwrite an existing export (the stamp is only
-        second-granular, so two quick runs can collide)."""
-        if not os.path.exists(path):
+        second-granular, so two quick runs can collide). Paths promised to
+        still-queued jobs count as taken even though not on disk yet."""
+        pending = getattr(self, "_pending_out_paths", set())
+
+        def taken(p):
+            return os.path.exists(p) or p in pending
+
+        if not taken(path):
             return path
         stem, ext = os.path.splitext(path)
         for i in range(2, 100):
             cand = f"{stem}_{i}{ext}"
-            if not os.path.exists(cand):
+            if not taken(cand):
                 return cand
         return path
 
     def _run_combine(self, fn, out):
+        self._pending_out_paths.add(out)
         if getattr(self, "_combine_busy", False):
-            messagebox.showinfo("Please wait",
-                                "A combine/merge is already running.")
+            # Queue it instead of refusing: several jobs (e.g. converting many
+            # ticked recordings) run back to back with one summary at the end.
+            self._combine_queue.append((fn, out))
+            self.status_lbl.config(
+                text=f"Combining... ({len(self._combine_queue)} more queued)")
             return
         self._combine_busy = True
         self.status_lbl.config(text="Combining... (this can take a while for video)")
@@ -2113,30 +2406,46 @@ class App(tk.Tk):
 
     def _combine_done(self, ok, out, detail):
         self._combine_busy = False
-        # Don't stomp the status of a recording that started mid-merge.
-        if self.recording:
-            self.status_lbl.config(text="Recording...")
-        elif self._finalizing:
-            self.status_lbl.config(text="Finalizing recording...")
-        else:
-            self.status_lbl.config(text="Idle.")
-        if ok and os.path.isfile(out):
+        self._pending_out_paths.discard(out)
+        ok = bool(ok) and os.path.isfile(out)
+        if ok:
             log.info("Combined -> %s", out)
-            self._refresh_library()  # the merged file may add a new session folder
+        else:
+            log.error("Combine failed: %s", str(detail)[:800])
+        self._combine_results.append((ok, out, detail))
+        # More jobs waiting? Start the next one; the summary comes at the end.
+        if self._combine_queue and not getattr(self, "_closing", False):
+            fn, nxt = self._combine_queue.pop(0)
+            self._run_combine(fn, nxt)
+            return
+        results, self._combine_results = self._combine_results, []
+        self._restore_status()
+        self._refresh_library()  # the merged files may add new session folders
+        saved = [o for k, o, _ in results if k]
+        failed = [(o, d) for k, o, d in results if not k]
+        if saved and not failed:
+            word = "it" if len(saved) == 1 else "the first one"
             if messagebox.askyesno(
                     "Merge complete",
-                    f"Saved:\n{out}\n\nShow it in the folder?"):
-                folder = os.path.dirname(out)
+                    "Saved:\n" + "\n".join(saved)
+                    + f"\n\nShow {word} in the folder?"):
+                folder = os.path.dirname(saved[0])
                 try:
                     if os.path.isdir(folder):
                         os.startfile(folder)
                 except Exception as e:
                     log.warning("open folder failed: %s", e)
+        elif saved:
+            messagebox.showwarning(
+                "Merge partly complete",
+                "Saved:\n" + "\n".join(saved) + "\n\nFailed:\n"
+                + "\n".join(f"{os.path.basename(o)}: {str(d)[-200:]}"
+                            for o, d in failed))
         else:
-            log.error("Combine failed: %s", str(detail)[:800])
             messagebox.showerror(
                 "Combine failed",
-                "The merge did not complete.\n\n" + str(detail)[-800:])
+                "The merge did not complete.\n\n"
+                + "\n\n".join(str(d)[-400:] for _, d in failed))
 
     # ------------------------------------------------------------- close #
     def on_close(self):
@@ -2154,6 +2463,12 @@ class App(tk.Tk):
             if not messagebox.askyesno(
                     "Quit",
                     "A merge/convert is still running and will be abandoned "
+                    "if you quit now.\n\nQuit anyway?"):
+                return
+        if self._transcribe_busy:
+            if not messagebox.askyesno(
+                    "Quit",
+                    "A transcription is still running and will be abandoned "
                     "if you quit now.\n\nQuit anyway?"):
                 return
         if self.recording:

@@ -71,6 +71,13 @@ DEFAULTS = {
     # files were moved/deleted are pruned automatically on load.
     "recordings": [],
 
+    # --- Scrivox transcription (optional integration) ---
+    # Scrivox is auto-detected (same folder, sibling folders, installed
+    # locations, registry, PATH). This override is only for unusual setups:
+    # point it at Scrivox.exe or its folder. All Scrivox UI stays hidden when
+    # no Scrivox is found.
+    "scrivox_path": "",
+
     # --- combine ---
     "auto_combine": False,
     # When screen recording is on, what to do with screen + audio at stop:
