@@ -25,8 +25,14 @@ and the background watchdog can be turned on or off in Settings.
   NVIDIA NVENC, Intel Quick Sync, AMD AMF, Apple VideoToolbox, or CPU, with
   automatic fallback. Records silent video; combine with audio afterward.
 - **Combine (after the fact, non-destructive)**: mux video and audio into one
-  file, merge per-device WAVs into one multichannel WAV, or mix to stereo. Your
-  original separate tracks are always kept.
+  file, merge per-device WAVs into one multichannel WAV, mix to stereo, or
+  convert every ticked recording to another format in one go. Several jobs
+  queue up and run back to back. Your original separate tracks are always kept.
+- **Transcription (optional, via [Scrivox](https://github.com/Deenyoro/Scrivox))**:
+  when a Scrivox install is detected, the library grows a **Transcribe with
+  Scrivox** button - tick recordings and get a transcript saved next to each
+  one, either audio-only or with on-screen descriptions for takes that include
+  video. See below.
 - **Resilience**: in-process monitors plus a separate watchdog process and
   heartbeat files, with optional auto-restart on failure.
 - **Immense logging**: rotating logs in the data folder plus a live in-app log.
@@ -76,3 +82,30 @@ Use a full build (gyan.dev "full"/"git" or BtbN) so NVENC/QSV/AMF are present.
 2. Optional: enable **Record a screen**, click **Identify screens**, pick the monitor.
 3. Hit **RECORD**. Watch the green status lights. Hit **STOP** when done.
 4. Optional: use the **Combine** buttons to stitch tracks together.
+
+## Transcription with Scrivox
+
+[Scrivox](https://github.com/Deenyoro/Scrivox) is a standalone GPU
+transcription suite (Whisper + speaker diarization + on-screen descriptions +
+summaries). When both apps are present, SimpleReliableRecorder finds it
+automatically - no setup:
+
+- Portable: put the Scrivox folder (or `Scrivox.exe`) next to
+  `SimpleReliableRecorder.exe`, or keep both app folders side by side.
+- Installed: any installed Scrivox is found via the usual install locations,
+  the registry, and PATH.
+
+Tick recordings in the library and click **Transcribe with Scrivox...** (also
+available on right-click). Choose audio-only or, for takes with video,
+"describe what's on screen" as well; each transcript is saved next to its
+recording as .txt / .md / .srt / .vtt / .json. Multi-track takes are mixed
+automatically for transcription - your originals are never touched.
+
+The transcription itself (model, language, speaker names, API keys,
+translation, description detail) follows whatever you configured in Scrivox:
+the **Open Scrivox** button in Settings (or in the transcribe dialog) opens it
+to change them.
+
+If Scrivox is not present, none of this UI exists - the app stays exactly as
+lean as before. Unusual setups can point the optional `scrivox_path` key in
+`config.json` at a specific `Scrivox.exe`.

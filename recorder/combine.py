@@ -573,8 +573,12 @@ def concat_sessions(sessions, out_path, include_video=False):
         for si in range(len(sessions)):
             vi = seg_video_idx[si]
             vlbl = f"sv{si}"
+            # setpts first: real recordings (fragmented/restarted captures)
+            # can start at a non-zero timestamp, and concat needs every
+            # segment rebased to 0 or the output stalls after the first one.
             filt.append(
-                f"[{vi}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                f"[{vi}:v]setpts=PTS-STARTPTS,"
+                f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
                 f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g},"
                 f"format=yuv420p[{vlbl}]")
             vlabels.append(vlbl)
