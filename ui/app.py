@@ -22,11 +22,16 @@ from recorder.audio import (AudioRecorder, CaptureSource, LevelMonitor,
 from recorder.config import ConfigManager
 from recorder.logging_setup import get_logger, install_inapp_handler
 from recorder.screen import ScreenRecorder, list_monitors
-from ui.widgets import (COLORS, DeviceRow, GoldBanner, ScrollFrame,
-                        SegmentedControl, StatusLight, ToggleSwitch,
+from ui.widgets import (COLORS, FONT, DeviceRow, GoldBanner, ScrollFrame,
+                        SegmentedControl, StatusLight, ToggleSwitch, Tooltip,
                         apply_dark_theme)
 
 log = get_logger("gui")
+
+
+def _ellipsize(s, n=46):
+    """Middle-ellipsis so both the start and the distinctive tail survive."""
+    return s if len(s) <= n else s[: n // 2 - 1] + "..." + s[-(n // 2 - 2):]
 
 
 class App(tk.Tk):
@@ -75,6 +80,7 @@ class App(tk.Tk):
         self._build_window_icons()
 
         self.cfg = ConfigManager()
+        self._cleanup_stale_sessions()
         self.inputs, self.outputs = list_devices()
         self.all_devices = self.inputs + self.outputs
         self.encoders = ffmpeg_tools.probe_encoders()
@@ -113,6 +119,7 @@ class App(tk.Tk):
         self._record_start_mono = 0.0
         self.last_outputs = {}
         self._restart_cooldown = {}
+        self._restart_counts = {}
         self._log_queue = queue.Queue()
         self._device_rows = []
         self.level_monitor = None
@@ -153,10 +160,18 @@ class App(tk.Tk):
         self.settings_win = None
         self.tray = None
         self.hotkeys = None
+        # _save_settings is a no-op until restore finishes: the var traces fire
+        # during UI construction (e.g. _refresh_monitor_list writes monitor_var)
+        # while _device_rows is still empty, and a save at that moment would
+        # wipe the persisted device selections, gains, and mutes on every
+        # launch.
+        self._ui_ready = False
+        self._unresolved_sources = []
         self._make_vars()
         self._build_ui()
         install_inapp_handler(self._enqueue_log)
         self._restore_from_config()
+        self._ui_ready = True
         self._refresh_monitor()
         self._setup_tray()
         self._setup_hotkeys()
@@ -165,6 +180,29 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         log.info("GUI ready. %d devices, encoders=%s", len(self.all_devices),
                  self.encoders)
+
+    def _cleanup_stale_sessions(self):
+        """Best-effort removal of session dirs left by dead instances (the
+        dir name embeds the pid; see start_recording)."""
+        import glob as _glob
+        import shutil as _shutil
+        try:
+            import psutil
+        except ImportError:
+            return
+        base = paths.data_dir()
+        for d in _glob.glob(os.path.join(base, "session-*")) + [
+                os.path.join(base, "session")]:  # legacy shared dir
+            if not os.path.isdir(d):
+                continue
+            pid_part = os.path.basename(d).rpartition("-")[2]
+            try:
+                if pid_part.isdigit() and psutil.pid_exists(int(pid_part)) \
+                        and int(pid_part) != os.getpid():
+                    continue  # that instance is alive - leave its dir alone
+                _shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
 
     # ------------------------------------------------------- tray + hotkeys #
     def _safe_after(self, fn):
@@ -320,11 +358,15 @@ class App(tk.Tk):
     def _apply_hotkey_mute(self, target, muted):
         """Mute/unmute the hotkey's target device(s). Empty target = all mics.
 
-        Hotkey mutes are a transient overlay: they never overwrite a mute the
-        user set by hand, releasing the key only unmutes rows the hotkey muted,
-        and _save_settings does not persist them - so a recording made next
-        week can't silently start with muted mics because PTT was tried once.
+        Hotkey mutes are a transient overlay: in ptt/ptm modes they never
+        overwrite a mute the user set by hand (releasing the key only unmutes
+        rows the hotkey muted), and _save_settings does not persist them - so
+        a recording made next week can't silently start with muted mics
+        because PTT was tried once. TOGGLE mode is different: each press is an
+        explicit user action, so unmute applies to every target row - without
+        this, a hand-muted device could never be unmuted by its own hotkey.
         """
+        toggle_mode = self.ptt_mode_var.get() == "toggle"
         for row in self._device_rows:
             d = row.get_selection()
             if not d:
@@ -338,7 +380,8 @@ class App(tk.Tk):
                     row._hotkey_muted = True
                     row.set_muted(True, notify=True)
             else:
-                if getattr(row, "_hotkey_muted", False):
+                if getattr(row, "_hotkey_muted", False) or (
+                        toggle_mode and row.is_muted()):
                     row._hotkey_muted = False
                     row.set_muted(False, notify=True)
 
@@ -418,10 +461,12 @@ class App(tk.Tk):
         ttk.Label(header, text="SimpleReliableRecorder", style="Title.TLabel").pack(side="left")
         ttk.Button(header, text="Settings", command=self._open_settings).pack(
             side="left", padx=14)
-        self.audio_light = StatusLight(header, "Audio: idle")
+        self.audio_light = StatusLight(header, "Audio")
         self.audio_light.pack(side="right", padx=4)
-        self.screen_light = StatusLight(header, "Screen: off")
+        self.screen_light = StatusLight(header, "Screen")
         self.screen_light.pack(side="right", padx=4)
+        self.audio_light.set_state(COLORS["muted"], ": idle")
+        self.screen_light.set_state(COLORS["muted"], ": off")
         self.elapsed_lbl = ttk.Label(header, text="00:00:00", style="Header.TLabel")
         self.elapsed_lbl.pack(side="right", padx=12)
 
@@ -447,7 +492,7 @@ class App(tk.Tk):
         lf = ttk.Labelframe(parent, text=title, style="TLabelframe")
         lf.pack(fill="x", pady=6)
         inner = ttk.Frame(lf, style="TFrame")
-        inner.pack(fill="x", padx=10, pady=8)
+        inner.pack(fill="x", padx=12, pady=8)
         return inner
 
     def _build_devices(self, parent):
@@ -461,9 +506,15 @@ class App(tk.Tk):
                    command=self._add_default_mic).pack(side="left", padx=6)
         ttk.Button(btns, text="+ System playback",
                    command=self._add_system_playback).pack(side="left")
-        ttk.Button(btns, text="Refresh", command=self._refresh_devices).pack(side="right")
-        ToggleSwitch(btns, self.live_levels_var, text="Live meters").pack(
-            side="right", padx=8)
+        dev_refresh = ttk.Button(btns, text="Refresh",
+                                 command=self._refresh_devices)
+        dev_refresh.pack(side="right")
+        Tooltip(dev_refresh, "Re-scan for plugged-in/unplugged devices.")
+        meters_toggle = ToggleSwitch(btns, self.live_levels_var,
+                                     text="Live meters")
+        meters_toggle.pack(side="right", padx=8)
+        Tooltip(meters_toggle, "Show each device's live level even while not "
+                               "recording, so you can check a mic works.")
         ttk.Label(inner, text="Balance each device with the faders; meters are live.",
                   style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
@@ -471,7 +522,7 @@ class App(tk.Tk):
         inner = self._section(parent, "Screen recording  (optional)")
         top = ttk.Frame(inner, style="TFrame")
         top.pack(fill="x")
-        ttk.Label(top, text="Record a screen", style="Panel.TLabel").pack(side="left")
+        ttk.Label(top, text="Record a screen").pack(side="left")
         ToggleSwitch(top, self.screen_enabled, command=self._toggle_screen).pack(
             side="left", padx=(12, 0))
 
@@ -483,8 +534,11 @@ class App(tk.Tk):
         self.monitor_combo = ttk.Combobox(row, textvariable=self.monitor_var,
                                           width=26, state="readonly")
         self.monitor_combo.pack(side="left", padx=6)
-        ttk.Button(row, text="Identify screens",
-                   command=self._identify_screens).pack(side="left", padx=6)
+        ident_btn = ttk.Button(row, text="Identify screens",
+                               command=self._identify_screens)
+        ident_btn.pack(side="left", padx=6)
+        Tooltip(ident_btn, "Flashes a big number on each monitor so you can "
+                           "tell which is which.")
         self._refresh_monitor_list()
         ttk.Label(self.screen_opts,
                   text="Encoder, quality and crash-safety options are in Settings.",
@@ -529,12 +583,19 @@ class App(tk.Tk):
         ttk.Button(bottom, text="Close", style="Accent.TButton",
                    command=lambda: _on_settings_close()).pack(side="right")
 
-        scroll = ScrollFrame(win)
-        scroll.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        p = scroll.body
+        # Tabs instead of one tall scroll: each concern fits on screen and the
+        # safety-critical alerts page is findable by name instead of being
+        # below the fold.
+        nb = ttk.Notebook(win)
+        nb.pack(fill="both", expand=True, padx=12, pady=(12, 0))
+        pages = {}
+        for name in ("Recording", "Saving", "Safety & alerts", "Hotkey & tray"):
+            pg = ScrollFrame(nb)
+            nb.add(pg, text=name)
+            pages[name] = pg.body
 
         # --- Audio output ---
-        a = self._section(p, "Audio output")
+        a = self._section(pages["Recording"], "Audio output")
         modes = [
             ("separate", "Separate file per device  (safest, default)"),
             ("channels", "Separate channels in ONE file  (mic=ch1, playback=ch2 ...)"),
@@ -550,7 +611,7 @@ class App(tk.Tk):
                   style="Muted.TLabel").pack(side="left", padx=8)
 
         # --- Screen quality ---
-        s = self._section(p, "Screen recording quality")
+        s = self._section(pages["Recording"], "Screen recording quality")
         r1 = ttk.Frame(s, style="TFrame")
         r1.pack(fill="x")
         ttk.Label(r1, text="Encoder:").pack(side="left")
@@ -583,7 +644,7 @@ class App(tk.Tk):
                   style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
         # --- Output location ---
-        o = self._section(p, "Output location")
+        o = self._section(pages["Saving"], "Output location")
         f = ttk.Frame(o, style="TFrame")
         f.pack(fill="x")
         ttk.Label(f, text="Save to:").pack(side="left")
@@ -598,7 +659,7 @@ class App(tk.Tk):
                      values=["ask", "combine", "separate"]).pack(side="left")
 
         # --- System tray ---
-        tsec = self._section(p, "System tray")
+        tsec = self._section(pages["Hotkey & tray"], "System tray")
         ToggleSwitch(tsec, self.tray_var,
                      text="Show a tray icon (turns red while recording)").pack(
             anchor="w", pady=3)
@@ -606,7 +667,8 @@ class App(tk.Tk):
                   style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
 
         # --- Push to talk / push to mute ---
-        psec = self._section(p, "Push to talk / push to mute hotkey")
+        psec = self._section(pages["Hotkey & tray"],
+                             "Push to talk / push to mute hotkey")
         ToggleSwitch(psec, self.ptt_enabled_var,
                      text="Enable a global hotkey that mutes/unmutes a device").pack(
             anchor="w", pady=3)
@@ -640,7 +702,7 @@ class App(tk.Tk):
             self._scrivox_exe = scrivox_bridge.find_scrivox(
                 self.cfg.get("scrivox_path"))
         if self._scrivox_exe:
-            xsec = self._section(p, "Transcription (Scrivox)")
+            xsec = self._section(pages["Saving"], "Transcription (Scrivox)")
             ttk.Label(xsec, text=f"Scrivox detected:  {self._scrivox_exe}",
                       style="Muted.TLabel", wraplength=560,
                       justify="left").pack(anchor="w")
@@ -658,7 +720,7 @@ class App(tk.Tk):
                       justify="left").pack(anchor="w", pady=(6, 0))
 
         # --- Resilience ---
-        rsec = self._section(p, "Resilience")
+        rsec = self._section(pages["Safety & alerts"], "Resilience")
         ToggleSwitch(rsec, self.autorestart_var,
                      text="Auto-restart a subsystem if it fails mid-recording").pack(
             anchor="w", pady=3)
@@ -670,7 +732,7 @@ class App(tk.Tk):
                                                                      pady=(4, 0))
 
         # --- Alerts ---
-        al = self._section(p, "Alert me if recording stops")
+        al = self._section(pages["Safety & alerts"], "Alert me if recording stops")
         for text, var in (("Play a sound", self.sound_var),
                           ("Flashing gold banner", self.banner_var),
                           ("Flash the taskbar button", self.taskbar_var),
@@ -689,16 +751,87 @@ class App(tk.Tk):
             self.settings_win = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_settings_close)
+        win.bind("<Escape>", lambda e: _on_settings_close())
+
+    IDLE_TEXT = "Ready - press RECORD (or F9) to start. Everything saves automatically."
 
     def _build_record(self, parent):
         inner = self._section(parent, "Record")
         self.record_btn = tk.Button(inner, text="●  RECORD", command=self._toggle_record,
                                     bg=COLORS["green"], fg="#0b0b0b",
                                     font=("Segoe UI", 20, "bold"), relief="flat",
-                                    height=2, activebackground="#7fd687")
+                                    height=2, activebackground="#7fd687",
+                                    cursor="hand2", takefocus=1,
+                                    highlightthickness=2,
+                                    highlightbackground=COLORS["bg"],
+                                    highlightcolor=COLORS["fg"])
         self.record_btn.pack(fill="x", pady=4)
-        self.status_lbl = ttk.Label(inner, text="Idle.", style="Muted.TLabel")
+        # F9 works everywhere (a bare Space would fight with text entries).
+        self.bind("<F9>", lambda e: self._toggle_record())
+        self.status_lbl = ttk.Label(inner, text=self.IDLE_TEXT,
+                                    style="Muted.TLabel")
         self.status_lbl.pack(anchor="w", pady=(6, 0))
+        # Where files go - the top question from new users. Click to open.
+        self.saveto_lbl = ttk.Label(
+            inner, style="Muted.TLabel", cursor="hand2",
+            text=f"Saving to: {self.cfg.resolved_save_folder()}")
+        self.saveto_lbl.pack(anchor="w", pady=(2, 0))
+        self.saveto_lbl.bind(
+            "<Button-1>",
+            lambda e: self._open_folder(self.cfg.resolved_save_folder()))
+        self.folder_var.trace_add(
+            "write", lambda *a: self.saveto_lbl.config(
+                text=f"Saving to: {self.cfg.resolved_save_folder()}"))
+        Tooltip(self.saveto_lbl, "Click to open this folder.")
+        # One shared busy area for combine/convert/transcribe background jobs:
+        # motion while something runs, and a way to drop what hasn't started.
+        self.busy_row = ttk.Frame(inner, style="TFrame")
+        self.busy_bar = ttk.Progressbar(self.busy_row, mode="indeterminate",
+                                        style="Busy.Horizontal.TProgressbar")
+        self.busy_bar.pack(side="left", fill="x", expand=True)
+        self.busy_cancel = ttk.Button(self.busy_row, text="Cancel queued",
+                                      command=self._cancel_queued_jobs)
+        self.busy_cancel.pack(side="left", padx=(8, 0))
+
+    def _open_folder(self, path):
+        try:
+            if path and os.path.isdir(path):
+                os.startfile(path)
+        except Exception as e:
+            log.warning("open folder failed: %s", e)
+
+    def _set_busy(self, on):
+        """Show/hide the animated busy bar under the status label."""
+        try:
+            if on:
+                if not self.busy_row.winfo_manager():
+                    self.busy_row.pack(fill="x", pady=(6, 0))
+                    if str(self.busy_bar.cget("mode")) == "indeterminate":
+                        self.busy_bar.start(12)
+                if not self._transcribe_busy:
+                    self.busy_cancel.config(state=(
+                        "normal" if self._combine_queue else "disabled"))
+            else:
+                self.busy_bar.stop()
+                self.busy_bar.config(mode="indeterminate", value=0)
+                self.busy_cancel.config(text="Cancel queued",
+                                        command=self._cancel_queued_jobs)
+                self.busy_row.pack_forget()
+        except Exception:
+            pass
+
+    def _cancel_queued_jobs(self):
+        """Drop combine/convert jobs that haven't started; the running one
+        finishes (stopping ffmpeg mid-write would leave a broken file)."""
+        dropped, self._combine_queue = self._combine_queue, []
+        for _fn, out in dropped:
+            self._pending_out_paths.discard(out)
+            self._combine_results.append((False, out,
+                                          "Cancelled before it started."))
+        if dropped:
+            self.status_lbl.config(
+                text="Finishing the current job... (queued ones cancelled)")
+        self.busy_cancel.config(state="disabled")
 
     # ----------------------------------------------------- recordings library #
     def _build_library(self, parent):
@@ -706,9 +839,8 @@ class App(tk.Tk):
         desc = ttk.Label(
             inner, style="Muted.TLabel", justify="left",
             text="Past recordings stay listed here so you can keep recording, "
-            "then tick any and merge them into one file with the buttons below. "
-            "Double-click a recording to rename it (folder + every track); "
-            "right-click for more options. "
+            "then tick any (click anywhere on a row) and use the buttons "
+            "below. Double-click renames; right-click for more options. "
             "Entries whose files are moved are removed automatically.")
         desc.pack(fill="x", anchor="w")
         # Wrap the text to the actual panel width instead of a fixed value, so it
@@ -720,13 +852,22 @@ class App(tk.Tk):
         self.lib_holder.configure(height=150)
         self.lib_holder.pack(fill="x", pady=(8, 0))
         self.lib_body = self.lib_holder.body
-        self.lib_empty = ttk.Label(inner, text="No saved recordings yet.",
-                                   style="Muted.TLabel")
+        self.lib_empty = ttk.Label(
+            inner, style="Muted.TLabel", justify="left",
+            text="No recordings yet. Your first one will appear here the "
+                 "moment you press STOP - nothing to save manually.")
         self.lib_empty.pack(anchor="w", pady=(4, 0))
 
-        self.lib_sel_lbl = ttk.Label(inner, text="Nothing selected.",
+        selrow = ttk.Frame(inner, style="TFrame")
+        selrow.pack(fill="x", pady=(6, 0))
+        ttk.Button(selrow, text="Select all", width=10,
+                   command=lambda: self._set_all_ticks(True)).pack(side="left")
+        ttk.Button(selrow, text="Clear", width=8,
+                   command=lambda: self._set_all_ticks(False)).pack(
+            side="left", padx=6)
+        self.lib_sel_lbl = ttk.Label(selrow, text="Nothing selected.",
                                      style="Muted.TLabel")
-        self.lib_sel_lbl.pack(anchor="w", pady=(8, 0))
+        self.lib_sel_lbl.pack(side="left", padx=(10, 0))
 
         b = ttk.Frame(inner, style="TFrame")
         b.pack(fill="x", pady=(4, 0))
@@ -756,20 +897,52 @@ class App(tk.Tk):
 
         b2 = ttk.Frame(inner, style="TFrame")
         b2.pack(fill="x", pady=(2, 0))
-        ttk.Button(b2, text="Open folder", width=12,
-                   command=self._open_selected_library).pack(side="left")
-        ttk.Button(b2, text="Remove", width=10,
-                   command=self._remove_selected_library).pack(side="left", padx=6)
-        ttk.Button(b2, text="Refresh", width=10,
-                   command=lambda: self._refresh_library(rescan=True)).pack(side="right")
+        open_btn = ttk.Button(b2, text="Open folder", width=12,
+                              command=self._open_selected_library)
+        open_btn.pack(side="left")
+        remove_btn = ttk.Button(b2, text="Remove", width=10,
+                                command=self._remove_selected_library)
+        remove_btn.pack(side="left", padx=6)
+        refresh_btn = ttk.Button(
+            b2, text="Refresh", width=10,
+            command=lambda: self._refresh_library(rescan=True))
+        refresh_btn.pack(side="right")
+
+        # Disabled buttons should say WHY on hover; the text is updated in
+        # _update_library_buttons as the selection changes.
+        self._lib_tips = {
+            "video": Tooltip(self.lib_btn_video,
+                             "Joins the ticked recordings end to end into one "
+                             "video with their sound."),
+            "multi": Tooltip(self.lib_btn_multi,
+                             "One WAV where every ticked track keeps its own "
+                             "channel - great for editing."),
+            "mix": Tooltip(self.lib_btn_mix,
+                           "Everything summed into one stereo file."),
+            "convert": Tooltip(self.lib_btn_convert,
+                               "Export each ticked recording to another "
+                               "format (MP4, MP3, MKV, WAV...)."),
+            "transcribe": Tooltip(self.lib_btn_transcribe,
+                                  "Turn the ticked recordings into text with "
+                                  "Scrivox - saved next to each recording."),
+        }
+        Tooltip(remove_btn, "Removes from this list only - never deletes "
+                            "files on disk.")
+        Tooltip(refresh_btn, "Re-scan the save folder for recordings made "
+                             "outside this app.")
+        Tooltip(open_btn, "Open the selected recording's folder.")
         self._refresh_library()
 
     def _add_to_library(self, select_new=False):
         audio = [a for a in (self.last_outputs.get("audio") or [])
                  if a and os.path.isfile(a)]
-        video = self.last_outputs.get("video") or ""
-        if not os.path.isfile(video):
-            video = ""
+        # A mid-take screen auto-restart leaves the pre-restart video in
+        # videos_extra; the entry must reference the MAIN segment (usually the
+        # long pre-restart one, per _pick_video), not just the tail fragment.
+        vids = [v for v in ([self.last_outputs.get("video") or ""]
+                            + (self.last_outputs.get("videos_extra") or []))
+                if v and os.path.isfile(v)]
+        video = library._pick_video(vids) if vids else ""
         if not audio and not video:
             return
         self._lib_seq += 1
@@ -779,6 +952,10 @@ class App(tk.Tk):
             out_dir=self.last_outputs.get("out_dir", ""),
             audio=audio, video=video,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        extras = [v for v in vids if v != video]
+        if extras:
+            # Kept for visibility/future use; prune() preserves unknown keys.
+            entry["videos_extra"] = extras
         self._library.append(entry)
         self.cfg.set("recordings", self._library)
         self._refresh_library()
@@ -827,19 +1004,37 @@ class App(tk.Tk):
             row = ttk.Frame(self.lib_body, style="Card.TFrame", padding=6)
             row.pack(fill="x", pady=2)
             var = tk.BooleanVar(value=(e.get("id") in ticked))
-            cb = ToggleSwitch(row, var,
-                              text=f'{e["name"]}  ({library.summarize(e)})',
-                              command=self._update_library_buttons)
-            cb.pack(anchor="w")
+            cb = ToggleSwitch(row, var, command=self._update_library_buttons)
+            cb.pack(side="left")
+            # Name + muted metadata on separate lines: the date is how people
+            # actually remember a take, and long names get middle-ellipsized
+            # instead of pushing everything off-screen.
+            txt = ttk.Frame(row, style="Card.TFrame")
+            txt.pack(side="left", padx=(10, 0), fill="x", expand=True)
+            name_lbl = ttk.Label(txt, text=_ellipsize(e["name"]),
+                                 style="Card.TLabel")
+            name_lbl.pack(anchor="w")
+            created = (e.get("created") or "")[:16]
+            meta = library.summarize(e) + (f"   ·   {created}" if created else "")
+            meta_lbl = tk.Label(txt, text=meta, bg=COLORS["panel2"],
+                                fg=COLORS["muted"], font=(FONT, 9))
+            meta_lbl.pack(anchor="w")
+            # Click anywhere on the row to tick it (the tiny toggle was the
+            # only target before). Double-click still renames: the two rapid
+            # clicks toggle twice (net unchanged), then the dialog opens.
+            def _toggle(ev, v=var):
+                v.set(not v.get())
+                self._update_library_buttons()
+            for w in (row, txt, name_lbl, meta_lbl):
+                w.bind("<Button-1>", _toggle)
+                w.bind("<Double-Button-1>",
+                       lambda ev, ent=e: self._rename_entry(ent))
             # Right-click a row for a context menu (rename / open / show).
-            for w in (row, cb, getattr(cb, "label", None), getattr(cb, "canvas", None)):
+            for w in (row, txt, name_lbl, meta_lbl, cb,
+                      getattr(cb, "label", None), getattr(cb, "canvas", None)):
                 if w is not None:
                     w.bind("<Button-3>",
                            lambda ev, ent=e: self._show_library_menu(ev, ent))
-            # Double-click the row background renames directly (kept off the
-            # toggle itself so it doesn't fight with ticking).
-            row.bind("<Double-Button-1>",
-                     lambda ev, ent=e: self._rename_entry(ent))
             self._lib_rows.append({"frame": row, "var": var, "entry": e})
         has = bool(self._library)
         self.lib_empty.pack_forget() if has else self.lib_empty.pack(
@@ -874,16 +1069,36 @@ class App(tk.Tk):
         self.lib_sel_lbl.config(text=f"{n} {word} selected.")
         # Video: only when every selected take has a video.
         self.lib_btn_video.config(state=("normal" if all_video else "disabled"))
+        if not all_video:
+            self._lib_tips["video"].set_text(
+                "Needs a screen recording in EVERY ticked take - untick the "
+                "audio-only ones, or use an audio button instead.")
+        else:
+            self._lib_tips["video"].set_text(
+                "Joins the ticked recordings end to end into one video with "
+                "their sound.")
         # Multitrack: needs at least two audio tracks across the selection.
         self.lib_btn_multi.config(state=("normal" if total_audio >= 2 else "disabled"))
+        self._lib_tips["multi"].set_text(
+            "One WAV where every ticked track keeps its own channel - great "
+            "for editing." if total_audio >= 2 else
+            "Needs at least two audio tracks across the ticked recordings.")
         # Mix: any audio present.
         self.lib_btn_mix.config(state=("normal" if total_audio >= 1 else "disabled"))
+        self._lib_tips["mix"].set_text(
+            "Everything summed into one stereo file." if total_audio else
+            "No audio in the current selection.")
         # Convert: each ticked recording is exported on its own.
         self.lib_btn_convert.config(state="normal")
         # Transcribe: anything with audio or video qualifies.
         has_media = any(e.get("audio") or e.get("video") for e in sel)
         self.lib_btn_transcribe.config(
             state=("normal" if has_media else "disabled"))
+
+    def _set_all_ticks(self, on):
+        for r in self._lib_rows:
+            r["var"].set(on)
+        self._update_library_buttons()
 
     def _selected_library_entries(self):
         return [r["entry"] for r in self._lib_rows if r["var"].get()]
@@ -984,11 +1199,29 @@ class App(tk.Tk):
         self._transcribe_status(f"Transcribing 1/{n} with Scrivox...")
         log.info("Transcription started: %d recording(s), vision=%s, fmt=%s",
                  n, want_vision, fmt)
+        # Determinate progress (the total is known) + a safe between-files
+        # stop: no processes are killed, the current file simply becomes the
+        # last one.
+        self._transcribe_cancel = threading.Event()
+        try:
+            self.busy_bar.stop()
+            self.busy_bar.config(mode="determinate", maximum=n, value=0)
+            self.busy_cancel.config(text="Stop after current file",
+                                    state="normal",
+                                    command=self._transcribe_cancel.set)
+            self._set_busy(True)
+        except Exception:
+            pass
 
         def work():
             results = []
             for i, e in enumerate(entries):
                 name = e.get("name") or "recording"
+                if self._transcribe_cancel.is_set():
+                    results.append((name, False, "Skipped - you pressed Stop."))
+                    continue
+                self._safe_after(
+                    lambda i=i: self.busy_bar.config(value=i))
                 def status(msg, i=i, name=name):
                     self._safe_after(lambda: self._transcribe_status(
                         f"Transcribing {i + 1}/{n} ({name}): {msg}"))
@@ -1023,7 +1256,9 @@ class App(tk.Tk):
         elif self._transcribe_busy:
             self.status_lbl.config(text="Transcribing with Scrivox...")
         else:
-            self.status_lbl.config(text="Idle.")
+            self.status_lbl.config(text=self.IDLE_TEXT)
+        if not self._combine_busy and not self._transcribe_busy:
+            self._set_busy(False)
 
     def _transcribe_done(self, results):
         self._transcribe_busy = False
@@ -1065,21 +1300,40 @@ class App(tk.Tk):
         except Exception as e:
             log.warning("reveal transcript failed: %s", e)
 
-    def _transcribe_dialog(self, n_entries, any_video):
-        """Modal dialog for transcription options.
-        Returns (want_vision, fmt, ext) or None if cancelled."""
+    def _modal_dialog(self, title):
+        """Shared boilerplate for the app's small option dialogs."""
         win = tk.Toplevel(self)
-        win.title("Transcribe with Scrivox")
+        win.title(title)
         win.configure(bg=COLORS["bg"])
         win.transient(self)
         win.grab_set()
+        win.resizable(False, False)
         try:
             ip = paths.icon_path()
             if ip:
                 win.iconbitmap(ip)
         except Exception:
             pass
+        return win
 
+    def _finish_dialog(self, win, ok_fn, focus=None):
+        """Keyboard parity + centering: Enter confirms, Escape cancels."""
+        win.bind("<Return>", lambda e: ok_fn())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        try:
+            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
+            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+            win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+        (focus or win).focus_set()
+
+    def _transcribe_dialog(self, n_entries, any_video):
+        """Modal dialog for transcription options.
+        Returns (want_vision, fmt, ext) or None if cancelled."""
+        win = self._modal_dialog("Transcribe with Scrivox")
         result = {"value": None}
         frm = ttk.Frame(win, style="TFrame")
         frm.pack(fill="both", expand=True, padx=16, pady=14)
@@ -1125,18 +1379,13 @@ class App(tk.Tk):
             result["value"] = (mode_var.get() == "vision", fmt, ext)
             win.destroy()
 
-        ttk.Button(btns, text="Transcribe", style="Accent.TButton",
-                   command=ok).pack(side="right")
+        go_btn = ttk.Button(btns, text="Transcribe", style="Accent.TButton",
+                            command=ok)
+        go_btn.pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right", padx=(0, 8))
 
-        win.update_idletasks()
-        try:
-            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
-            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
-            win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
-            pass
+        self._finish_dialog(win, ok, focus=go_btn)
         win.wait_window()
         return result["value"]
 
@@ -1167,18 +1416,8 @@ class App(tk.Tk):
     def _convert_dialog(self, n_audio, has_video, n_entries=1):
         """Modal dialog to pick an output format and audio handling.
         Returns (fmt_label, audio_mode) or None if cancelled."""
-        win = tk.Toplevel(self)
-        win.title("Convert recording" + ("" if n_entries == 1 else "s"))
-        win.configure(bg=COLORS["bg"])
-        win.transient(self)
-        win.grab_set()
-        try:
-            ip = paths.icon_path()
-            if ip:
-                win.iconbitmap(ip)
-        except Exception:
-            pass
-
+        win = self._modal_dialog(
+            "Convert recording" + ("" if n_entries == 1 else "s"))
         result = {"value": None}
         frm = ttk.Frame(win, style="TFrame")
         frm.pack(fill="both", expand=True, padx=16, pady=14)
@@ -1230,19 +1469,13 @@ class App(tk.Tk):
             result["value"] = (fmt_var.get(), mode_var.get())
             win.destroy()
 
-        ttk.Button(btns, text="Convert", style="Accent.TButton",
-                   command=ok).pack(side="right")
+        go_btn = ttk.Button(btns, text="Convert", style="Accent.TButton",
+                            command=ok)
+        go_btn.pack(side="right")
         ttk.Button(btns, text="Cancel", command=win.destroy).pack(
             side="right", padx=(0, 8))
 
-        win.update_idletasks()
-        # Center over the main window.
-        try:
-            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
-            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
-            win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
-            pass
+        self._finish_dialog(win, ok, focus=fmt_combo)
         win.wait_window()
         return result["value"]
 
@@ -1486,10 +1719,17 @@ class App(tk.Tk):
     def _restore_from_config(self):
         saved = self.cfg.get("audio_sources") or []
         any_added = False
+        self._unresolved_sources = []
         for sel in saved:
             if resolve_selection(sel):
                 self._add_row(preset=sel)
                 any_added = True
+            else:
+                # Unplugged right now, not gone: keep it so its selection,
+                # gain, and mute survive until it's plugged back in.
+                self._unresolved_sources.append(dict(sel))
+                log.info("Saved device not present now (kept in config): %s",
+                         sel.get("name"))
         if not any_added:
             self._add_default_mic()
             self._add_system_playback()
@@ -1505,6 +1745,8 @@ class App(tk.Tk):
 
     def _save_settings(self):
         self._save_job = None
+        if not getattr(self, "_ui_ready", True):
+            return  # still building/restoring - saving now would wipe config
         sels, gains, mutes = [], {}, {}
         for row in self._device_rows:
             d = row.get_selection()
@@ -1516,6 +1758,21 @@ class App(tk.Tk):
                 # Hotkey (PTT) mutes are transient - never persist them.
                 mutes[key] = row.is_muted() and not getattr(
                     row, "_hotkey_muted", False)
+        # A device that's merely unplugged right now must not be erased from
+        # the config - keep its selection, gain, and mute until the user
+        # removes it on purpose.
+        saved_gains = self.cfg.get("audio_gains") or {}
+        saved_mutes = self.cfg.get("audio_mutes") or {}
+        present = {f'{s["name"]}|{s["kind"]}' for s in sels}
+        for sel in self._unresolved_sources:
+            key = f'{sel.get("name")}|{sel.get("kind")}'
+            if key in present:
+                continue
+            sels.append(sel)
+            if key in saved_gains:
+                gains[key] = saved_gains[key]
+            if key in saved_mutes:
+                mutes[key] = saved_mutes[key]
         self.cfg.update({
             "audio_sources": sels,
             "audio_gains": gains,
@@ -1834,7 +2091,11 @@ class App(tk.Tk):
         base = f"SRR_{stamp}"
         self._session_base = base
 
-        self.session_dir = os.path.join(paths.data_dir(), "session")
+        # Per-process session dir: with a shared fixed dir, two app instances
+        # interleave heartbeats and either one's stop flag kills BOTH
+        # watchdogs, leaving the still-recording instance unprotected.
+        self.session_dir = os.path.join(paths.data_dir(),
+                                        f"session-{os.getpid()}")
         os.makedirs(self.session_dir, exist_ok=True)
         watchdog.clear_alert(self.session_dir)
         # Re-arm alerting and clear any leftover banner from a previous take.
@@ -1899,7 +2160,7 @@ class App(tk.Tk):
             # NOTHING actually started. Never enter the recording state - a red
             # button over zero capture is the worst possible lie this app can
             # tell. Surface the failure and bail out cleanly.
-            self.status_lbl.config(text="Idle.")
+            self.status_lbl.config(text=self.IDLE_TEXT)
             messagebox.showerror(
                 "Recording did NOT start",
                 "Screen recording failed to start and no audio devices are "
@@ -1915,6 +2176,7 @@ class App(tk.Tk):
         self._screen_last_size = -1
         self._screen_last_grow = time.monotonic()
         self._restart_cooldown = {}
+        self._restart_counts = {}
         self.recording = True
 
         self.heartbeat = watchdog.HeartbeatWriter(self.session_dir,
@@ -2029,8 +2291,13 @@ class App(tk.Tk):
         self.audio_rec = None
         self.screen_rec = None
         self._set_recording_ui(False)
-        self.record_btn.config(state="disabled")
+        # The user must never wonder whether STOP "took": say what's happening
+        # on the button itself and keep the busy bar moving until done().
+        self.record_btn.config(state="disabled",
+                               text="Saving your recording...",
+                               bg=COLORS["panel3"])
         self.status_lbl.config(text="Finalizing recording...")
+        self._set_busy(True)
 
         def finalize():
             audio_files, video_path = None, None
@@ -2059,13 +2326,44 @@ class App(tk.Tk):
                 self.last_outputs["video"] = video_path
             self._finalizing = False
             try:
-                self.record_btn.config(state="normal")
-                self.status_lbl.config(text="Idle.")
+                self.record_btn.config(state="normal", text="●  RECORD",
+                                       bg=COLORS["green"])
+                self._restore_status()
+                self._set_busy(False)
             except Exception:
                 pass
             self._add_to_library(select_new=True)
             log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
             self._refresh_monitor()
+            self._offer_stop_combine()
+
+    def _offer_stop_combine(self):
+        """Honor the 'When screen+audio ends' setting: ask / combine /
+        separate. Non-destructive - the separate tracks are always kept."""
+        action = self.on_stop_var.get()
+        if action == "separate":
+            return
+        video = self.last_outputs.get("video") or ""
+        audio = [a for a in (self.last_outputs.get("audio") or [])
+                 if a and os.path.isfile(a)]
+        if not (video and os.path.isfile(video) and audio):
+            return
+        if action == "ask":
+            if not messagebox.askyesno(
+                    "Combine now?",
+                    "Make one video file with the sound included?\n\n"
+                    "Your separate tracks are kept either way. (You can "
+                    "change this prompt in Settings > Saving.)"):
+                return
+        out_dir = (self.last_outputs.get("out_dir")
+                   or os.path.dirname(video))
+        base = getattr(self, "_session_base", None) or "SRR"
+        ext = os.path.splitext(video)[1].lstrip(".") or "mkv"
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out = self._unique_path(
+            os.path.join(out_dir, f"{base}_merged_{stamp}.{ext}"))
+        self._run_combine(
+            lambda: combine.combine_av(video, audio, out), out)
 
         if blocking:
             a, v = finalize()
@@ -2084,7 +2382,7 @@ class App(tk.Tk):
         else:
             self.record_btn.config(text="●  RECORD", bg=COLORS["green"],
                                    activebackground="#7fd687")
-            self.status_lbl.config(text="Idle.")
+            self._restore_status()
             self.audio_light.set_state(COLORS["muted"], ": idle")
             self.screen_light.set_state(COLORS["muted"], ": off")
             self.elapsed_lbl.config(text="00:00:00")
@@ -2144,14 +2442,26 @@ class App(tk.Tk):
         if self.session_dir:
             watchdog.clear_alert(self.session_dir)
 
+    # Audio capture already self-heals an unplugged device in place (it keeps
+    # the file open, fills the gap with silence, and retries every 0.5s), so
+    # tearing the whole subsystem down mustn't repeat forever: each rebuild
+    # creates another junk WAV set. Cap the attempts and back off between them.
+    _AUDIO_RESTART_CAP = 3
+
     def _auto_restart_failed(self):
         now = time.monotonic()
         if self.audio_rec is not None:
             a = self.audio_rec.get_status()
             secs = (time.monotonic() - a["last_write"]) if a["last_write"] else 999
-            if (not a["any_active"] or secs > 4) and now - self._restart_cooldown.get("audio", 0) > 8:
+            n = self._restart_counts.get("audio", 0)
+            cooldown = 8 * (2 ** n)
+            if ((not a["any_active"] or secs > 4)
+                    and n < self._AUDIO_RESTART_CAP
+                    and now - self._restart_cooldown.get("audio", 0) > cooldown):
                 self._restart_cooldown["audio"] = now
-                log.warning("Auto-restarting AUDIO subsystem...")
+                self._restart_counts["audio"] = n + 1
+                log.warning("Auto-restarting AUDIO subsystem (attempt %d/%d)...",
+                            n + 1, self._AUDIO_RESTART_CAP)
                 self._restart_audio()
         if self.screen_rec is not None:
             s = self.screen_rec.get_status()
@@ -2192,7 +2502,9 @@ class App(tk.Tk):
                 threading.Thread(target=_stop_old_audio,
                                  name="audio-restart-stop", daemon=True).start()
             base = self._combine_base() + "_restart-" + datetime.now().strftime("%H%M%S")
-            self._record_start_mono = time.monotonic()  # give the restart grace too
+            # NOTE: _record_start_mono is deliberately NOT reset here - it is
+            # the take's true start; resetting it lied to the elapsed timer
+            # and re-armed the watchdog's startup grace mid-recording.
             self.audio_rec = AudioRecorder(
                 sources, self.output_mode.get(), out_dir, base,
                 target_samplerate=int(self.cfg.get("audio_target_samplerate")),
@@ -2324,6 +2636,11 @@ class App(tk.Tk):
             row.set_level(levels.get(lb, 0.0) if lb else 0.0)
 
     def _update_status_lights(self):
+        # The timer must tick for screen-only takes too - a frozen 00:00:00
+        # reads as "not recording" to exactly the users this app is for.
+        if self.recording and self._record_start_mono:
+            self.elapsed_lbl.config(text=_fmt_elapsed(
+                time.monotonic() - self._record_start_mono))
         if self.audio_rec:
             a = self.audio_rec.get_status()
             secs = (time.monotonic() - a["last_write"]) if a["last_write"] else 999
@@ -2391,9 +2708,11 @@ class App(tk.Tk):
             self._combine_queue.append((fn, out))
             self.status_lbl.config(
                 text=f"Combining... ({len(self._combine_queue)} more queued)")
+            self._set_busy(True)
             return
         self._combine_busy = True
         self.status_lbl.config(text="Combining... (this can take a while for video)")
+        self._set_busy(True)
         log.info("Combine started -> %s", out)
 
         def work():
@@ -2425,9 +2744,12 @@ class App(tk.Tk):
         failed = [(o, d) for k, o, d in results if not k]
         if saved and not failed:
             word = "it" if len(saved) == 1 else "the first one"
+            # Basenames + one folder line: full absolute paths per file wrap
+            # horribly for deep folders.
+            names = "\n".join("  " + os.path.basename(o) for o in saved)
             if messagebox.askyesno(
                     "Merge complete",
-                    "Saved:\n" + "\n".join(saved)
+                    f"Saved:\n{names}\n\nIn: {os.path.dirname(saved[0])}"
                     + f"\n\nShow {word} in the folder?"):
                 folder = os.path.dirname(saved[0])
                 try:

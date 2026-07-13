@@ -38,7 +38,11 @@ _PART_RE = re.compile(r"^(?P<base>.+)_part(?P<num>\d+)$")
 def _run(cmd, timeout=None, out_path=None):
     log.info("combine: %s", " ".join(cmd))
     try:
+        # encoding pinned: ffmpeg echoes file paths as UTF-8; the default
+        # locale codepage (cp1252) raises UnicodeDecodeError on non-ASCII
+        # recording names and failed the whole merge.
         res = subprocess.run(cmd, capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
                              timeout=timeout,
                              creationflags=CREATE_NO_WINDOW,
                              startupinfo=_startupinfo())
@@ -78,7 +82,8 @@ def _probe_media(path):
     try:
         res = subprocess.run([ffmpeg_tools.ffmpeg_exe(), "-hide_banner",
                               "-i", path],
-                             capture_output=True, text=True, timeout=30,
+                             capture_output=True, text=True,
+                             encoding="utf-8", errors="replace", timeout=30,
                              creationflags=CREATE_NO_WINDOW,
                              startupinfo=_startupinfo())
         text = res.stderr or ""

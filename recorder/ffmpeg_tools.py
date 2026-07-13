@@ -42,7 +42,8 @@ def run_capture(args, timeout=20):
     cmd = [ffmpeg_exe(), "-hide_banner"] + args
     try:
         res = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout,
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=timeout,
             creationflags=CREATE_NO_WINDOW, startupinfo=_startupinfo())
         return res.returncode, (res.stdout or "") + (res.stderr or "")
     except Exception as e:

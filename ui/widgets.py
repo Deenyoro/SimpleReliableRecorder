@@ -16,7 +16,9 @@ COLORS = {
     "panel2": "#262a32",
     "panel3": "#2f343d",
     "fg": "#e6e8ec",
-    "muted": "#8b909a",
+    # Muted carries load-bearing hint text at 10pt, so it is kept a notch
+    # brighter than a decorative gray (~6.3:1 on bg, ~5.7:1 on panel).
+    "muted": "#9aa1ad",
     "accent": "#4cc2b0",
     "accent_dim": "#36serial",  # placeholder, overwritten below
     "gold": "#FFC107",
@@ -29,6 +31,24 @@ COLORS = {
 COLORS["accent_dim"] = "#3a8f83"
 
 FONT = "Segoe UI"
+
+# Spacing tokens so paddings stop drifting between panels and dialogs.
+PAD_XS, PAD_S, PAD_M, PAD_L = 4, 8, 12, 16
+
+_ui_scale = None
+
+
+def ui_scale(widget):
+    """Pixel scale factor (1.0 at 96 DPI). Canvas-based widgets use fixed
+    pixel sizes that don't follow `tk scaling`, so they multiply by this to
+    stay proportionate to the text on high-DPI displays."""
+    global _ui_scale
+    if _ui_scale is None:
+        try:
+            _ui_scale = max(1.0, widget.winfo_fpixels("1i") / 96.0)
+        except Exception:
+            return 1.0
+    return _ui_scale
 
 # Maps the ttk frame styles we use to their background color, so plain tk
 # widgets (Canvas/Label) placed inside them can match exactly.
@@ -122,12 +142,85 @@ def apply_dark_theme(root):
                     troughcolor=c["bg"], bordercolor=c["bg"], arrowcolor=c["muted"])
     style.map("Vertical.TScrollbar", background=[("active", c["accent_dim"])])
 
-    # Section frames.
-    style.configure("TLabelframe", background=c["panel"], foreground=c["accent"],
+    # Section frames. Background matches the window so a section's TFrame
+    # interior doesn't show as a darker rectangle floating inside it.
+    style.configure("TLabelframe", background=c["bg"], foreground=c["accent"],
                     bordercolor=c["border"], relief="solid", borderwidth=1)
-    style.configure("TLabelframe.Label", background=c["panel"], foreground=c["accent"],
+    style.configure("TLabelframe.Label", background=c["bg"], foreground=c["accent"],
                     font=(FONT, 10, "bold"))
+
+    # Labels that sit on Card.TFrame rows (device rows, library rows).
+    style.configure("Card.TLabel", background=c["panel2"], foreground=c["fg"],
+                    font=(FONT, 11))
+
+    # Busy bar for background combine/convert/transcribe jobs.
+    style.configure("Busy.Horizontal.TProgressbar",
+                    background=c["accent"], troughcolor=c["panel3"],
+                    bordercolor=c["panel"], lightcolor=c["accent"],
+                    darkcolor=c["accent"])
+
+    # Settings notebook.
+    style.configure("TNotebook", background=c["bg"], borderwidth=0)
+    style.configure("TNotebook.Tab", background=c["panel"], foreground=c["muted"],
+                    padding=(14, 7), font=(FONT, 10))
+    style.map("TNotebook.Tab",
+              background=[("selected", c["panel3"])],
+              foreground=[("selected", c["fg"])])
     return style
+
+
+class Tooltip:
+    """Delayed, theme-matched hover tooltip for any widget."""
+
+    def __init__(self, widget, text, delay=600):
+        self.widget, self.text, self.delay = widget, text, delay
+        self._tip = None
+        self._job = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def set_text(self, text):
+        self.text = text
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        try:
+            self._job = self.widget.after(self.delay, self._show)
+        except Exception:
+            pass
+
+    def _show(self):
+        if self._tip or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 6
+            self._tip = tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            tk.Label(tw, text=self.text, bg=COLORS["panel3"], fg=COLORS["fg"],
+                     font=(FONT, 9), justify="left", wraplength=320,
+                     padx=8, pady=5, bd=1, relief="solid").pack()
+        except Exception:
+            self._tip = None
+
+    def _cancel(self):
+        if self._job is not None:
+            try:
+                self.widget.after_cancel(self._job)
+            except Exception:
+                pass
+            self._job = None
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
 
 
 class ScrollFrame(ttk.Frame):
@@ -172,20 +265,32 @@ class ScrollFrame(ttk.Frame):
             pass
 
 
-class StatusLight(tk.Canvas):
-    """A small colored dot with a label, used for per-subsystem state."""
+class StatusLight(tk.Frame):
+    """A small colored dot with a label, used for per-subsystem state.
+
+    A Frame with a real Label (auto-sizes, follows DPI) instead of a
+    fixed-width canvas that clipped longer states like 'Screen: REC 1023MB'.
+    `text` is the bare subsystem name ("Audio"); set_state appends the state.
+    """
 
     def __init__(self, parent, text, **kw):
-        super().__init__(parent, width=150, height=24, highlightthickness=0,
-                         bg=COLORS["bg"], **kw)
-        self._dot = self.create_oval(5, 7, 17, 19, fill=COLORS["muted"], outline="")
-        self._text = self.create_text(25, 12, anchor="w", text=text,
-                                      fill=COLORS["fg"], font=(FONT, 10))
+        super().__init__(parent, bg=COLORS["bg"], **kw)
+        s = ui_scale(parent)
+        d = int(14 * s)
+        self.dot = tk.Canvas(self, width=d, height=d, bg=COLORS["bg"],
+                             highlightthickness=0)
+        pad = max(2, int(2 * s))
+        self._oval = self.dot.create_oval(pad, pad, d - pad, d - pad,
+                                          fill=COLORS["muted"], outline="")
+        self.dot.pack(side="left", padx=(0, 5))
+        self.lbl = tk.Label(self, text=text, bg=COLORS["bg"],
+                            fg=COLORS["fg"], font=(FONT, 10))
+        self.lbl.pack(side="left")
         self._base = text
 
     def set_state(self, color, suffix=""):
-        self.itemconfig(self._dot, fill=color)
-        self.itemconfig(self._text, text=self._base + suffix)
+        self.dot.itemconfig(self._oval, fill=color)
+        self.lbl.config(text=self._base + suffix)
 
 
 class LevelMeter(tk.Canvas):
@@ -258,13 +363,24 @@ class ToggleSwitch(tk.Frame):
         super().__init__(parent, bg=bg)
         self.var = variable
         self.command = command
+        s = ui_scale(parent)
+        width, height = int(width * s), int(height * s)
         self._w_sw = width
         self._h_sw = height
 
         self.canvas = tk.Canvas(self, width=width, height=height,
-                                highlightthickness=0, bg=bg, cursor="hand2")
+                                highlightthickness=0, bg=bg, cursor="hand2",
+                                takefocus=1)
         self.canvas.pack(side="left")
         self.canvas.bind("<Button-1>", self._on_click)
+        # Keyboard operability + a visible focus ring (canvas widgets are
+        # otherwise invisible to Tab navigation).
+        self.canvas.bind("<space>", self._on_click)
+        self.canvas.bind("<Return>", self._on_click)
+        self.canvas.bind("<FocusIn>", lambda e: self.canvas.configure(
+            highlightthickness=2, highlightbackground=COLORS["accent"]))
+        self.canvas.bind("<FocusOut>", lambda e: self.canvas.configure(
+            highlightthickness=0))
 
         if text:
             # Determine a label style whose background matches our parent so the
@@ -331,9 +447,10 @@ class SegmentedControl(tk.Frame):
 
     def __init__(self, parent, variable, options, command=None, bg=None):
         bg = bg or COLORS["panel"]
-        super().__init__(parent, bg=bg)
+        super().__init__(parent, bg=bg, takefocus=1)
         self.var = variable
         self.command = command
+        self._values = [v for v, _ in options]
         self._rows = {}  # value -> label widget
         for value, text in options:
             row = tk.Label(self, text="   " + text, anchor="w", justify="left",
@@ -342,6 +459,12 @@ class SegmentedControl(tk.Frame):
             row.pack(fill="x", pady=2)
             row.bind("<Button-1>", lambda e, v=value: self._select(v))
             self._rows[value] = row
+        # Keyboard operability: Tab to focus, Up/Down to change selection.
+        self.bind("<Up>", lambda e: self._move(-1))
+        self.bind("<Down>", lambda e: self._move(+1))
+        self.bind("<FocusIn>", lambda e: self.configure(
+            highlightthickness=2, highlightbackground=COLORS["accent"]))
+        self.bind("<FocusOut>", lambda e: self.configure(highlightthickness=0))
         self._refresh()
         try:
             self._trace = self.var.trace_add("write", lambda *a: self._refresh())
@@ -366,6 +489,14 @@ class SegmentedControl(tk.Frame):
         self.var.set(value)
         if self.command:
             self.command()
+
+    def _move(self, step):
+        try:
+            i = self._values.index(self.var.get())
+        except ValueError:
+            i = 0
+        self._select(self._values[max(0, min(len(self._values) - 1, i + step))])
+        return "break"
 
     def _refresh(self):
         try:
@@ -410,6 +541,8 @@ class DeviceRow(ttk.Frame):
                                   font=(FONT, 10, "bold"), cursor="hand2",
                                   command=self._toggle_mute)
         self.mute_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        Tooltip(self.mute_btn, "Silences this device in the recording - "
+                               "its meter drops to zero while muted.")
         self.remove_btn = ttk.Button(self, text="Remove", width=8,
                                      command=lambda: on_remove(self))
         self.remove_btn.grid(row=0, column=3, sticky="e")
@@ -417,7 +550,7 @@ class DeviceRow(ttk.Frame):
         # Row 1: gain fader + percent + meter. Range 0..800% so a quiet mic can
         # actually be boosted. Mousewheel nudges it for easy fine control.
         self.GAIN_MAX = 800
-        ttk.Label(self, text="Volume", style="Panel.TLabel").grid(
+        ttk.Label(self, text="Volume", style="Card.TLabel").grid(
             row=1, column=0, sticky="w", pady=(10, 0))
         self.gain_var = tk.DoubleVar(value=float(gain) * 100.0)
         self.scale = ttk.Scale(self, from_=0, to=self.GAIN_MAX, variable=self.gain_var,
@@ -425,8 +558,10 @@ class DeviceRow(ttk.Frame):
                                style="Horizontal.TScale")
         self.scale.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
         self.scale.bind("<MouseWheel>", self._on_wheel)
+        Tooltip(self.scale, "Drag or scroll to boost a quiet mic - "
+                            "100% is normal, up to 800% for very quiet ones.")
         self.pct_lbl = ttk.Label(self, text=f"{int(float(gain) * 100)}%",
-                                 style="Panel.TLabel", width=6)
+                                 style="Card.TLabel", width=6)
         self.pct_lbl.grid(row=1, column=2, sticky="w", pady=(10, 0))
         self.meter = LevelMeter(self)
         self.meter.grid(row=1, column=3, sticky="e", pady=(10, 0))
