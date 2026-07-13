@@ -445,6 +445,7 @@ class ScreenRecorder:
         log.info("Hybrid remux: %s", " ".join(cmd))
         try:
             res = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace",
                                  creationflags=CREATE_NO_WINDOW,
                                  startupinfo=_startupinfo(), timeout=120)
             if res.returncode == 0 and os.path.isfile(self.final_path):

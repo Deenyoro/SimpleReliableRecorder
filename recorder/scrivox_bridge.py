@@ -315,6 +315,7 @@ def transcribe_entry(exe, entry, want_vision, fmt="txt", ext="txt",
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE, text=True,
+                                    encoding="utf-8", errors="replace",
                                     cwd=os.path.dirname(exe),
                                     creationflags=CREATE_NO_WINDOW,
                                     startupinfo=_startupinfo())

@@ -78,19 +78,25 @@ class SafeWavWriter:
     def _open_segment(self, path):
         self._f = open(path, "wb")
         self._data_bytes = 0
-        self.paths.append(path)
+        if not self.paths or self.paths[-1] != path:
+            self.paths.append(path)
         self._write_header()
         self._f.flush()
         if self._segment > 1:
             log.info("WAV rollover: started segment %d -> %s", self._segment, path)
 
     def _roll_over(self):
-        # Finalize the current segment, then open the next one.
+        # Finalize the current segment, then open the next one. If the open
+        # fails (transient AV/disk lock right at the 4 GiB mark), _f must not
+        # remain the CLOSED old handle - that would wedge the writer forever
+        # (every write would re-enter rollover and die on the closed file).
+        # Leave _f None instead; write() retries the open on the next block.
         self._refresh_locked()
         try:
             self._f.close()
         except Exception:
             pass
+        self._f = None
         self._segment += 1
         self._open_segment(self._segment_path(self._segment))
 
@@ -125,6 +131,9 @@ class SafeWavWriter:
         with self._lock:
             if self._closed:
                 return
+            # Recover from a failed rollover open (see _roll_over).
+            if self._f is None:
+                self._open_segment(self._segment_path(self._segment))
             # Roll to a new segment before crossing the 4 GiB boundary.
             if self._data_bytes + len(raw) > self._roll_at:
                 self._roll_over()
@@ -148,6 +157,8 @@ class SafeWavWriter:
 
     def _refresh_locked(self):
         # Update the size headers and force everything to physical disk.
+        if self._f is None or self._f.closed:
+            return
         self._write_header()
         self._f.seek(0, os.SEEK_END)
         self._f.flush()
