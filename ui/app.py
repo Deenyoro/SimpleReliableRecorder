@@ -434,6 +434,7 @@ class App(tk.Tk):
         self.ptt_hotkey_var = tk.StringVar(value=cfg.get("ptt_hotkey"))
         self.ptt_target_var = tk.StringVar(value=cfg.get("ptt_target"))
         self.ptt_mode_var = tk.StringVar(value=cfg.get("ptt_mode"))
+        self.scrivox_path_var = tk.StringVar(value=cfg.get("scrivox_path"))
         for v in (self.live_levels_var, self.output_mode, self.subtype,
                   self.screen_enabled, self.monitor_var, self.encoder_var,
                   self.container_var, self.codec_var, self.fps_var,
@@ -442,7 +443,8 @@ class App(tk.Tk):
                   self.watchdog_var, self.sound_var, self.banner_var,
                   self.taskbar_var, self.msgbox_var, self.tray_var,
                   self.ptt_enabled_var, self.ptt_hotkey_var,
-                  self.ptt_target_var, self.ptt_mode_var):
+                  self.ptt_target_var, self.ptt_mode_var,
+                  self.scrivox_path_var):
             v.trace_add("write", lambda *a: self._save_settings())
         self.live_levels_var.trace_add("write", lambda *a: self._refresh_monitor())
         # Debounced: rebinding on every keystroke of the hotkey field would
@@ -697,27 +699,68 @@ class App(tk.Tk):
                   style="Muted.TLabel", wraplength=560, justify="left").pack(
             anchor="w", pady=(6, 0))
 
-        # --- Scrivox transcription (hidden when Scrivox is not present) ---
+        # --- Scrivox transcription (always shown, so the path can be set
+        # even when auto-detection finds nothing) ---
         if not self._transcribe_busy:
             self._scrivox_exe = scrivox_bridge.find_scrivox(
                 self.cfg.get("scrivox_path"))
-        if self._scrivox_exe:
-            xsec = self._section(pages["Saving"], "Transcription (Scrivox)")
-            ttk.Label(xsec, text=f"Scrivox detected:  {self._scrivox_exe}",
-                      style="Muted.TLabel", wraplength=560,
-                      justify="left").pack(anchor="w")
-            xrow = ttk.Frame(xsec, style="TFrame")
-            xrow.pack(fill="x", pady=(8, 0))
-            ttk.Button(
-                xrow, text="Open Scrivox",
-                command=lambda: scrivox_bridge.open_scrivox(self._scrivox_exe)
-                ).pack(side="left")
-            ttk.Label(xsec,
-                      text="Transcription options (model, language, speakers, "
-                      "API keys, screen-description detail) are configured "
-                      "inside Scrivox and used automatically here.",
-                      style="Muted.TLabel", wraplength=560,
-                      justify="left").pack(anchor="w", pady=(6, 0))
+        xsec = self._section(pages["Saving"], "Transcription (Scrivox)")
+        scrivox_status = ttk.Label(xsec, style="Muted.TLabel", wraplength=560,
+                                   justify="left")
+        scrivox_status.pack(anchor="w")
+        xpath = ttk.Frame(xsec, style="TFrame")
+        xpath.pack(fill="x", pady=(8, 0))
+        ttk.Label(xpath, text="Scrivox location:").pack(side="left")
+        ttk.Entry(xpath, textvariable=self.scrivox_path_var, width=34).pack(
+            side="left", padx=6, fill="x", expand=True)
+        xrow = ttk.Frame(xsec, style="TFrame")
+        xrow.pack(fill="x", pady=(8, 0))
+        open_btn = ttk.Button(xrow, text="Open Scrivox",
+                              command=lambda: scrivox_bridge.open_scrivox(
+                                  self._scrivox_exe))
+
+        def _scrivox_update_status():
+            if self._scrivox_exe:
+                scrivox_status.config(
+                    text=f"Scrivox detected:  {self._scrivox_exe}")
+                open_btn.config(state="normal")
+            else:
+                scrivox_status.config(
+                    text="Scrivox not found. Point 'Scrivox location' at "
+                         "Scrivox.exe (or its folder), or leave it blank to "
+                         "auto-detect an installed/portable Scrivox.")
+                open_btn.config(state="disabled")
+
+        def _scrivox_redetect():
+            # The traced var already saved the config; force skips the cache
+            # so the new path (or a freshly installed Scrivox) applies now.
+            if not self._transcribe_busy:
+                self._scrivox_exe = scrivox_bridge.find_scrivox(
+                    self.cfg.get("scrivox_path"), force=True)
+            _scrivox_update_status()
+            self._refresh_library()
+
+        def _scrivox_browse():
+            p = filedialog.askopenfilename(
+                parent=win, title="Locate Scrivox.exe",
+                filetypes=[("Scrivox", "Scrivox.exe"),
+                           ("Programs", "*.exe"), ("All files", "*.*")])
+            if p:
+                self.scrivox_path_var.set(p)
+                _scrivox_redetect()
+
+        ttk.Button(xrow, text="Browse", command=_scrivox_browse).pack(
+            side="left")
+        ttk.Button(xrow, text="Check", command=_scrivox_redetect).pack(
+            side="left", padx=6)
+        open_btn.pack(side="left", padx=(6, 0))
+        _scrivox_update_status()
+        ttk.Label(xsec,
+                  text="Transcription options (model, language, speakers, "
+                  "API keys, screen-description detail) are configured "
+                  "inside Scrivox and used automatically here.",
+                  style="Muted.TLabel", wraplength=560,
+                  justify="left").pack(anchor="w", pady=(6, 0))
 
         # --- Resilience ---
         rsec = self._section(pages["Safety & alerts"], "Resilience")
@@ -748,6 +791,13 @@ class App(tk.Tk):
                 except Exception:
                     pass
                 self._reconfigure_hotkeys()
+            # Apply a hand-edited Scrivox path without needing the Check
+            # button: re-detect (skipping the cache) and refresh the library
+            # so the Transcribe button appears/disappears immediately.
+            if not self._transcribe_busy:
+                self._scrivox_exe = scrivox_bridge.find_scrivox(
+                    self.cfg.get("scrivox_path"), force=True)
+            self._refresh_library()
             self.settings_win = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_settings_close)
@@ -1184,8 +1234,9 @@ class App(tk.Tk):
             if not self._scrivox_exe:
                 messagebox.showinfo(
                     "Scrivox not found",
-                    "Scrivox is no longer where it was detected. Put it back "
-                    "next to this app (or reinstall it) and try again.")
+                    "Scrivox is no longer where it was detected. Put it back, "
+                    "reinstall it, or set its location in Settings > Saving > "
+                    "Transcription (Scrivox), then try again.")
                 return
             exe = self._scrivox_exe
         any_video = any(e.get("video") for e in entries)
@@ -1802,6 +1853,7 @@ class App(tk.Tk):
             "ptt_hotkey": self.ptt_hotkey_var.get().strip(),
             "ptt_target": self.ptt_target_var.get(),
             "ptt_mode": self.ptt_mode_var.get(),
+            "scrivox_path": self.scrivox_path_var.get().strip(),
         })
 
     def _fps(self):
@@ -2337,6 +2389,15 @@ class App(tk.Tk):
             self._refresh_monitor()
             self._offer_stop_combine()
 
+        if blocking:
+            a, v = finalize()
+            done(a, v)
+        else:
+            def work():
+                a, v = finalize()
+                self._safe_after(lambda: done(a, v))
+            threading.Thread(target=work, name="finalize", daemon=True).start()
+
     def _offer_stop_combine(self):
         """Honor the 'When screen+audio ends' setting: ask / combine /
         separate. Non-destructive - the separate tracks are always kept."""
@@ -2364,15 +2425,6 @@ class App(tk.Tk):
             os.path.join(out_dir, f"{base}_merged_{stamp}.{ext}"))
         self._run_combine(
             lambda: combine.combine_av(video, audio, out), out)
-
-        if blocking:
-            a, v = finalize()
-            done(a, v)
-        else:
-            def work():
-                a, v = finalize()
-                self._safe_after(lambda: done(a, v))
-            threading.Thread(target=work, name="finalize", daemon=True).start()
 
     def _set_recording_ui(self, on):
         if on:
