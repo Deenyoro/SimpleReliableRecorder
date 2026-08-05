@@ -274,10 +274,100 @@ def _prepare_input(entry, want_vision, tmp_dir):
     return None, "this recording has no usable audio or video files"
 
 
-def transcribe_entry(exe, entry, want_vision, fmt="txt", ext="txt",
-                     on_status=None):
+def default_options():
+    """The transcription options the dialog starts from. None everywhere means
+    'use whatever is saved in the Scrivox GUI' (the --use-config behavior)."""
+    return {
+        "vision": False,          # add on-screen descriptions (video entries)
+        "fmt": "txt", "ext": "txt",
+        "input_mode": "mix",      # "mix": one transcript per recording;
+                                  # "tracks": each audio track separately
+        "merge": False,           # tracks mode: single combined text file
+        "vision_interval": None,  # seconds between screen descriptions
+        "diarize": None,          # None=Scrivox setting, True/False=override
+        "num_speakers": None,     # exact speaker count when diarize is True
+        "model": None,            # whisper model override
+        "language": None,         # language code override
+        "summarize": None,        # None=Scrivox setting, True/False=override
+    }
+
+
+def _option_args(opts):
+    """CLI overrides for the 'More settings' choices. Only explicit choices
+    emit flags; everything left on 'use Scrivox setting' rides on
+    --use-config, so the Scrivox GUI stays the single source of defaults."""
+    args = []
+    if opts.get("model"):
+        args += ["--model", opts["model"]]
+    if opts.get("language"):
+        args += ["--language", opts["language"]]
+    diarize = opts.get("diarize")
+    if diarize is True:
+        args.append("--diarize")
+        if opts.get("num_speakers"):
+            args += ["--num-speakers", str(int(opts["num_speakers"]))]
+    elif diarize is False:
+        args.append("--no-diarize")
+    summarize = opts.get("summarize")
+    if summarize is True:
+        args.append("--summarize")
+    elif summarize is False:
+        args.append("--no-summarize")
+    return args
+
+
+def _vision_args(opts):
+    args = ["--vision"]
+    if opts.get("vision_interval"):
+        args += ["--vision-interval", str(opts["vision_interval"])]
+    return args
+
+
+def _run_scrivox(exe, input_path, out_path, args, status, what):
+    """One blocking Scrivox run. Returns (ok, out_path_or_error_detail)."""
+    cmd = _scrivox_cmd(exe, [input_path] + args + ["-o", out_path])
+    dur = combine._probe_media(input_path).get("duration") or 0
+    timeout = max(_MIN_TIMEOUT, int(10 * dur))
+    status(f"transcribing {what} (this can take a while)...")
+    log.info("scrivox: %s", " ".join(cmd))
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                encoding="utf-8", errors="replace",
+                                cwd=os.path.dirname(exe),
+                                creationflags=CREATE_NO_WINDOW,
+                                startupinfo=_startupinfo())
+    except Exception as e:
+        return False, f"could not run Scrivox: {e}"
+    try:
+        out_s, err_s = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        return False, (f"Scrivox did not finish within {timeout} seconds "
+                       "and was stopped")
+
+    # The output file is the authoritative success signal: a windowed exe's
+    # exit code / stderr can be unreliable across launch environments.
+    if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+        log.info("scrivox OK -> %s", out_path)
+        return True, out_path
+    tail = ((err_s or "") + "\n" + (out_s or "")).strip()[-800:]
+    log.error("scrivox failed (rc=%s):\n%s", proc.returncode, tail)
+    return False, tail or f"Scrivox exited with code {proc.returncode}"
+
+
+def _track_label(name, path):
+    """Short label for one track file: 'keithPTOcall_mic-1.wav' -> 'mic-1'."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    if stem.lower().startswith(name.lower() + "_"):
+        return stem[len(name) + 1:] or stem
+    return stem
+
+
+def transcribe_entry(exe, entry, opts, on_status=None):
     """Transcribe one library entry with Scrivox. Blocking; run off the UI
-    thread. Returns (ok, transcript_path_or_error_detail)."""
+    thread. `opts` is a default_options()-shaped dict.
+    Returns (ok, list_of_transcript_paths) or (False, error_detail)."""
     def status(msg):
         if on_status:
             on_status(msg)
@@ -292,49 +382,81 @@ def transcribe_entry(exe, entry, want_vision, fmt="txt", ext="txt",
         return False, "the recording's folder no longer exists"
 
     name = (entry.get("name") or "recording").strip() or "recording"
-    out_path = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
+    fmt = opts.get("fmt", "txt")
+    ext = opts.get("ext", "txt")
+    audio = [a for a in entry.get("audio", []) if a and os.path.isfile(a)]
+    video = entry.get("video", "")
+    video = video if video and os.path.isfile(video) else ""
+    want_vision = bool(opts.get("vision")) and bool(video)
+    per_track = opts.get("input_mode") == "tracks" and len(audio) > 1
+    merge = per_track and bool(opts.get("merge"))
+
+    # Explicit either way: the user's choice in OUR dialog must beat any
+    # vision preference saved in the Scrivox GUI config.
+    common = ["--use-config", "--format", fmt] + _option_args(opts)
 
     tmp_dir = tempfile.mkdtemp(prefix="srr_scrivox_")
     try:
-        status("preparing audio...")
-        input_path, err = _prepare_input(entry, want_vision, tmp_dir)
-        if err:
-            return False, err
+        if not per_track:
+            status("preparing audio...")
+            input_path, err = _prepare_input(entry, want_vision, tmp_dir)
+            if err:
+                return False, err
+            out_path = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
+            args = common + (_vision_args(opts) if want_vision
+                             else ["--no-vision"])
+            ok, detail = _run_scrivox(exe, input_path, out_path, args,
+                                      status, "audio")
+            return (True, [detail]) if ok else (False, detail)
 
-        args = [input_path, "--use-config", "--format", fmt, "-o", out_path]
-        # Explicit either way: the user's choice in OUR dialog must beat any
-        # vision preference saved in the Scrivox GUI config.
-        args.append("--vision" if want_vision else "--no-vision")
-        cmd = _scrivox_cmd(exe, args)
+        # Per-track: one Scrivox run per audio file; with vision also one
+        # run over the screen recording (muxed with the mixed audio so the
+        # descriptions line up with real speech on the timeline).
+        jobs = []  # (label, input_path, is_vision_run)
+        if want_vision:
+            status("preparing video...")
+            if audio:
+                muxed = os.path.join(tmp_dir, "srr_vision_input.mkv")
+                ok, detail = combine.combine_av(video, audio, muxed,
+                                                audio_mode="mix")
+                if not ok:
+                    return False, f"could not prepare video+audio input: {detail}"
+                jobs.append(("screen", muxed, True))
+            else:
+                jobs.append(("screen", video, True))
+        for a in audio:
+            jobs.append((_track_label(name, a), a, False))
 
-        dur = combine._probe_media(input_path).get("duration") or 0
-        timeout = max(_MIN_TIMEOUT, int(10 * dur))
+        outputs = []  # (label, path)
+        for i, (label, inp, is_vision) in enumerate(jobs):
+            if merge:
+                part_out = os.path.join(tmp_dir, f"part_{i}.{ext}")
+            else:
+                part_out = _unique(os.path.join(
+                    out_dir, f"{name}_{label}_transcript.{ext}"))
+            args = common + (_vision_args(opts) if is_vision
+                             else ["--no-vision"])
+            ok, detail = _run_scrivox(exe, inp, part_out, args, status,
+                                      f"{label} ({i + 1}/{len(jobs)})")
+            if not ok:
+                return False, f"{label}: {detail}"
+            outputs.append((label, part_out))
 
-        status("transcribing (this can take a while)...")
-        log.info("scrivox: %s", " ".join(cmd))
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True,
-                                    encoding="utf-8", errors="replace",
-                                    cwd=os.path.dirname(exe),
-                                    creationflags=CREATE_NO_WINDOW,
-                                    startupinfo=_startupinfo())
-        except Exception as e:
-            return False, f"could not run Scrivox: {e}"
-        try:
-            out_s, err_s = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            return False, (f"Scrivox did not finish within {timeout} seconds "
-                           "and was stopped")
+        if not merge:
+            return True, [p for _, p in outputs]
 
-        # The output file is the authoritative success signal: a windowed exe's
-        # exit code / stderr can be unreliable across launch environments.
-        if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
-            log.info("scrivox OK -> %s", out_path)
-            return True, out_path
-        tail = ((err_s or "") + "\n" + (out_s or "")).strip()[-800:]
-        log.error("scrivox failed (rc=%s):\n%s", proc.returncode, tail)
-        return False, tail or f"Scrivox exited with code {proc.returncode}"
+        final = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
+        with open(final, "w", encoding="utf-8") as out:
+            for i, (label, p) in enumerate(outputs):
+                header = ("Screen + descriptions" if label == "screen"
+                          else f"Track: {label}")
+                if fmt == "md":
+                    out.write(("\n\n" if i else "") + f"## {header}\n\n")
+                else:
+                    out.write(("\n\n" if i else "")
+                              + "======== " + header + " ========\n\n")
+                with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                    out.write(fh.read().strip() + "\n")
+        return True, [final]
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
