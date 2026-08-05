@@ -224,7 +224,18 @@ class Tooltip:
 
 
 class ScrollFrame(ttk.Frame):
-    """A vertically scrollable container. Put content into `.body`."""
+    """A vertically scrollable container. Put content into `.body`.
+
+    Wheel events are routed globally to the ScrollFrame under the pointer
+    instead of per-instance <Enter>/<Leave> bind_all juggling: with NESTED
+    ScrollFrames (the recordings list inside the scrollable right column) the
+    old scheme unbound the outer frame's wheel the moment the pointer left the
+    inner one, leaving the column wheel-dead until re-entered. The router also
+    respects widgets with native wheel scrolling (Text, Listbox): scrolling
+    the live log must not drag the whole column along.
+    """
+
+    _router_installed_for = set()  # toplevel ids with the wheel router bound
 
     def __init__(self, parent):
         super().__init__(parent, style="TFrame")
@@ -239,30 +250,42 @@ class ScrollFrame(ttk.Frame):
                        lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfig(self._win, width=e.width))
-        self.canvas.bind("<Enter>",
-                         lambda e: self.canvas.bind_all("<MouseWheel>", self._wheel))
-        self.canvas.bind("<Leave>",
-                         lambda e: self.canvas.unbind_all("<MouseWheel>"))
-        # If the window is closed with the cursor inside the canvas, <Leave>
-        # never fires and the global wheel binding would point at a dead canvas.
-        self.bind("<Destroy>", self._on_destroy)
+        top = self.winfo_toplevel()
+        if id(top) not in ScrollFrame._router_installed_for:
+            ScrollFrame._router_installed_for.add(id(top))
+            # bind (not bind_all): per-toplevel, so it dies with the window and
+            # never outlives its widgets. "all" bindtag processing means every
+            # widget in this window funnels unhandled wheel events here.
+            top.bind_class(str(top), "<MouseWheel>", ScrollFrame._route_wheel)
+            top.bind("<Destroy>", lambda e, t=top: (
+                ScrollFrame._router_installed_for.discard(id(t))
+                if e.widget is t else None), add="+")
+            top.bind("<MouseWheel>", ScrollFrame._route_wheel)
 
-    def _on_destroy(self, event):
-        # <Destroy> fires once per descendant; only act on our own.
-        if event.widget is not self:
-            return
+    @staticmethod
+    def _route_wheel(event):
+        """Scroll the innermost scrollABLE ScrollFrame under the pointer.
+
+        Walking up from the pointer widget: a Text/Listbox handles its own
+        wheel (class binding already ran), so stop there; a ScrollFrame whose
+        content fits is skipped so the wheel falls through to an outer one.
+        """
         try:
-            self.canvas.unbind_all("<MouseWheel>")
+            w = event.widget.winfo_containing(event.x_root, event.y_root)
         except Exception:
-            pass
-
-    def _wheel(self, e):
-        try:
-            if not self.canvas.winfo_exists():
-                return
-            self.canvas.yview_scroll(int(-e.delta / 120), "units")
-        except tk.TclError:
-            pass
+            return
+        while w is not None:
+            if isinstance(w, (tk.Text, tk.Listbox)):
+                return  # native scrolling area - leave the event to it
+            if isinstance(w, ScrollFrame):
+                try:
+                    lo, hi = w.canvas.yview()
+                    if hi - lo < 1.0:  # content taller than the viewport
+                        w.canvas.yview_scroll(int(-event.delta / 120), "units")
+                        return "break"
+                except tk.TclError:
+                    return
+            w = getattr(w, "master", None)
 
 
 class StatusLight(tk.Frame):
