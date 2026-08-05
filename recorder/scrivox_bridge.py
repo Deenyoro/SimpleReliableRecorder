@@ -28,12 +28,14 @@ ffmpeg; the result is SAVED next to the recording as a normal combine export
 find_precombined. Originals are never touched.
 """
 
+import collections
 import glob
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 from . import combine, paths
@@ -398,38 +400,72 @@ def _vision_args(opts):
     return args
 
 
-def _run_scrivox(exe, input_path, out_path, args):
+def _run_scrivox(exe, input_path, out_path, args, live=None):
     """One blocking Scrivox run. Returns (ok, out_path_or_error_detail).
-    Progress narration is the caller's job (_Steps) - this only logs the
-    exact command line for the Live log / debugging."""
+
+    Scrivox's console output is streamed while it runs instead of collected
+    at the end: `live` (throttled to ~1/s) receives the newest line for the
+    status label, a heartbeat with elapsed time and the latest line lands in
+    the Live log every 30s, and the last lines feed the error report on
+    failure - so a long run never looks frozen again."""
     cmd = _scrivox_cmd(exe, [input_path] + args + ["-o", out_path])
     dur = combine._probe_media(input_path).get("duration") or 0
     timeout = max(_MIN_TIMEOUT, int(10 * dur))
     log.info("scrivox: %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True,
+                                stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace",
                                 cwd=os.path.dirname(exe),
                                 creationflags=CREATE_NO_WINDOW,
                                 startupinfo=_startupinfo())
     except Exception as e:
         return False, f"could not run Scrivox: {e}"
-    try:
-        out_s, err_s = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
-        return False, (f"Scrivox did not finish within {timeout} seconds "
-                       "and was stopped")
+
+    tail = collections.deque(maxlen=60)
+    last = {"line": "", "sent": 0.0}
+
+    def _pump():
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+                tail.append(line)
+                last["line"] = line
+                now = time.monotonic()
+                if live and now - last["sent"] >= 1.0:
+                    last["sent"] = now
+                    live(line)
+        except Exception:
+            pass
+
+    reader = threading.Thread(target=_pump, name="scrivox-out", daemon=True)
+    reader.start()
+    start = time.monotonic()
+    last_beat = start
+    while proc.poll() is None:
+        time.sleep(0.5)
+        now = time.monotonic()
+        if now - start > timeout:
+            _kill_tree(proc)
+            return False, (f"Scrivox did not finish within {timeout} seconds "
+                           "and was stopped")
+        if now - last_beat >= 30.0:
+            last_beat = now
+            mins, secs = divmod(int(now - start), 60)
+            log.info("scrivox working (%dm%02ds elapsed): %s", mins, secs,
+                     (last["line"] or "no output yet")[:200])
+    reader.join(timeout=5)
 
     # The output file is the authoritative success signal: a windowed exe's
     # exit code / stderr can be unreliable across launch environments.
     if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
         log.info("scrivox OK -> %s", out_path)
         return True, out_path
-    tail = ((err_s or "") + "\n" + (out_s or "")).strip()[-800:]
-    log.error("scrivox failed (rc=%s):\n%s", proc.returncode, tail)
-    return False, tail or f"Scrivox exited with code {proc.returncode}"
+    tail_text = "\n".join(list(tail)[-20:]).strip()[-800:]
+    log.error("scrivox failed (rc=%s):\n%s", proc.returncode, tail_text)
+    return False, tail_text or f"Scrivox exited with code {proc.returncode}"
 
 
 def _track_label(name, path):
@@ -483,6 +519,11 @@ class _Steps:
     def fail(self, detail):
         log.error("Transcribe '%s' - step %d/%d FAILED: %s",
                   self.name, self.i, self.total, str(detail)[:500])
+
+    def live(self, line):
+        """Latest console line from the running tool -> status label."""
+        if self.on_status:
+            self.on_status(f"step {self.i}/{self.total}: {line[:120]}")
 
 
 def transcribe_entry(exe, entry, opts, on_status=None):
@@ -583,7 +624,8 @@ def transcribe_entry(exe, entry, opts, on_status=None):
             args = common + (_vision_args(opts) if want_vision
                              else ["--no-vision"])
             steps.start(plan[-1])
-            ok, detail = _run_scrivox(exe, input_path, out_path, args)
+            ok, detail = _run_scrivox(exe, input_path, out_path, args,
+                                      live=steps.live)
             if not ok:
                 steps.fail(detail)
                 return False, detail
@@ -640,7 +682,8 @@ def transcribe_entry(exe, entry, opts, on_status=None):
             steps.start("transcribe + describe the screen with Scrivox"
                         if is_vision
                         else f"transcribe track '{label}' with Scrivox")
-            ok, detail = _run_scrivox(exe, inp, part_out, args)
+            ok, detail = _run_scrivox(exe, inp, part_out, args,
+                                      live=steps.live)
             if not ok:
                 steps.fail(detail)
                 return False, f"{label}: {detail}"
