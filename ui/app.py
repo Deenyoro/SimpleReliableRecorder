@@ -1543,10 +1543,21 @@ class App(tk.Tk):
         r2.pack(fill="x", pady=(6, 0))
         ttk.Label(r2, text="Describe the screen every").pack(side="left")
         vi_var = tk.StringVar(value="")
-        ttk.Spinbox(r2, from_=1, to=3600, width=6,
-                    textvariable=vi_var).pack(side="left", padx=4)
+        vi_sb = ttk.Spinbox(r2, from_=1, to=3600, width=6,
+                            textvariable=vi_var)
+        vi_sb.pack(side="left", padx=4)
         ttk.Label(r2, text="seconds  (blank = Scrivox setting)",
                   style="Muted.TLabel").pack(side="left", padx=4)
+        if any_video:
+            # Entering an interval IS asking for screen descriptions - flip
+            # the capture mode on so the value can never be silently ignored
+            # (a filled interval with descriptions off burned a real user).
+            def _interval_implies_vision(*_a):
+                if vi_var.get().strip() and mode_var.get() != "vision":
+                    mode_var.set("vision")
+            vi_var.trace_add("write", _interval_implies_vision)
+        else:
+            vi_sb.config(state="disabled")
 
         r3 = ttk.Frame(adv, style="TFrame")
         r3.pack(fill="x", pady=(6, 0))
@@ -1621,7 +1632,10 @@ class App(tk.Tk):
                     parent=win)
                 return
             opts["use_precombined"] = (combo_var.get() == "auto")
-            opts["vision_interval"] = _num(vi_var, float)
+            # The interval only exists for vision; a stale value alongside
+            # vision=False in the log reads like a contradiction.
+            opts["vision_interval"] = (_num(vi_var, float)
+                                       if opts["vision"] else None)
             dia = dia_var.get()
             opts["diarize"] = (True if dia == "On"
                                else False if dia == "Off" else None)
