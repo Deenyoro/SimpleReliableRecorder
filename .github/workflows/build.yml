@@ -1,4 +1,4 @@
-name: build
+﻿name: build
 
 on:
   push:
@@ -111,8 +111,13 @@ jobs:
           stage_tarxz() {
             url="$1"
             echo "Trying ffmpeg (tar.xz): $url"
-            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
-                 --max-time 300 "$url" -o ff.tar.xz || { echo "  download failed"; return 1; }
+            # --retry-max-time caps ALL retries in one budget and the speed
+            # floor aborts a trickling mirror, so a dying server can cost at
+            # most ~6 minutes instead of retry*timeout (25+ min observed).
+            curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
+                 --max-time 300 --retry-max-time 360 \
+                 --speed-limit 200000 --speed-time 30 \
+                 "$url" -o ff.tar.xz || { echo "  download failed"; return 1; }
             rm -rf ffx && mkdir ffx
             tar xf ff.tar.xz -C ffx || { echo "  extract failed"; return 1; }
             bin="$(find ffx -name ffmpeg -type f | head -n1)"
@@ -133,8 +138,10 @@ jobs:
           stage_rawbin() {
             url="$1"
             echo "Trying ffmpeg (raw binary): $url"
-            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
-                 --max-time 300 "$url" -o ffmpeg/ffmpeg || { echo "  download failed"; return 1; }
+            curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
+                 --max-time 300 --retry-max-time 360 \
+                 --speed-limit 200000 --speed-time 30 \
+                 "$url" -o ffmpeg/ffmpeg || { echo "  download failed"; return 1; }
             chmod +x ffmpeg/ffmpeg
             if ! ldd ffmpeg/ffmpeg 2>&1 | grep -q "not a dynamic executable"; then
               if ! file ffmpeg/ffmpeg | grep -qi "static"; then
@@ -145,21 +152,23 @@ jobs:
             return 0
           }
 
-          # Four candidates per arch: BtbN briefly ships dynamically linked
-          # linux builds at times (gate rejects them) and johnvansickle has
-          # outages, so no two sources shared by one failure mode are ever
-          # relied on alone.
+          # Four candidates per arch, GITHUB-HOSTED SOURCES FIRST: BtbN
+          # sometimes ships dynamically linked linux builds (the gate rejects
+          # them fast) and johnvansickle degrades into an alive-but-crawling
+          # server that used to eat the whole retry budget before the healthy
+          # mirror ever got a turn - so it is consulted last, behind the
+          # speed-floor that aborts trickling transfers.
           if [ "${{ matrix.arch }}" = "arm64" ]; then
             stage_tarxz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linuxarm64-gpl.tar.xz" \
-              || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" \
               || stage_rawbin "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-arm64" \
+              || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-arm64-static.tar.xz" \
               || stage_tarxz "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-arm64-static.tar.xz" \
               || { echo "ERROR: no static ffmpeg source succeeded for linux-arm64." >&2; \
                    echo "Refusing to ship a dynamically linked fallback; failing the build." >&2; exit 1; }
           else
             stage_tarxz "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-linux64-gpl.tar.xz" \
-              || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
               || stage_rawbin "https://github.com/eugeneware/ffmpeg-static/releases/latest/download/ffmpeg-linux-x64" \
+              || stage_tarxz "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz" \
               || stage_tarxz "https://johnvansickle.com/ffmpeg/builds/ffmpeg-git-amd64-static.tar.xz" \
               || { echo "ERROR: no static ffmpeg source succeeded for linux-x64." >&2; \
                    echo "Refusing to ship a dynamically linked fallback; failing the build." >&2; exit 1; }
@@ -182,8 +191,10 @@ jobs:
           try_source() {
             url="$1"; expected="$2"
             echo "Trying ffmpeg source: $url (need $expected)"
-            curl -fL --retry 4 --retry-all-errors --connect-timeout 20 \
-                 --max-time 300 "$url" -o ff.zip || { echo "  download failed"; return 1; }
+            curl -fL --retry 2 --retry-all-errors --connect-timeout 20 \
+                 --max-time 300 --retry-max-time 360 \
+                 --speed-limit 200000 --speed-time 30 \
+                 "$url" -o ff.zip || { echo "  download failed"; return 1; }
             if ! file ff.zip | grep -qi 'zip'; then
               echo "  not a zip archive"; return 1
             fi
@@ -337,3 +348,4 @@ jobs:
         with:
           files: dist_all/**/*
           generate_release_notes: true
+
