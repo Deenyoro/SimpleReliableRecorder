@@ -733,18 +733,30 @@ class App(tk.Tk):
         open_btn = ttk.Button(xrow, text="Open Scrivox",
                               command=lambda: scrivox_bridge.open_scrivox(
                                   self._scrivox_exe))
+        scrivox_info = ttk.Label(
+            xsec,
+            text="Transcription options (model, language, speakers, "
+            "API keys, screen-description detail) are configured "
+            "inside Scrivox and used automatically here.",
+            style="Muted.TLabel", wraplength=560, justify="left")
 
         def _scrivox_update_status():
+            # Until Scrivox is actually found, the ONLY Scrivox UI anywhere
+            # is this location setting - no dead buttons, no explainer text.
             if self._scrivox_exe:
                 scrivox_status.config(
                     text=f"Scrivox detected:  {self._scrivox_exe}")
-                open_btn.config(state="normal")
+                if not open_btn.winfo_manager():
+                    open_btn.pack(side="left", padx=(6, 0))
+                if not scrivox_info.winfo_manager():
+                    scrivox_info.pack(anchor="w", pady=(6, 0))
             else:
                 scrivox_status.config(
                     text="Scrivox not found. Point 'Scrivox location' at "
                          "Scrivox.exe (or its folder), or leave it blank to "
                          "auto-detect an installed/portable Scrivox.")
-                open_btn.config(state="disabled")
+                open_btn.pack_forget()
+                scrivox_info.pack_forget()
 
         def _scrivox_redetect():
             # The traced var already saved the config; force skips the cache
@@ -768,14 +780,7 @@ class App(tk.Tk):
             side="left")
         ttk.Button(xrow, text="Check", command=_scrivox_redetect).pack(
             side="left", padx=6)
-        open_btn.pack(side="left", padx=(6, 0))
         _scrivox_update_status()
-        ttk.Label(xsec,
-                  text="Transcription options (model, language, speakers, "
-                  "API keys, screen-description detail) are configured "
-                  "inside Scrivox and used automatically here.",
-                  style="Muted.TLabel", wraplength=560,
-                  justify="left").pack(anchor="w", pady=(6, 0))
 
         # --- Resilience ---
         rsec = self._section(pages["Safety & alerts"], "Resilience")
