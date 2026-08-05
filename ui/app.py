@@ -1281,8 +1281,10 @@ class App(tk.Tk):
         # last one.
         self._transcribe_cancel = threading.Event()
         try:
-            self.busy_bar.stop()
-            self.busy_bar.config(mode="determinate", maximum=n, value=0)
+            # Marquee, not determinate: a determinate bar counting FILES sat
+            # at zero for the whole of a single-recording run and looked
+            # frozen. Motion means alive; the status label carries file i/n
+            # and the live Scrivox output.
             self.busy_cancel.config(text="Stop after current file",
                                     state="normal",
                                     command=self._transcribe_cancel.set)
@@ -1297,8 +1299,6 @@ class App(tk.Tk):
                 if self._transcribe_cancel.is_set():
                     results.append((name, False, "Skipped - you pressed Stop."))
                     continue
-                self._safe_after(
-                    lambda i=i: self.busy_bar.config(value=i))
                 def status(msg, i=i, name=name):
                     self._safe_after(lambda: self._transcribe_status(
                         f"Transcribing {i + 1}/{n} ({name}): {msg}"))
