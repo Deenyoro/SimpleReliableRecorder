@@ -477,8 +477,12 @@ class App(tk.Tk):
         left_scroll = ScrollFrame(body)
         left_scroll.pack(side="left", fill="both", expand=True, padx=(0, 10))
         left = left_scroll.body
-        right = ttk.Frame(body, style="TFrame")
-        right.pack(side="left", fill="both", expand=True)
+        # The right column scrolls too: on a small window the Live log and the
+        # library buttons used to be pushed below the bottom edge with no way
+        # to reach them.
+        right_scroll = ScrollFrame(body)
+        right_scroll.pack(side="left", fill="both", expand=True)
+        right = right_scroll.body
 
         self._build_devices(left)
         self._build_screen(left)
@@ -508,15 +512,19 @@ class App(tk.Tk):
                    command=self._add_default_mic).pack(side="left", padx=6)
         ttk.Button(btns, text="+ System playback",
                    command=self._add_system_playback).pack(side="left")
-        dev_refresh = ttk.Button(btns, text="Refresh",
+        # Own row: sharing the row above clipped this pair off the right edge
+        # whenever the window was narrow.
+        btns2 = ttk.Frame(inner, style="TFrame")
+        btns2.pack(fill="x", pady=(6, 0))
+        meters_toggle = ToggleSwitch(btns2, self.live_levels_var,
+                                     text="Live meters")
+        meters_toggle.pack(side="left")
+        Tooltip(meters_toggle, "Show each device's live level even while not "
+                               "recording, so you can check a mic works.")
+        dev_refresh = ttk.Button(btns2, text="Refresh",
                                  command=self._refresh_devices)
         dev_refresh.pack(side="right")
         Tooltip(dev_refresh, "Re-scan for plugged-in/unplugged devices.")
-        meters_toggle = ToggleSwitch(btns, self.live_levels_var,
-                                     text="Live meters")
-        meters_toggle.pack(side="right", padx=8)
-        Tooltip(meters_toggle, "Show each device's live level even while not "
-                               "recording, so you can check a mic works.")
         ttk.Label(inner, text="Balance each device with the faders; meters are live.",
                   style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
 
@@ -566,10 +574,17 @@ class App(tk.Tk):
         win.configure(bg=COLORS["bg"])
         # Wide enough that the longest single row (FPS / Quality / Crash-safety)
         # and the resilience toggle labels are fully visible without horizontal
-        # scrolling. The minimum is enforced so the user cannot shrink it below
-        # readable width.
-        win.geometry("760x780")
-        win.minsize(720, 560)
+        # scrolling, but clamped to the screen so the window (and its Close
+        # button) can never open partly off a small display.
+        try:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            mon_h = sh if sh < 2000 else sh // 2  # stacked-monitor clamp
+            w, h = min(760, sw - 40), min(780, mon_h - 80)
+        except Exception:
+            w, h = 760, 780
+        win.geometry(f"{w}x{h}")
+        win.minsize(min(720, w), min(560, h))
         try:
             ip = paths.icon_path()
             if ip:
@@ -1240,16 +1255,16 @@ class App(tk.Tk):
                 return
             exe = self._scrivox_exe
         any_video = any(e.get("video") for e in entries)
-        choice = self._transcribe_dialog(len(entries), any_video)
-        if not choice:
+        multi_track = any(
+            len([a for a in e.get("audio", []) if a]) > 1 for e in entries)
+        opts = self._transcribe_dialog(len(entries), any_video, multi_track)
+        if not opts:
             return
-        want_vision, fmt, ext = choice
 
         self._transcribe_busy = True
         n = len(entries)
         self._transcribe_status(f"Transcribing 1/{n} with Scrivox...")
-        log.info("Transcription started: %d recording(s), vision=%s, fmt=%s",
-                 n, want_vision, fmt)
+        log.info("Transcription started: %d recording(s), opts=%s", n, opts)
         # Determinate progress (the total is known) + a safe between-files
         # stop: no processes are killed, the current file simply becomes the
         # last one.
@@ -1281,8 +1296,7 @@ class App(tk.Tk):
                 # stuck True and block every later transcription.
                 try:
                     ok, detail = scrivox_bridge.transcribe_entry(
-                        exe, e, want_vision and bool(e.get("video")), fmt, ext,
-                        on_status=status)
+                        exe, e, opts, on_status=status)
                 except Exception as ex:
                     ok, detail = False, str(ex)
                 results.append((name, ok, detail))
@@ -1314,25 +1328,30 @@ class App(tk.Tk):
     def _transcribe_done(self, results):
         self._transcribe_busy = False
         self._restore_status()
+        # Success detail is a LIST of transcript paths (per-track mode can
+        # produce several per recording); failure detail is an error string.
         done = [(n, d) for n, ok, d in results if ok]
         failed = [(n, d) for n, ok, d in results if not ok]
-        for n, p in done:
+        paths = [p for _, ps in done for p in ps]
+        for p in paths:
             log.info("Transcript saved: %s", p)
         for n, d in failed:
             log.error("Transcription failed for '%s': %s", n, str(d)[:800])
         if done and not failed:
-            lines = "\n".join(p for _, p in done)
+            shown = paths if len(paths) <= 12 else (
+                paths[:12] + [f"... and {len(paths) - 12} more"])
             if messagebox.askyesno(
                     "Transcription complete",
-                    f"Saved {len(done)} transcript"
-                    + ("" if len(done) == 1 else "s") + f":\n{lines}"
+                    f"Saved {len(paths)} transcript"
+                    + ("" if len(paths) == 1 else "s") + ":\n"
+                    + "\n".join(shown)
                     + "\n\nShow the first one in its folder?"):
-                self._reveal_path(done[0][1])
+                self._reveal_path(paths[0])
         elif done:
             messagebox.showwarning(
                 "Transcription partly done",
-                f"Saved {len(done)} transcript(s), but "
-                f"{len(failed)} failed:\n\n"
+                f"Saved {len(paths)} transcript(s), but "
+                f"{len(failed)} recording(s) failed:\n\n"
                 + "\n".join(f"{n}: {str(d)[:200]}" for n, d in failed))
         else:
             messagebox.showerror(
@@ -1381,9 +1400,11 @@ class App(tk.Tk):
             pass
         (focus or win).focus_set()
 
-    def _transcribe_dialog(self, n_entries, any_video):
+    _SCRIVOX_USE_SETTING = "Use Scrivox setting"
+
+    def _transcribe_dialog(self, n_entries, any_video, multi_track):
         """Modal dialog for transcription options.
-        Returns (want_vision, fmt, ext) or None if cancelled."""
+        Returns a scrivox_bridge.default_options()-shaped dict, or None."""
         win = self._modal_dialog("Transcribe with Scrivox")
         result = {"value": None}
         frm = ttk.Frame(win, style="TFrame")
@@ -1408,10 +1429,98 @@ class App(tk.Tk):
                      values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
                      ).pack(side="left", padx=6)
 
-        ttk.Label(frm, style="Muted.TLabel", justify="left", wraplength=420,
-                  text="Each transcript is saved next to its recording. The "
-                  "model, language, speaker options and API keys are whatever "
-                  "you set in Scrivox - use the button below to change them."
+        # ---- multi-track handling (shown only when it applies) ----
+        input_var = tk.StringVar(value="mix")
+        output_var = tk.StringVar(value="separate")
+        if multi_track:
+            ttk.Label(frm, text="Recordings with several audio tracks:").pack(
+                anchor="w", pady=(12, 0))
+            SegmentedControl(frm, input_var, [
+                ("mix", "Mix the tracks first - one transcript per recording"),
+                ("tracks", "Transcribe each track separately (per mic/playback)"),
+            ]).pack(fill="x", pady=(4, 0))
+            out_row = ttk.Frame(frm, style="TFrame")
+            ttk.Label(out_row, text="Per-track results:").pack(
+                anchor="w", pady=(8, 0))
+            SegmentedControl(out_row, output_var, [
+                ("separate", "A transcript file per track"),
+                ("merged", "One combined file: screen descriptions + every "
+                           "track's transcript"),
+            ]).pack(fill="x", pady=(4, 0))
+
+            def _toggle_outrow(*_a):
+                if input_var.get() == "tracks":
+                    out_row.pack(fill="x")
+                else:
+                    out_row.pack_forget()
+                win.geometry("")  # re-fit the dialog to its content
+            input_var.trace_add("write", _toggle_outrow)
+
+        # ---- More settings (collapsed by default) ----
+        more_btn = ttk.Button(frm, text="More settings  ▸")
+        more_btn.pack(anchor="w", pady=(12, 0))
+        adv = ttk.Frame(frm, style="TFrame")
+        USE = self._SCRIVOX_USE_SETTING
+
+        r1 = ttk.Frame(adv, style="TFrame")
+        r1.pack(fill="x", pady=(8, 0))
+        ttk.Label(r1, text="Identify speakers:").pack(side="left")
+        dia_var = tk.StringVar(value=USE)
+        ttk.Combobox(r1, textvariable=dia_var, state="readonly", width=18,
+                     values=[USE, "On", "Off"]).pack(side="left", padx=6)
+        ttk.Label(r1, text="How many:").pack(side="left", padx=(10, 0))
+        spk_var = tk.StringVar(value="")
+        ttk.Spinbox(r1, from_=1, to=20, width=4,
+                    textvariable=spk_var).pack(side="left", padx=4)
+        ttk.Label(r1, text="blank = auto", style="Muted.TLabel").pack(
+            side="left", padx=4)
+
+        r2 = ttk.Frame(adv, style="TFrame")
+        r2.pack(fill="x", pady=(6, 0))
+        ttk.Label(r2, text="Describe the screen every").pack(side="left")
+        vi_var = tk.StringVar(value="")
+        ttk.Spinbox(r2, from_=1, to=3600, width=6,
+                    textvariable=vi_var).pack(side="left", padx=4)
+        ttk.Label(r2, text="seconds  (blank = Scrivox setting)",
+                  style="Muted.TLabel").pack(side="left", padx=4)
+
+        r3 = ttk.Frame(adv, style="TFrame")
+        r3.pack(fill="x", pady=(6, 0))
+        ttk.Label(r3, text="Model:").pack(side="left")
+        model_var = tk.StringVar(value=USE)
+        ttk.Combobox(r3, textvariable=model_var, state="readonly", width=18,
+                     values=[USE, "large-v3", "large-v3-turbo", "medium",
+                             "small", "base", "tiny"]).pack(side="left", padx=6)
+        ttk.Label(r3, text="Language:").pack(side="left", padx=(10, 0))
+        lang_var = tk.StringVar(value="")
+        ttk.Entry(r3, textvariable=lang_var, width=6).pack(side="left", padx=4)
+        ttk.Label(r3, text="e.g. en, ko - blank = auto",
+                  style="Muted.TLabel").pack(side="left", padx=4)
+
+        r4 = ttk.Frame(adv, style="TFrame")
+        r4.pack(fill="x", pady=(6, 0))
+        ttk.Label(r4, text="Meeting summary:").pack(side="left")
+        sum_var = tk.StringVar(value=USE)
+        ttk.Combobox(r4, textvariable=sum_var, state="readonly", width=18,
+                     values=[USE, "On", "Off"]).pack(side="left", padx=6)
+
+        adv_open = {"on": False}
+
+        def _toggle_adv():
+            adv_open["on"] = not adv_open["on"]
+            if adv_open["on"]:
+                more_btn.config(text="More settings  ▾")
+                adv.pack(fill="x", after=more_btn)
+            else:
+                more_btn.config(text="More settings  ▸")
+                adv.pack_forget()
+            win.geometry("")
+        more_btn.config(command=_toggle_adv)
+
+        ttk.Label(frm, style="Muted.TLabel", justify="left", wraplength=460,
+                  text="Each transcript is saved next to its recording. "
+                  "Anything left on 'Use Scrivox setting' (and the API keys) "
+                  "comes from Scrivox - use the button below to change those."
                   ).pack(anchor="w", pady=(10, 8))
 
         btns = ttk.Frame(frm, style="TFrame")
@@ -1425,9 +1534,41 @@ class App(tk.Tk):
         ttk.Button(btns, text="Open Scrivox settings",
                    command=open_settings).pack(side="left")
 
+        def _num(var, cast):
+            s = var.get().strip()
+            try:
+                return cast(s) if s else None
+            except ValueError:
+                return None
+
         def ok():
             fmt, ext = scrivox_bridge.TRANSCRIBE_FORMATS[fmt_var.get()]
-            result["value"] = (mode_var.get() == "vision", fmt, ext)
+            opts = scrivox_bridge.default_options()
+            opts["vision"] = (mode_var.get() == "vision")
+            opts["fmt"], opts["ext"] = fmt, ext
+            opts["input_mode"] = input_var.get()
+            opts["merge"] = (output_var.get() == "merged")
+            if (opts["input_mode"] == "tracks" and opts["merge"]
+                    and fmt not in ("txt", "md")):
+                messagebox.showwarning(
+                    "Combined file needs a text format",
+                    "One combined file only works for Plain text or Markdown. "
+                    "Pick one of those formats, or keep a file per track.",
+                    parent=win)
+                return
+            opts["vision_interval"] = _num(vi_var, float)
+            dia = dia_var.get()
+            opts["diarize"] = (True if dia == "On"
+                               else False if dia == "Off" else None)
+            if opts["diarize"]:
+                opts["num_speakers"] = _num(spk_var, int)
+            m = model_var.get()
+            opts["model"] = None if m == USE else m
+            opts["language"] = lang_var.get().strip() or None
+            s = sum_var.get()
+            opts["summarize"] = (True if s == "On"
+                                 else False if s == "Off" else None)
+            result["value"] = opts
             win.destroy()
 
         go_btn = ttk.Button(btns, text="Transcribe", style="Accent.TButton",
