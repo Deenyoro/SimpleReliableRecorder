@@ -22,8 +22,10 @@ Transcription runs Scrivox's headless CLI with --use-config, so the model,
 language, diarization, API keys etc. are whatever the user configured in the
 Scrivox GUI - SRR only decides the input, the output path/format, and whether
 to add on-screen descriptions (--vision). Multi-track recordings are first
-mixed to a temp stereo WAV (or muxed with the video for vision) with the
-bundled ffmpeg; originals are never touched.
+mixed to a stereo WAV (or muxed with the video for vision) with the bundled
+ffmpeg; the result is SAVED next to the recording as a normal combine export
+(same artifact/naming as the Combine buttons) and reused by later runs via
+find_precombined. Originals are never touched.
 """
 
 import glob
@@ -241,12 +243,31 @@ def _unique(path):
     return path
 
 
-def _prepare_input(entry, want_vision, tmp_dir):
+def _mux_av_export(entry, out_dir, name):
+    """Mux the entry's video + mixed audio into a KEPT export next to the
+    recording - the same artifact 'Make one video with sound' produces, named
+    the same way, so the work is never thrown away and later transcriptions
+    (and the user) reuse it. Returns (path, error)."""
+    audio = [a for a in entry.get("audio", []) if a and os.path.isfile(a)]
+    video = entry.get("video", "")
+    vid_ext = os.path.splitext(video)[1].lstrip(".") or "mkv"
+    stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+    out = _unique(os.path.join(out_dir, f"{name}_merged_{stamp}.{vid_ext}"))
+    ok, detail = combine.combine_av(video, audio, out, audio_mode="mix")
+    if not ok:
+        return None, f"could not prepare video+audio input: {detail}"
+    log.info("Saved AV export (kept): %s", out)
+    return out, None
+
+
+def _prepare_input(entry, want_vision, out_dir, name, status):
     """Build the single input file Scrivox needs from a library entry.
 
-    Returns (input_path, error). Multi-track audio is mixed to a temp stereo
-    WAV; for vision the mixed audio is muxed with the video into a temp MKV so
-    one file carries both. Single plain files are passed through untouched.
+    Returns (input_path, error). Multi-track audio is mixed, and for vision
+    the mix is muxed with the video - both saved as normal combine exports
+    next to the recording (NOT temp files), exactly as if the user had
+    pressed the corresponding Combine button first. Single plain files are
+    passed through untouched.
     """
     audio = [a for a in entry.get("audio", []) if a and os.path.isfile(a)]
     video = entry.get("video", "")
@@ -255,20 +276,20 @@ def _prepare_input(entry, want_vision, tmp_dir):
     if want_vision and video:
         if not audio:
             return video, None  # backfilled entries may carry AV in one file
-        tmp = os.path.join(tmp_dir, "srr_vision_input.mkv")
-        ok, detail = combine.combine_av(video, audio, tmp, audio_mode="mix")
-        if not ok:
-            return None, f"could not prepare video+audio input: {detail}"
-        return tmp, None
+        status("combining video + audio (saved next to the recording)...")
+        return _mux_av_export(entry, out_dir, name)
 
     if len(audio) == 1:
         return audio[0], None
     if audio:
-        tmp = os.path.join(tmp_dir, "srr_audio_input.wav")
-        ok, detail = combine.mix_audio_to_stereo(audio, tmp)
+        status("mixing the audio tracks (saved next to the recording)...")
+        stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
+        out = _unique(os.path.join(out_dir, f"{name}_mixed_{stamp}.wav"))
+        ok, detail = combine.mix_audio_to_stereo(audio, out)
         if not ok:
             return None, f"could not mix the audio tracks: {detail}"
-        return tmp, None
+        log.info("Saved audio mix export (kept): %s", out)
+        return out, None
     if video:
         return video, None  # audio-less entry: let Scrivox read the video's sound
     return None, "this recording has no usable audio or video files"
@@ -283,6 +304,8 @@ def default_options():
         "input_mode": "mix",      # "mix": one transcript per recording;
                                   # "tracks": each audio track separately
         "merge": False,           # tracks mode: single combined text file
+        "use_precombined": True,  # reuse up-to-date _merged_/_mixed_ exports
+                                  # instead of re-muxing/re-mixing the tracks
         "vision_interval": None,  # seconds between screen descriptions
         "diarize": None,          # None=Scrivox setting, True/False=override
         "num_speakers": None,     # exact speaker count when diarize is True
@@ -290,6 +313,60 @@ def default_options():
         "language": None,         # language code override
         "summarize": None,        # None=Scrivox setting, True/False=override
     }
+
+
+_PRECOMBINED_VIDEO_EXTS = (".mkv", ".mp4", ".mov")
+_PRECOMBINED_AUDIO_EXTS = (".wav", ".flac", ".mp3", ".m4a")
+
+
+def find_precombined(entry):
+    """Combine-exports of this recording that are safe to transcribe directly.
+
+    Returns {"av": path_or_None, "audio": path_or_None}: the newest
+    '<name>_merged_*' video (video+sound in one file) and the newest
+    '<name>_mixed_*' stereo audio in the entry's folder, but only when the
+    export is at least as new as every source track - a stale export from
+    before a track was replaced must not silently win over the real tracks.
+    """
+    found = {"av": None, "audio": None}
+    out_dir = entry.get("out_dir") or ""
+    name = (entry.get("name") or "").strip()
+    if not name or not os.path.isdir(out_dir):
+        return found
+
+    sources = [p for p in list(entry.get("audio") or [])
+               + [entry.get("video") or ""] if p and os.path.isfile(p)]
+    try:
+        newest_src = max(os.path.getmtime(p) for p in sources) if sources else 0
+    except OSError:
+        return found
+
+    def newest(marker, exts):
+        best, best_ts = None, -1.0
+        try:
+            names = os.listdir(out_dir)
+        except OSError:
+            return None
+        for f in names:
+            stem, ext = os.path.splitext(f)
+            if ext.lower() not in exts:
+                continue
+            if not stem.lower().startswith(name.lower() + "_"):
+                continue
+            if marker not in stem.lower():
+                continue
+            full = os.path.join(out_dir, f)
+            try:
+                ts = os.path.getmtime(full)
+            except OSError:
+                continue
+            if ts >= newest_src and ts > best_ts:
+                best, best_ts = full, ts
+        return best
+
+    found["av"] = newest("_merged_", _PRECOMBINED_VIDEO_EXTS)
+    found["audio"] = newest("_mixed_", _PRECOMBINED_AUDIO_EXTS)
+    return found
 
 
 def _option_args(opts):
@@ -395,13 +472,40 @@ def transcribe_entry(exe, entry, opts, on_status=None):
     # vision preference saved in the Scrivox GUI config.
     common = ["--use-config", "--format", fmt] + _option_args(opts)
 
+    # An up-to-date combine-export made earlier IS the requested input - reuse
+    # it instead of re-muxing/re-mixing (faster, and it honors a hand-tweaked
+    # merge, e.g. one remade with different track levels).
+    pre = (find_precombined(entry) if opts.get("use_precombined", True)
+           else {"av": None, "audio": None})
+
     tmp_dir = tempfile.mkdtemp(prefix="srr_scrivox_")
     try:
         if not per_track:
-            status("preparing audio...")
-            input_path, err = _prepare_input(entry, want_vision, tmp_dir)
-            if err:
-                return False, err
+            input_path = None
+            if video and audio:
+                # Audio + a separate screen video always become ONE combined
+                # file - vision or not. The merged export is a deliverable in
+                # its own right (identical to 'Make one video with sound'),
+                # so transcribing IS also the combine step.
+                if pre["av"]:
+                    status("using your combined video...")
+                    log.info("Using pre-combined AV export: %s", pre["av"])
+                    input_path = pre["av"]
+                else:
+                    status("combining video + audio "
+                           "(saved next to the recording)...")
+                    input_path, err = _mux_av_export(entry, out_dir, name)
+                    if err:
+                        return False, err
+            elif len(audio) > 1 and pre["audio"]:
+                status("using your mixed audio...")
+                log.info("Using pre-mixed audio export: %s", pre["audio"])
+                input_path = pre["audio"]
+            if input_path is None:
+                input_path, err = _prepare_input(entry, want_vision, out_dir,
+                                                 name, status)
+                if err:
+                    return False, err
             out_path = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
             args = common + (_vision_args(opts) if want_vision
                              else ["--no-vision"])
@@ -414,13 +518,15 @@ def transcribe_entry(exe, entry, opts, on_status=None):
         # descriptions line up with real speech on the timeline).
         jobs = []  # (label, input_path, is_vision_run)
         if want_vision:
-            status("preparing video...")
-            if audio:
-                muxed = os.path.join(tmp_dir, "srr_vision_input.mkv")
-                ok, detail = combine.combine_av(video, audio, muxed,
-                                                audio_mode="mix")
-                if not ok:
-                    return False, f"could not prepare video+audio input: {detail}"
+            if pre["av"]:
+                status("using your combined video...")
+                log.info("Using pre-combined AV export: %s", pre["av"])
+                jobs.append(("screen", pre["av"], True))
+            elif audio:
+                status("combining video + audio (saved next to the recording)...")
+                muxed, err = _mux_av_export(entry, out_dir, name)
+                if err:
+                    return False, err
                 jobs.append(("screen", muxed, True))
             else:
                 jobs.append(("screen", video, True))

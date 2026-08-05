@@ -1257,7 +1257,13 @@ class App(tk.Tk):
         any_video = any(e.get("video") for e in entries)
         multi_track = any(
             len([a for a in e.get("audio", []) if a]) > 1 for e in entries)
-        opts = self._transcribe_dialog(len(entries), any_video, multi_track)
+        # Combining can happen for any entry with several tracks, or with a
+        # separate video + audio pair (the vision mux).
+        any_combinable = any(
+            len([a for a in e.get("audio", []) if a]) > 1
+            or (e.get("video") and e.get("audio")) for e in entries)
+        opts = self._transcribe_dialog(len(entries), any_video, multi_track,
+                                       any_combinable)
         if not opts:
             return
 
@@ -1402,7 +1408,8 @@ class App(tk.Tk):
 
     _SCRIVOX_USE_SETTING = "Use Scrivox setting"
 
-    def _transcribe_dialog(self, n_entries, any_video, multi_track):
+    def _transcribe_dialog(self, n_entries, any_video, multi_track,
+                           any_combinable=False):
         """Modal dialog for transcription options.
         Returns a scrivox_bridge.default_options()-shaped dict, or None."""
         win = self._modal_dialog("Transcribe with Scrivox")
@@ -1414,31 +1421,66 @@ class App(tk.Tk):
         ttk.Label(frm, text=f"Transcribe {n_entries} {word}:",
                   style="Header.TLabel").pack(anchor="w")
 
+        # ---- quick presets: pick the deliverable, tune anything after ----
+        fmt_var = tk.StringVar(value="Plain text (.txt)")
+        preset_var = tk.StringVar(value="transcript")
+        preset_opts = [("transcript", "Transcript"),
+                       ("notes", "Meeting notes + transcript")]
+        if any_video:
+            preset_opts.insert(1, ("subtitles", "Subtitles for the video (.srt)"))
+
+        def _apply_preset(*_a):
+            p = preset_var.get()
+            if p == "subtitles":
+                fmt_var.set("Subtitles (.srt)")
+            elif p == "notes":
+                sum_var.set("On")
+                if fmt_var.get().startswith("Subtitles"):
+                    fmt_var.set("Plain text (.txt)")
+            else:
+                sum_var.set(self._SCRIVOX_USE_SETTING)
+        preset_var.trace_add("write", _apply_preset)
+        SegmentedControl(frm, preset_var, preset_opts).pack(
+            fill="x", pady=(6, 10))
+
         mode_var = tk.StringVar(value="audio")
         options = [("audio", "Transcribe the audio")]
         if any_video:
             options.append(("vision",
                             "Transcribe the audio + describe what's on screen"))
-        SegmentedControl(frm, mode_var, options).pack(fill="x", pady=(6, 10))
+        SegmentedControl(frm, mode_var, options).pack(fill="x", pady=(0, 4))
 
-        fr = ttk.Frame(frm, style="TFrame")
-        fr.pack(fill="x")
-        ttk.Label(fr, text="Save as:").pack(side="left")
-        fmt_var = tk.StringVar(value="Plain text (.txt)")
-        ttk.Combobox(fr, textvariable=fmt_var, state="readonly", width=22,
-                     values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
-                     ).pack(side="left", padx=6)
-
-        # ---- multi-track handling (shown only when it applies) ----
+        # ---- what Scrivox reads (shown whenever combining can happen) ----
         input_var = tk.StringVar(value="mix")
         output_var = tk.StringVar(value="separate")
-        if multi_track:
-            ttk.Label(frm, text="Recordings with several audio tracks:").pack(
-                anchor="w", pady=(12, 0))
+        combo_var = tk.StringVar(value="auto")
+        if any_combinable:
+            combined_text = ("One combined file per recording - every audio "
+                             "track merged into one, kept next to the "
+                             "recording" if not any_video else
+                             "One combined file per recording - every audio "
+                             "track + the screen video merged into one video "
+                             "file, kept next to the recording")
+            ttk.Label(frm, text="What Scrivox transcribes:").pack(
+                anchor="w", pady=(8, 0))
             SegmentedControl(frm, input_var, [
-                ("mix", "Mix the tracks first - one transcript per recording"),
-                ("tracks", "Transcribe each track separately (per mic/playback)"),
+                ("mix", combined_text),
+                ("tracks", "Each audio track separately (per mic/playback)"),
             ]).pack(fill="x", pady=(4, 0))
+
+            # Reuse policy for the combined file. In per-track mode it only
+            # matters for the screen-description pass, so it hides unless
+            # that pass will actually run.
+            reuse_row = ttk.Frame(frm, style="TFrame")
+            ttk.Label(reuse_row,
+                      text="If a combined file was already made with SRR:"
+                      ).pack(anchor="w", pady=(8, 0))
+            SegmentedControl(reuse_row, combo_var, [
+                ("auto", "Use it - only build one if it's missing or older "
+                         "than the tracks"),
+                ("rebuild", "Build a fresh one now"),
+            ]).pack(fill="x", pady=(4, 0))
+
             out_row = ttk.Frame(frm, style="TFrame")
             ttk.Label(out_row, text="Per-track results:").pack(
                 anchor="w", pady=(8, 0))
@@ -1448,13 +1490,30 @@ class App(tk.Tk):
                            "track's transcript"),
             ]).pack(fill="x", pady=(4, 0))
 
-            def _toggle_outrow(*_a):
-                if input_var.get() == "tracks":
-                    out_row.pack(fill="x")
-                else:
-                    out_row.pack_forget()
+            def _relayout(*_a):
+                per_track = input_var.get() == "tracks"
+                # Repack in a fixed order so the rows never swap positions:
+                # [what Scrivox transcribes] -> reuse -> per-track -> Save as.
+                reuse_row.pack_forget()
+                out_row.pack_forget()
+                if not per_track or mode_var.get() == "vision":
+                    reuse_row.pack(fill="x", before=save_row)
+                if per_track:
+                    out_row.pack(fill="x", before=save_row)
                 win.geometry("")  # re-fit the dialog to its content
-            input_var.trace_add("write", _toggle_outrow)
+            input_var.trace_add("write", _relayout)
+            mode_var.trace_add("write", _relayout)
+
+        # ---- output format (after the input choices - it describes results)
+        save_row = ttk.Frame(frm, style="TFrame")
+        save_row.pack(fill="x", pady=(8, 0))
+        ttk.Label(save_row, text="Save as:").pack(side="left")
+        ttk.Combobox(save_row, textvariable=fmt_var, state="readonly",
+                     width=22,
+                     values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
+                     ).pack(side="left", padx=6)
+        if any_combinable:
+            _relayout()
 
         # ---- More settings (collapsed by default) ----
         more_btn = ttk.Button(frm, text="More settings  ▸")
@@ -1556,6 +1615,7 @@ class App(tk.Tk):
                     "Pick one of those formats, or keep a file per track.",
                     parent=win)
                 return
+            opts["use_precombined"] = (combo_var.get() == "auto")
             opts["vision_interval"] = _num(vi_var, float)
             dia = dia_var.get()
             opts["diarize"] = (True if dia == "On"
