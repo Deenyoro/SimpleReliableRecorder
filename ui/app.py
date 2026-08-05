@@ -3048,8 +3048,11 @@ class App(tk.Tk):
         if self._transcribe_busy:
             if not messagebox.askyesno(
                     "Quit",
-                    "A transcription is still running and will be abandoned "
-                    "if you quit now.\n\nQuit anyway?"):
+                    "A transcription is still running. If you quit now, "
+                    "Scrivox keeps working in the background and the "
+                    "transcript will still be saved next to the recording - "
+                    "but this app won't be around to tell you when it's "
+                    "done.\n\nQuit anyway?"):
                 return
         if self.recording:
             try:

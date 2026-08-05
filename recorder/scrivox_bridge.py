@@ -276,13 +276,11 @@ def _prepare_input(entry, want_vision, out_dir, name, status):
     if want_vision and video:
         if not audio:
             return video, None  # backfilled entries may carry AV in one file
-        status("combining video + audio (saved next to the recording)...")
         return _mux_av_export(entry, out_dir, name)
 
     if len(audio) == 1:
         return audio[0], None
     if audio:
-        status("mixing the audio tracks (saved next to the recording)...")
         stamp = time.strftime("%Y-%m-%d_%H-%M-%S")
         out = _unique(os.path.join(out_dir, f"{name}_mixed_{stamp}.wav"))
         ok, detail = combine.mix_audio_to_stereo(audio, out)
@@ -400,12 +398,13 @@ def _vision_args(opts):
     return args
 
 
-def _run_scrivox(exe, input_path, out_path, args, status, what):
-    """One blocking Scrivox run. Returns (ok, out_path_or_error_detail)."""
+def _run_scrivox(exe, input_path, out_path, args):
+    """One blocking Scrivox run. Returns (ok, out_path_or_error_detail).
+    Progress narration is the caller's job (_Steps) - this only logs the
+    exact command line for the Live log / debugging."""
     cmd = _scrivox_cmd(exe, [input_path] + args + ["-o", out_path])
     dur = combine._probe_media(input_path).get("duration") or 0
     timeout = max(_MIN_TIMEOUT, int(10 * dur))
-    status(f"transcribing {what} (this can take a while)...")
     log.info("scrivox: %s", " ".join(cmd))
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -439,6 +438,51 @@ def _track_label(name, path):
     if stem.lower().startswith(name.lower() + "_"):
         return stem[len(name) + 1:] or stem
     return stem
+
+
+def _mb(path):
+    try:
+        return f"{os.path.getsize(path) / 1e6:.1f} MB"
+    except OSError:
+        return "size unknown"
+
+
+class _Steps:
+    """Narrates a transcription's plan and progress into the Live log.
+
+    Announces every planned step up front, then logs each one as it starts
+    and finishes (with the produced file + size), so the user can always see
+    what the app is doing and what is already done. The same step text also
+    drives the status label via on_status.
+    """
+
+    def __init__(self, name, on_status):
+        self.name = name
+        self.on_status = on_status
+        self.total = 0
+        self.i = 0
+
+    def plan(self, labels):
+        self.total = len(labels)
+        log.info("Transcribe '%s' - %d step(s) planned:", self.name, self.total)
+        for n, label in enumerate(labels, 1):
+            log.info("  step %d/%d: %s", n, self.total, label)
+
+    def start(self, label):
+        self.i += 1
+        log.info("Transcribe '%s' - step %d/%d STARTING: %s",
+                 self.name, self.i, self.total, label)
+        if self.on_status:
+            self.on_status(f"step {self.i}/{self.total}: {label}")
+
+    def done(self, detail=""):
+        log.info("Transcribe '%s' - step %d/%d DONE%s",
+                 self.name, self.i, self.total,
+                 f" -> {detail}" if detail else "")
+
+    def fail(self, detail):
+        log.error("Transcribe '%s' - step %d/%d FAILED: %s",
+                  self.name, self.i, self.total, str(detail)[:500])
 
 
 def transcribe_entry(exe, entry, opts, on_status=None):
@@ -478,56 +522,107 @@ def transcribe_entry(exe, entry, opts, on_status=None):
     pre = (find_precombined(entry) if opts.get("use_precombined", True)
            else {"av": None, "audio": None})
 
+    steps = _Steps(name, on_status)
     tmp_dir = tempfile.mkdtemp(prefix="srr_scrivox_")
     try:
         if not per_track:
-            input_path = None
-            if video and audio:
-                # Audio + a separate screen video always become ONE combined
-                # file - vision or not. The merged export is a deliverable in
-                # its own right (identical to 'Make one video with sound'),
-                # so transcribing IS also the combine step.
-                if pre["av"]:
-                    status("using your combined video...")
-                    log.info("Using pre-combined AV export: %s", pre["av"])
-                    input_path = pre["av"]
-                else:
-                    status("combining video + audio "
-                           "(saved next to the recording)...")
-                    input_path, err = _mux_av_export(entry, out_dir, name)
-                    if err:
-                        return False, err
-            elif len(audio) > 1 and pre["audio"]:
-                status("using your mixed audio...")
-                log.info("Using pre-mixed audio export: %s", pre["audio"])
+            # Audio + a separate screen video always become ONE combined
+            # file - vision or not. The merged export is a deliverable in
+            # its own right (identical to 'Make one video with sound'),
+            # so transcribing IS also the combine step.
+            combine_av_now = bool(video and audio) and not pre["av"]
+            reuse_av = bool(video and audio) and bool(pre["av"])
+            mix_now = (not video and len(audio) > 1) and not pre["audio"]
+            reuse_mix = (not video and len(audio) > 1) and bool(pre["audio"])
+
+            plan = []
+            if reuse_av:
+                plan.append("use the combined video you already made")
+            elif combine_av_now:
+                plan.append("combine the video + all audio tracks into one "
+                            "file (kept next to the recording)")
+            elif reuse_mix:
+                plan.append("use the mixed audio you already made")
+            elif mix_now:
+                plan.append("mix all audio tracks into one file (kept next "
+                            "to the recording)")
+            plan.append("transcribe with Scrivox"
+                        + (" + describe the screen" if want_vision else ""))
+            steps.plan(plan)
+
+            input_path, err = None, None
+            if reuse_av:
+                steps.start(plan[0])
+                input_path = pre["av"]
+                steps.done(f"{os.path.basename(input_path)} "
+                           f"({_mb(input_path)}, already on disk)")
+            elif combine_av_now:
+                steps.start(plan[0])
+                input_path, err = _mux_av_export(entry, out_dir, name)
+            elif reuse_mix:
+                steps.start(plan[0])
                 input_path = pre["audio"]
-            if input_path is None:
+                steps.done(f"{os.path.basename(input_path)} "
+                           f"({_mb(input_path)}, already on disk)")
+            elif mix_now:
+                steps.start(plan[0])
                 input_path, err = _prepare_input(entry, want_vision, out_dir,
                                                  name, status)
-                if err:
-                    return False, err
+            else:
+                # Pass-through: a single audio file, or a lone video.
+                input_path, err = _prepare_input(entry, want_vision, out_dir,
+                                                 name, status)
+            if err:
+                steps.fail(err)
+                return False, err
+            if combine_av_now or mix_now:
+                steps.done(f"{os.path.basename(input_path)} "
+                           f"({_mb(input_path)})")
+
             out_path = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
             args = common + (_vision_args(opts) if want_vision
                              else ["--no-vision"])
-            ok, detail = _run_scrivox(exe, input_path, out_path, args,
-                                      status, "audio")
-            return (True, [detail]) if ok else (False, detail)
+            steps.start(plan[-1])
+            ok, detail = _run_scrivox(exe, input_path, out_path, args)
+            if not ok:
+                steps.fail(detail)
+                return False, detail
+            steps.done(f"{os.path.basename(detail)} ({_mb(detail)})")
+            return True, [detail]
 
         # Per-track: one Scrivox run per audio file; with vision also one
         # run over the screen recording (muxed with the mixed audio so the
         # descriptions line up with real speech on the timeline).
+        need_mux = want_vision and audio and not pre["av"]
+        plan = []
+        if want_vision:
+            if pre["av"]:
+                plan.append("use the combined video you already made")
+            elif audio:
+                plan.append("combine the video + all audio tracks into one "
+                            "file (kept next to the recording)")
+            plan.append("transcribe + describe the screen with Scrivox")
+        plan += [f"transcribe track '{_track_label(name, a)}' with Scrivox"
+                 for a in audio]
+        if merge:
+            plan.append("merge everything into one transcript file")
+        steps.plan(plan)
+
         jobs = []  # (label, input_path, is_vision_run)
         if want_vision:
             if pre["av"]:
-                status("using your combined video...")
-                log.info("Using pre-combined AV export: %s", pre["av"])
+                steps.start(plan[0])
                 jobs.append(("screen", pre["av"], True))
-            elif audio:
-                status("combining video + audio (saved next to the recording)...")
+                steps.done(f"{os.path.basename(pre['av'])} "
+                           f"({_mb(pre['av'])}, already on disk)")
+            elif need_mux:
+                steps.start(plan[0])
                 muxed, err = _mux_av_export(entry, out_dir, name)
                 if err:
+                    steps.fail(err)
                     return False, err
                 jobs.append(("screen", muxed, True))
+                steps.done(f"{os.path.basename(muxed)} ({_mb(muxed)})")
             else:
                 jobs.append(("screen", video, True))
         for a in audio:
@@ -542,15 +637,20 @@ def transcribe_entry(exe, entry, opts, on_status=None):
                     out_dir, f"{name}_{label}_transcript.{ext}"))
             args = common + (_vision_args(opts) if is_vision
                              else ["--no-vision"])
-            ok, detail = _run_scrivox(exe, inp, part_out, args, status,
-                                      f"{label} ({i + 1}/{len(jobs)})")
+            steps.start("transcribe + describe the screen with Scrivox"
+                        if is_vision
+                        else f"transcribe track '{label}' with Scrivox")
+            ok, detail = _run_scrivox(exe, inp, part_out, args)
             if not ok:
+                steps.fail(detail)
                 return False, f"{label}: {detail}"
+            steps.done(f"{os.path.basename(part_out)} ({_mb(part_out)})")
             outputs.append((label, part_out))
 
         if not merge:
             return True, [p for _, p in outputs]
 
+        steps.start("merge everything into one transcript file")
         final = _unique(os.path.join(out_dir, f"{name}_transcript.{ext}"))
         with open(final, "w", encoding="utf-8") as out:
             for i, (label, p) in enumerate(outputs):
@@ -563,6 +663,7 @@ def transcribe_entry(exe, entry, opts, on_status=None):
                               + "======== " + header + " ========\n\n")
                 with open(p, "r", encoding="utf-8", errors="replace") as fh:
                     out.write(fh.read().strip() + "\n")
+        steps.done(f"{os.path.basename(final)} ({_mb(final)})")
         return True, [final]
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
