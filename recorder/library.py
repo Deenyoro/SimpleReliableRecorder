@@ -17,7 +17,6 @@ Each entry is a dict:
     }
 """
 
-import glob
 import os
 
 from .logging_setup import get_logger
@@ -125,18 +124,25 @@ def _is_export_file(filename):
 def scan_folder(root, existing_dirs=None):
     """Discover recording sessions already on disk under `root`.
 
-    Looks for SRR_* session subfolders (the layout the app creates) that contain
-    audio and/or video, and returns library entries for any not already present
-    (by out_dir). Combined/merged exports are skipped as inputs. This is what
-    back-fills recordings made before the library existed.
+    ANY immediate subfolder holding audio and/or video files counts as a
+    session - requiring the SRR_* naming here (as this used to) silently hid
+    every session the user had renamed to a friendly name. Combined/merged
+    exports are skipped as inputs, and folders already in the library (by
+    out_dir, compared case-insensitively so a capitalization rename never
+    duplicates an entry) are left alone. This is what back-fills recordings
+    made before the library existed.
     """
     found = []
-    existing_dirs = set(existing_dirs or [])
+    known = {os.path.normcase(os.path.abspath(d))
+             for d in (existing_dirs or []) if d}
     try:
         if not root or not os.path.isdir(root):
             return found
-        for sub in sorted(glob.glob(os.path.join(root, "SRR_*"))):
-            if not os.path.isdir(sub) or sub in existing_dirs:
+        for name in sorted(os.listdir(root)):
+            sub = os.path.join(root, name)
+            if not os.path.isdir(sub):
+                continue
+            if os.path.normcase(os.path.abspath(sub)) in known:
                 continue
             audio, videos = [], []
             for f in sorted(os.listdir(sub)):
@@ -154,7 +160,6 @@ def scan_folder(root, existing_dirs=None):
             video = _pick_video(videos)
             if not audio and not video:
                 continue
-            name = os.path.basename(sub)
             try:
                 created = _mtime_str(sub)
             except Exception:
