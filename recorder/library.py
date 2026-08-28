@@ -18,6 +18,7 @@ Each entry is a dict:
 """
 
 import os
+import re
 
 from .logging_setup import get_logger
 
@@ -34,13 +35,17 @@ def _exists(p):
         return False
 
 
-def make_entry(entry_id, name, out_dir, audio, video, created):
+def make_entry(entry_id, name, out_dir, audio, video, created,
+               video_segments=None):
+    segs = order_video_segments([v for v in (video_segments or []) if v]
+                                or ([video] if video else []))
     return {
         "id": str(entry_id),
         "name": name,
         "out_dir": out_dir,
         "audio": [a for a in (audio or []) if a],
-        "video": video or "",
+        "video": segs[0] if segs else (video or ""),
+        "video_segments": segs,
         "created": created,
     }
 
@@ -157,8 +162,8 @@ def scan_folder(root, existing_dirs=None):
                     audio.append(full)
                 elif low.endswith(_VIDEO_EXTS):
                     videos.append(full)
-            video = _pick_video(videos)
-            if not audio and not video:
+            segs = order_video_segments(videos)
+            if not audio and not segs:
                 continue
             try:
                 created = _mtime_str(sub)
@@ -166,10 +171,39 @@ def scan_folder(root, existing_dirs=None):
                 created = ""
             found.append(make_entry(
                 entry_id="scan-" + name, name=name, out_dir=sub,
-                audio=audio, video=video, created=created))
+                audio=audio, video=(segs[0] if segs else ""),
+                video_segments=segs, created=created))
     except Exception as e:
         log.warning("Recordings scan failed for %s: %s", root, e)
     return found
+
+
+
+_SEG_TS_RE = re.compile(r"screen-restart-(\d{6})", re.IGNORECASE)
+
+
+def order_video_segments(videos):
+    """Chronological order of a take's screen segments.
+
+    The original capture (``name_screen.ext`` - no ``restart`` token) comes
+    first, then each ``name_screen-restart-HHMMSS.ext`` in time order (by the
+    stamp when present, else file mtime). Anything else falls in last by name.
+    A screen auto-restart is the only thing that produces more than one, so a
+    normal take yields a single-element list.
+    """
+    def key(p):
+        base = os.path.basename(p)
+        low = base.lower()
+        if "restart" not in low:
+            return (0, 0.0, low)
+        m = _SEG_TS_RE.search(base)
+        if m:
+            return (1, float(m.group(1)), low)
+        try:
+            return (1, os.path.getmtime(p), low)
+        except OSError:
+            return (2, 0.0, low)
+    return sorted([v for v in videos if v], key=key)
 
 
 def _pick_video(videos):

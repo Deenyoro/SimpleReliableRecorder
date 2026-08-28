@@ -673,6 +673,7 @@ class GoldBanner(tk.Frame):
         self._flash_on = False
         self._flashing = False
         self._flash_after = None
+        self._auto_hide = None
 
         self.label = tk.Label(self, text="", bg=COLORS["gold"], fg="#1a1a1a",
                               font=(FONT, 13, "bold"), anchor="w", justify="left")
@@ -707,12 +708,46 @@ class GoldBanner(tk.Frame):
 
     def show(self, message):
         self._cancel_flash()
-        self.label.config(text="   RECORDING PROBLEM:   " + message)
+        self._cancel_auto_hide()
+        # Restore the alarm look (a prior "recovered" note may have turned it
+        # green and hidden the restart button).
+        self.config(bg=COLORS["gold"])
+        self.label.config(bg=COLORS["gold"], fg="#1a1a1a",
+                          text="   RECORDING PROBLEM:   " + message)
+        self.restart_btn.pack_forget()
+        self.ack_btn.pack_forget()
+        self.restart_btn.pack(side="right", padx=(6, 18), pady=12)
+        self.ack_btn.pack(side="right", pady=12)
         if not self.winfo_manager():
             self.pack(side="bottom", fill="x")
         if not self._flashing:
             self._flashing = True
         self._flash()
+
+    def show_recovered(self, message):
+        """Non-alarming green note: the app already fixed the problem itself
+        and is still recording. Auto-hides; no "Restart recording" button
+        (there is nothing to restart - it already did)."""
+        self._cancel_flash()
+        self._cancel_auto_hide()
+        self._flashing = False
+        self.config(bg=COLORS["green"])
+        self.label.config(bg=COLORS["green"], fg="#0b0b0b",
+                          text="   RECORDING RECOVERED:   " + message)
+        self.restart_btn.pack_forget()
+        self.ack_btn.pack_forget()
+        self.ack_btn.pack(side="right", padx=(6, 18), pady=12)
+        if not self.winfo_manager():
+            self.pack(side="bottom", fill="x")
+        self._auto_hide = self.after(10000, self.stop)
+
+    def _cancel_auto_hide(self):
+        if self._auto_hide is not None:
+            aid, self._auto_hide = self._auto_hide, None
+            try:
+                self.after_cancel(aid)
+            except Exception:
+                pass
 
     def _cancel_flash(self):
         if self._flash_after is not None:
@@ -734,6 +769,7 @@ class GoldBanner(tk.Frame):
     def stop(self):
         self._flashing = False
         self._cancel_flash()
+        self._cancel_auto_hide()
         try:
             self.pack_forget()
         except Exception:
