@@ -277,6 +277,30 @@ def combine_av(video_path, audio_paths, out_path, audio_mode="mix"):
                 out_path=out_path)
 
 
+def combine_take(video_paths, audio_paths, out_path, audio_mode="mix"):
+    """Mux a WHOLE take - which may be SEVERAL video segments - with its audio.
+
+    A mid-recording screen auto-restart splits the screen capture into more
+    than one file (name_screen.mkv, name_screen-restart-HHMMSS.mkv, ...) while
+    the audio keeps running continuously. The old combine used only the single
+    tracked video plus the full audio, so one segment was dropped and the
+    sound drifted. This joins the segments end to end (in the given order) into
+    one continuous picture and muxes the mixed audio, aligned to the joined
+    length.
+
+    `video_paths` must already be in chronological order. A single segment
+    takes the fast stream-copy path (combine_av, no re-encode); several
+    segments go through concat_sessions, which re-encodes onto one canvas.
+    """
+    video_paths = [v for v in video_paths if v and os.path.isfile(v)]
+    if not video_paths:
+        return False, "no video inputs"
+    if len(video_paths) == 1:
+        return combine_av(video_paths[0], audio_paths, out_path, audio_mode)
+    return concat_sessions(
+        [{"videos": video_paths, "audio": audio_paths}],
+        out_path, include_video=True)
+
 def merge_audio_to_channels(audio_paths, out_path):
     """Merge N (mono) WAVs into one N-channel WAV. Great for Audacity editing.
 
@@ -475,19 +499,29 @@ def concat_sessions(sessions, out_path, include_video=False):
     times / codecs), so this is a one-off convenience export; the originals
     are never touched.
     """
+    def _svids(sess):
+        vs = sess.get("videos")
+        if vs:
+            return [v for v in vs if v and os.path.isfile(v)]
+        v = sess.get("video", "")
+        return [v] if v and os.path.isfile(v) else []
+
     sessions = [s for s in sessions if s and
                 ([a for a in s.get("audio", []) if a and os.path.isfile(a)]
-                 or (include_video and os.path.isfile(s.get("video", ""))))]
+                 or (include_video and _svids(s)))]
     if not sessions:
         return False, "no usable sessions selected"
 
-    do_video = include_video and all(os.path.isfile(s.get("video", ""))
-                                     for s in sessions)
+    # Every session must have >=1 video for a video concat; a session may have
+    # SEVERAL (screen auto-restart split one take's capture into segments).
+    do_video = include_video and all(_svids(s) for s in sessions)
 
     # Probe everything up front: durations bound silence, drive the A/V
     # alignment and the run timeout; resolutions/fps pick the common canvas.
     seg_audio_files = []   # per session: list of part-groups (file paths)
-    seg_video_info = []    # per session: probe dict or None
+    seg_video_files = []   # per session: ordered list of segment paths
+    seg_video_infos = []   # per session: list of probe dicts (parallel)
+    seg_video_dur = []     # per session: summed video duration (or 0.0)
     total_dur = 0.0
     for s in sessions:
         files = [a for a in s.get("audio", []) if a and os.path.isfile(a)]
@@ -497,34 +531,40 @@ def concat_sessions(sessions, out_path, include_video=False):
             d = _probe_media(a)["duration"]
             if d:
                 total_dur += d
-        v = s.get("video", "")
-        need_v_info = do_video or (not files and os.path.isfile(v))
+        vids = _svids(s)
+        need_v_info = do_video or (not files and vids)
+        infos, vdur = [], 0.0
         if need_v_info:
-            info = _probe_media(v)
-            if not info["duration"]:
-                return False, f"could not read video duration: {v}"
-            seg_video_info.append(info)
-            total_dur += info["duration"]
-        else:
-            seg_video_info.append(None)
+            for v in vids:
+                info = _probe_media(v)
+                if not info["duration"]:
+                    return False, f"could not read video duration: {v}"
+                infos.append(info)
+                vdur += info["duration"]
+                total_dur += info["duration"]
+        seg_video_files.append(vids)
+        seg_video_infos.append(infos)
+        seg_video_dur.append(vdur)
 
     if do_video:
-        widths = [i["width"] for i in seg_video_info if i and i["width"]]
-        heights = [i["height"] for i in seg_video_info if i and i["height"]]
-        if not widths or not heights:
+        allw = [i["width"] for infos in seg_video_infos for i in infos
+                if i["width"]]
+        allh = [i["height"] for infos in seg_video_infos for i in infos
+                if i["height"]]
+        if not allw or not allh:
             return False, "could not read video resolution from the sessions"
         # Common canvas: the largest of each dimension, forced even (yuv420p).
-        tw = (max(widths) // 2) * 2
-        th = (max(heights) // 2) * 2
-        fps = max([i["fps"] for i in seg_video_info if i and i["fps"]] or [0])
-        if not fps:
-            fps = 30
+        tw = (max(allw) // 2) * 2
+        th = (max(allh) // 2) * 2
+        allfps = [i["fps"] for infos in seg_video_infos for i in infos
+                  if i["fps"]]
+        fps = max(allfps) if allfps else 30
 
     ff = ffmpeg_tools.ffmpeg_exe()
     cmd = [ff, "-hide_banner", "-y"]
     idx = 0
     seg_audio_groups = []  # per session: list of groups of input indexes
-    seg_video_idx = []     # video input index per session (or None)
+    seg_video_idxs = []    # per session: list of video input indexes
     for si, s in enumerate(sessions):
         g_idx = []
         for g in seg_audio_files[si]:
@@ -534,29 +574,30 @@ def concat_sessions(sessions, out_path, include_video=False):
                 gi.append(idx); idx += 1
             g_idx.append(gi)
         seg_audio_groups.append(g_idx)
+        vidx = []
         if do_video:
-            cmd += ["-i", s["video"]]
-            seg_video_idx.append(idx); idx += 1
-        else:
-            seg_video_idx.append(None)
+            for v in seg_video_files[si]:
+                cmd += ["-i", v]
+                vidx.append(idx); idx += 1
+        seg_video_idxs.append(vidx)
 
     filt = []
     seg_audio_labels = []
     for si, g_idx in enumerate(seg_audio_groups):
         lbl = f"sa{si}"
-        vinfo = seg_video_info[si]
-        # Keep each segment's audio exactly as long as its video so the A/V
-        # offsets do not accumulate across the concatenated sessions.
-        align = (f",apad,atrim=duration={vinfo['duration']:.3f}"
-                 if do_video and vinfo and vinfo["duration"] else "")
+        vdur = seg_video_dur[si]
+        # Keep each session's audio exactly as long as its (joined) video so
+        # A/V offsets do not accumulate across the concatenated sessions.
+        align = (f",apad,atrim=duration={vdur:.3f}"
+                 if do_video and vdur else "")
         if not g_idx:
             # No audio in this session: synthesize silence bounded by the
             # video's duration (unbounded anullsrc would never end).
-            if not (vinfo and vinfo["duration"]):
+            if not vdur:
                 return False, ("session has no audio and its video duration "
                                "is unknown; cannot synthesize silence")
             filt.append(f"anullsrc=channel_layout=stereo:sample_rate=48000,"
-                        f"atrim=duration={vinfo['duration']:.3f},"
+                        f"atrim=duration={vdur:.3f},"
                         f"aformat=sample_rates=48000:channel_layouts=stereo"
                         f"[{lbl}]")
             seg_audio_labels.append(lbl)
@@ -573,19 +614,28 @@ def concat_sessions(sessions, out_path, include_video=False):
 
     timeout = max(_MIN_TIMEOUT, int(4 * total_dur))
     if do_video:
-        # Concatenate video+audio pairs together on a common canvas.
+        # Build one video label per session, first joining that session's own
+        # segments (screen-restart split) end to end on the common canvas.
         vlabels = []
         for si in range(len(sessions)):
-            vi = seg_video_idx[si]
+            parts = []
+            for k, vi in enumerate(seg_video_idxs[si]):
+                plbl = f"sv{si}_{k}"
+                # setpts first: real captures can start at a non-zero
+                # timestamp, and concat needs each part rebased to 0.
+                filt.append(
+                    f"[{vi}:v]setpts=PTS-STARTPTS,"
+                    f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
+                    f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g},"
+                    f"format=yuv420p[{plbl}]")
+                parts.append(plbl)
             vlbl = f"sv{si}"
-            # setpts first: real recordings (fragmented/restarted captures)
-            # can start at a non-zero timestamp, and concat needs every
-            # segment rebased to 0 or the output stalls after the first one.
-            filt.append(
-                f"[{vi}:v]setpts=PTS-STARTPTS,"
-                f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-                f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g},"
-                f"format=yuv420p[{vlbl}]")
+            if len(parts) == 1:
+                # rename via a passthrough so the outer concat sees [svN]
+                filt.append(f"[{parts[0]}]null[{vlbl}]")
+            else:
+                filt.append("".join(f"[{p}]" for p in parts)
+                            + f"concat=n={len(parts)}:v=1:a=0[{vlbl}]")
             vlabels.append(vlbl)
         pairs = "".join(f"[{vlabels[i]}][{seg_audio_labels[i]}]"
                         for i in range(len(sessions)))

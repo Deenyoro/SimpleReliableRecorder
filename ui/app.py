@@ -1006,26 +1006,23 @@ class App(tk.Tk):
     def _add_to_library(self, select_new=False):
         audio = [a for a in (self.last_outputs.get("audio") or [])
                  if a and os.path.isfile(a)]
-        # A mid-take screen auto-restart leaves the pre-restart video in
-        # videos_extra; the entry must reference the MAIN segment (usually the
-        # long pre-restart one, per _pick_video), not just the tail fragment.
+        # A mid-take screen auto-restart splits the capture into several
+        # segments; ALL of them belong to this take. make_entry orders them
+        # chronologically and records them as video_segments so combining
+        # joins every segment instead of dropping one.
         vids = [v for v in ([self.last_outputs.get("video") or ""]
                             + (self.last_outputs.get("videos_extra") or []))
                 if v and os.path.isfile(v)]
-        video = library._pick_video(vids) if vids else ""
-        if not audio and not video:
+        if not audio and not vids:
             return
         self._lib_seq += 1
         entry = library.make_entry(
             entry_id=f"rec{self._lib_seq}-{int(self._record_start_mono)}",
             name=getattr(self, "_session_base", "recording"),
             out_dir=self.last_outputs.get("out_dir", ""),
-            audio=audio, video=video,
+            audio=audio, video=(vids[0] if vids else ""),
+            video_segments=vids,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        extras = [v for v in vids if v != video]
-        if extras:
-            # Kept for visibility/future use; prune() preserves unknown keys.
-            entry["videos_extra"] = extras
         self._library.append(entry)
         self.cfg.set("recordings", self._library)
         self._refresh_library()
@@ -1207,7 +1204,13 @@ class App(tk.Tk):
             ext = self.container_var.get()
             out = self._unique_path(
                 os.path.join(out_dir, f"{prefix}_merged_{stamp}.{ext}"))
-            sessions = [{"audio": e.get("audio", []), "video": e.get("video", "")}
+            # Each entry contributes ALL its video segments (a screen
+            # restart can leave several); concat_sessions joins each take's
+            # segments, then concatenates the takes.
+            sessions = [{"audio": e.get("audio", []),
+                         "videos": (e.get("video_segments")
+                                    or ([e.get("video")] if e.get("video")
+                                        else []))}
                         for e in sel]
             self._run_combine(
                 lambda: combine.concat_sessions(sessions, out, True), out)
@@ -2624,10 +2627,13 @@ class App(tk.Tk):
         action = self.on_stop_var.get()
         if action == "separate":
             return
-        video = self.last_outputs.get("video") or ""
+        segments = library.order_video_segments(
+            [v for v in ([self.last_outputs.get("video") or ""]
+                         + (self.last_outputs.get("videos_extra") or []))
+             if v and os.path.isfile(v)])
         audio = [a for a in (self.last_outputs.get("audio") or [])
                  if a and os.path.isfile(a)]
-        if not (video and os.path.isfile(video) and audio):
+        if not (segments and audio):
             return
         if action == "ask":
             if not messagebox.askyesno(
@@ -2637,14 +2643,17 @@ class App(tk.Tk):
                     "change this prompt in Settings > Saving.)"):
                 return
         out_dir = (self.last_outputs.get("out_dir")
-                   or os.path.dirname(video))
+                   or os.path.dirname(segments[0]))
         base = getattr(self, "_session_base", None) or "SRR"
-        ext = os.path.splitext(video)[1].lstrip(".") or "mkv"
+        # Several segments must re-encode into one container; a single segment
+        # keeps its own extension (fast stream-copy in combine_take).
+        ext = ("mkv" if len(segments) > 1
+               else (os.path.splitext(segments[0])[1].lstrip(".") or "mkv"))
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out = self._unique_path(
             os.path.join(out_dir, f"{base}_merged_{stamp}.{ext}"))
         self._run_combine(
-            lambda: combine.combine_av(video, audio, out), out)
+            lambda: combine.combine_take(segments, audio, out), out)
 
     def _set_recording_ui(self, on):
         if on:
@@ -2784,6 +2793,7 @@ class App(tk.Tk):
             self.audio_rec.start()
             self.last_outputs.setdefault("audio", []).extend(self.audio_rec.output_files)
             log.info("Audio subsystem restarted -> %s", self.audio_rec.output_files)
+            self._safe_after(lambda: self._note_recovered("Audio recording"))
         except Exception as e:
             log.exception("Audio restart failed: %s", e)
 
@@ -2829,9 +2839,31 @@ class App(tk.Tk):
             # out-grow the old one's byte count before it registers as alive.
             self._screen_last_size = -1
             self._screen_last_grow = time.monotonic()
+            # Track the new segment so a later combine joins EVERY segment of
+            # this take, not just the pre-restart one.
+            self.last_outputs.setdefault("videos_extra", []).append(vpath)
             log.info("Screen subsystem restarted -> %s", vpath)
+            self._safe_after(lambda: self._note_recovered("Screen recording"))
         except Exception as e:
             log.exception("Screen restart failed: %s", e)
+
+    def _note_recovered(self, what):
+        """The watchdog stopped a stalled subsystem and the app already
+        restarted it on its own. Clear the scary alert and say so, instead of
+        leaving a flashing RECORDING PROBLEM banner (with a Restart button)
+        up for a problem that is already fixed and still recording."""
+        self._dismiss_alert()
+        log.info("%s auto-recovered; recording continues.", what)
+        self._log_queue.put((f"AUTO-RECOVERED: {what} restarted itself; "
+                             "recording continues.", 20))
+        if self.banner_var.get():
+            try:
+                self.banner.show_recovered(
+                    f"{what} stopped and was restarted automatically - "
+                    "still recording. It continues in a new segment; the "
+                    "segments are joined when you combine into one file.")
+            except Exception:
+                pass
 
     def _restart_recording(self):
         self._dismiss_alert()
