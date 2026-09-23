@@ -104,5 +104,30 @@ class OrderAndExportTests(unittest.TestCase):
         self.assertFalse(library._is_export_file("uncombined_take.wav"))
 
 
+class ScanCreatedTests(unittest.TestCase):
+    """The Recorded column must agree with the automatic name, which is
+    the moment the take started - not when its folder was last written."""
+
+    def test_stamped_folder_uses_its_start_time(self):
+        with tempfile.TemporaryDirectory() as root:
+            sub = os.path.join(root, "SRR_2026-09-23_17-44-02")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "SRR_2026-09-23_17-44-02_mic.wav"),
+                      "wb") as fh:
+                fh.write(b"x")
+            found = library.scan_folder(root)
+            self.assertEqual(found[0]["created"], "2026-09-23 17:44:02")
+
+    def test_other_folders_fall_back_to_modified_time(self):
+        with tempfile.TemporaryDirectory() as root:
+            sub = os.path.join(root, "Weekly standup")
+            os.makedirs(sub)
+            with open(os.path.join(sub, "mic.wav"), "wb") as fh:
+                fh.write(b"x")
+            found = library.scan_folder(root)
+            self.assertRegex(found[0]["created"],
+                             r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$")
+
+
 if __name__ == "__main__":
     unittest.main()

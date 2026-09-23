@@ -174,10 +174,12 @@ def scan_folder(root, existing_dirs=None):
             segs = order_video_segments(videos)
             if not audio and not segs:
                 continue
-            try:
-                created = _mtime_str(sub)
-            except Exception:
-                created = ""
+            created = _stamp_str(name)
+            if not created:
+                try:
+                    created = _mtime_str(sub)
+                except Exception:
+                    created = ""
             found.append(make_entry(
                 entry_id="scan-" + name, name=name, out_dir=sub,
                 audio=audio, video=(segs[0] if segs else ""),
@@ -230,6 +232,20 @@ def _pick_video(videos):
         return (1 if "restart" in name else 0, -size)
 
     return sorted(videos, key=key)[0]
+
+
+_STAMP_RE = re.compile(
+    r"^SRR_(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})$")
+
+
+def _stamp_str(folder_name):
+    """'SRR_2026-09-23_17-44-02' -> '2026-09-23 17:44:02' (the moment the
+    take started, as its folder name says), or '' for other folders."""
+    m = _STAMP_RE.match(folder_name or "")
+    if not m:
+        return ""
+    y, mo, d, hh, mi, ss = m.groups()
+    return f"{y}-{mo}-{d} {hh}:{mi}:{ss}"
 
 
 def _mtime_str(path):
