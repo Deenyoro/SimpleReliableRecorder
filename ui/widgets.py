@@ -5,8 +5,12 @@ LevelMeter, DeviceRow, GoldBanner) so ui/app.py is unaffected by visual tweaks.
 """
 
 import math
+import sys
 import tkinter as tk
+from tkinter import font as tkfont
 from tkinter import ttk
+
+from ui import ux
 
 # Modern flat dark palette.
 COLORS = {
@@ -92,7 +96,13 @@ def apply_dark_theme(root):
     style.configure("TLabel", background=c["bg"], foreground=c["fg"],
                     font=(FONT, 11))
     style.configure("Panel.TLabel", background=c["panel"], foreground=c["fg"],
-                    font=(FONT, 11))
+                    font=(FONT, 10))
+    style.configure("PanelMuted.TLabel", background=c["panel"],
+                    foreground=c["muted"], font=(FONT, 9))
+    style.configure("PanelWarn.TLabel", background=c["panel"],
+                    foreground=c["gold"], font=(FONT, 9))
+    style.configure("PanelError.TLabel", background=c["panel"],
+                    foreground=c["red"], font=(FONT, 9))
     style.configure("Muted.TLabel", background=c["bg"], foreground=c["muted"],
                     font=(FONT, 10))
     style.configure("Header.TLabel", background=c["bg"], foreground=c["accent"],
@@ -150,7 +160,7 @@ def apply_dark_theme(root):
 
     # Labels that sit on Card.TFrame rows (device rows, library rows).
     style.configure("Card.TLabel", background=c["panel2"], foreground=c["fg"],
-                    font=(FONT, 11))
+                    font=(FONT, 10))
 
     # Busy bar for background combine/convert/transcribe jobs.
     style.configure("Busy.Horizontal.TProgressbar",
@@ -165,7 +175,147 @@ def apply_dark_theme(root):
     style.map("TNotebook.Tab",
               background=[("selected", c["panel3"])],
               foreground=[("selected", c["fg"])])
+
+    s = ui_scale(root)
+    # Named fonts: native dialogs, menus, entries and the combobox popdown
+    # all follow Segoe UI instead of mixing in Tk's defaults.
+    for name, size in (("TkDefaultFont", 10), ("TkTextFont", 10),
+                       ("TkMenuFont", 10), ("TkHeadingFont", 10),
+                       ("TkCaptionFont", 10), ("TkTooltipFont", 9)):
+        try:
+            tkfont.nametofont(name).configure(family=FONT, size=size)
+        except tk.TclError:
+            pass
+    # The combobox dropdown list is a plain Listbox: without these it pops
+    # up white on the dark window.
+    root.option_add("*TCombobox*Listbox.background", c["panel2"])
+    root.option_add("*TCombobox*Listbox.foreground", c["fg"])
+    root.option_add("*TCombobox*Listbox.selectBackground", c["accent"])
+    root.option_add("*TCombobox*Listbox.selectForeground", "#06120f")
+    root.option_add("*TCombobox*Listbox.font", (FONT, 10))
+    root.option_add("*TCombobox*Listbox.borderWidth", 0)
+    root.option_add("*Menu.font", (FONT, 10))
+
+    # Arrows and scrollbars follow DPI (clam draws them in fixed pixels).
+    arrow = max(12, int(13 * s))
+    style.configure("TCombobox", arrowsize=arrow)
+    style.configure("TSpinbox", arrowsize=arrow)
+    for orient in ("Vertical", "Horizontal"):
+        style.configure(f"{orient}.TScrollbar", arrowsize=arrow,
+                        background=c["panel3"], troughcolor=c["bg"],
+                        bordercolor=c["bg"], arrowcolor=c["muted"],
+                        lightcolor=c["panel3"], darkcolor=c["panel3"],
+                        gripcount=0)
+        style.map(f"{orient}.TScrollbar",
+                  background=[("active", c["accent_dim"])])
+    style.configure("TCombobox", lightcolor=c["panel2"], darkcolor=c["panel2"])
+    style.map("TCombobox",
+              fieldbackground=[("disabled", c["panel"]),
+                               ("readonly", c["panel2"])],
+              foreground=[("disabled", "#6b717c"), ("readonly", c["fg"])],
+              bordercolor=[("focus", c["accent"])])
+    style.map("TEntry", bordercolor=[("focus", c["accent"])])
+    for name in ("TEntry", "TSpinbox"):
+        style.configure(name, lightcolor=c["panel2"], darkcolor=c["panel2"],
+                        bordercolor=c["border"])
+    style.map("TSpinbox", bordercolor=[("focus", c["accent"])],
+              fieldbackground=[("disabled", c["panel"])],
+              foreground=[("disabled", "#6b717c")])
+    style.configure("TNotebook", bordercolor=c["border"],
+                    lightcolor=c["bg"], darkcolor=c["bg"])
+    style.configure("TNotebook.Tab", bordercolor=c["border"],
+                    lightcolor=c["panel"], darkcolor=c["panel"])
+
+    # Command bar and cards.
+    style.configure("Bar.TFrame", background=c["panel"])
+    style.configure("Bar.TLabel", background=c["panel"], foreground=c["fg"],
+                    font=(FONT, 10))
+    style.configure("BarMuted.TLabel", background=c["panel"],
+                    foreground=c["muted"], font=(FONT, 10))
+    style.configure("Timer.TLabel", background=c["panel"], foreground=c["fg"],
+                    font=("Segoe UI Semibold", 24))
+    style.configure("Link.TLabel", background=c["panel"],
+                    foreground=c["accent"], font=(FONT, 10, "underline"))
+    style.configure("Section.TLabel", background=c["bg"], foreground=c["fg"],
+                    font=("Segoe UI Semibold", 12))
+    style.configure("CardMuted.TLabel", background=c["panel2"],
+                    foreground=c["muted"], font=(FONT, 9))
+    style.configure("CardWarn.TLabel", background=c["panel2"],
+                    foreground=c["gold"], font=(FONT, 9))
+    style.configure("Warn.TLabel", background=c["bg"], foreground=c["gold"],
+                    font=(FONT, 10))
+    style.configure("Error.TLabel", background=c["bg"], foreground=c["red"],
+                    font=(FONT, 10))
+    style.configure("Toolbar.TButton", padding=(10, 5), font=(FONT, 10))
+    style.configure("TMenubutton", background=c["panel3"], foreground=c["fg"],
+                    borderwidth=0, padding=(10, 5), font=(FONT, 10),
+                    arrowcolor=c["fg"], arrowsize=max(8, int(9 * s)))
+    style.map("TMenubutton",
+              background=[("active", c["accent_dim"]), ("disabled", "#23262d")],
+              foreground=[("active", "#06120f"), ("disabled", "#5b606a")],
+              arrowcolor=[("active", "#06120f"), ("disabled", "#5b606a")])
+    style.configure("TCheckbutton", indicatorbackground=c["panel2"],
+                    indicatorforeground=c["fg"], font=(FONT, 10))
+    style.map("TCheckbutton",
+              indicatorbackground=[("selected", c["accent"]),
+                                   ("active", c["panel3"])],
+              indicatorforeground=[("selected", "#06120f")])
+    style.configure("Horizontal.TProgressbar", background=c["accent"],
+                    troughcolor=c["panel3"], bordercolor=c["panel"],
+                    lightcolor=c["accent"], darkcolor=c["accent"])
+
+    # Success / notice strip under the command bar.
+    for name, col in (("Ok", c["green"]), ("Warn", c["gold"]),
+                      ("Info", c["accent"])):
+        style.configure(f"Strip{name}.TFrame", background=c["panel2"])
+        style.configure(f"Strip{name}.TLabel", background=c["panel2"],
+                        foreground=col, font=("Segoe UI Semibold", 10))
+    style.configure("Strip.TLabel", background=c["panel2"], foreground=c["fg"],
+                    font=(FONT, 10))
+
+    # Recordings list (Treeview): dark, roomy rows, accent selection.
+    style.configure("Treeview", background=c["panel2"],
+                    fieldbackground=c["panel2"], foreground=c["fg"],
+                    bordercolor=c["border"], lightcolor=c["panel2"],
+                    darkcolor=c["panel2"], rowheight=int(26 * s),
+                    font=(FONT, 10))
+    style.map("Treeview",
+              background=[("selected", "focus", c["accent_dim"]),
+                          ("selected", "#2d4a47")],
+              foreground=[("selected", "focus", "#06120f"),
+                          ("selected", c["fg"])])
+    style.configure("Treeview.Heading", background=c["panel"],
+                    foreground=c["muted"], bordercolor=c["border"],
+                    lightcolor=c["panel"], darkcolor=c["panel"],
+                    relief="flat", padding=(6, 4), font=(FONT, 9))
+    style.map("Treeview.Heading",
+              background=[("active", c["panel3"])],
+              foreground=[("active", c["fg"])])
+    style.configure("TPanedwindow", background=c["bg"])
+    style.configure("Sash", sashthickness=max(6, int(8 * s)),
+                    gripcount=0, background=c["bg"], bordercolor=c["bg"],
+                    lightcolor=c["bg"])
     return style
+
+
+def set_dark_titlebar(win):
+    """Ask Windows 10/11 for a dark title bar on `win` so it matches the dark
+    client area. Silently does nothing elsewhere or on older builds."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        win.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())
+        on = ctypes.c_int(1)
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE (Win10 20H1+), 19 on older builds.
+        for attr in (20, 19):
+            res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, attr, ctypes.byref(on), ctypes.sizeof(on))
+            if res == 0:
+                break
+    except (AttributeError, OSError, tk.TclError):
+        pass
 
 
 class Tooltip:
@@ -243,12 +393,39 @@ class ScrollFrame(ttk.Frame):
         self.body = ttk.Frame(self.canvas, style="TFrame")
         self._win = self.canvas.create_window((0, 0), window=self.body, anchor="nw")
         self.canvas.configure(yscrollcommand=self.vsb.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
         self.vsb.pack(side="right", fill="y")
-        self.body.bind("<Configure>",
-                       lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfig(self._win, width=e.width))
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.body.bind("<Configure>", self._on_body_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+        self._install_wheel_router()
+
+    def _on_body_configure(self, _e=None):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        self._update_scrollbar()
+
+    def _on_canvas_configure(self, e):
+        self.canvas.itemconfig(self._win, width=e.width)
+        self._update_scrollbar()
+
+    def _update_scrollbar(self):
+        """Show the scrollbar only while the content is taller than the
+        viewport - a permanent empty scrollbar reads as 'something is cut
+        off' and wastes a column of space."""
+        try:
+            req = self.body.winfo_reqheight()
+            have = self.canvas.winfo_height()
+            if have <= 1:
+                return  # not laid out yet
+            shown = bool(self.vsb.winfo_manager())
+            if req > have + 1 and not shown:
+                self.vsb.pack(side="right", fill="y", before=self.canvas)
+            elif req < have - 4 and shown:
+                self.vsb.pack_forget()
+                self.canvas.yview_moveto(0)
+        except tk.TclError:
+            pass
+
+    def _install_wheel_router(self):
         top = self.winfo_toplevel()
         if id(top) not in ScrollFrame._router_installed_for:
             ScrollFrame._router_installed_for.add(id(top))
@@ -295,17 +472,18 @@ class StatusLight(tk.Frame):
     `text` is the bare subsystem name ("Audio"); set_state appends the state.
     """
 
-    def __init__(self, parent, text, **kw):
-        super().__init__(parent, bg=COLORS["bg"], **kw)
+    def __init__(self, parent, text, bg=None, **kw):
+        bg = bg or COLORS["bg"]
+        super().__init__(parent, bg=bg, **kw)
         s = ui_scale(parent)
-        d = int(14 * s)
-        self.dot = tk.Canvas(self, width=d, height=d, bg=COLORS["bg"],
+        d = int(12 * s)
+        self.dot = tk.Canvas(self, width=d, height=d, bg=bg,
                              highlightthickness=0)
-        pad = max(2, int(2 * s))
+        pad = max(1, int(1 * s))
         self._oval = self.dot.create_oval(pad, pad, d - pad, d - pad,
                                           fill=COLORS["muted"], outline="")
-        self.dot.pack(side="left", padx=(0, 5))
-        self.lbl = tk.Label(self, text=text, bg=COLORS["bg"],
+        self.dot.pack(side="left", padx=(0, 6))
+        self.lbl = tk.Label(self, text=text, bg=bg,
                             fg=COLORS["fg"], font=(FONT, 10))
         self.lbl.pack(side="left")
         self._base = text
@@ -316,17 +494,33 @@ class StatusLight(tk.Frame):
 
 
 class LevelMeter(tk.Canvas):
-    """An OBS-style horizontal peak meter with a decaying peak-hold tick."""
+    """An OBS-style horizontal peak meter with a decaying peak-hold tick.
+
+    Stretches with its container (grid it with sticky="ew"): the drawing
+    follows the real width instead of a fixed 200 px box.
+    """
 
     def __init__(self, parent, width=200, height=16):
+        s = ui_scale(parent)
+        width, height = int(width * s), int(height * s)
         super().__init__(parent, width=width, height=height, highlightthickness=1,
                          highlightbackground=COLORS["border"], bg="#0b0d10")
         # NOTE: do NOT use self._w / self._h - those are Tk Canvas internals
         # (the widget's Tcl path). Use distinct names.
         self._mw = width
         self._mh = height
+        self._seg = max(4, int(4 * s))
         self._peak_hold = 0.0
+        self._last = 0.0
+        self.bind("<Configure>", self._on_resize)
         self._draw(0.0)
+
+    def _on_resize(self, e):
+        # Canvas width/height include the 1 px highlight on each side.
+        w, h = max(20, e.width - 2), max(6, e.height - 2)
+        if (w, h) != (self._mw, self._mh):
+            self._mw, self._mh = w, h
+            self._draw(self._last)
 
     @staticmethod
     def _to_frac(peak):
@@ -346,38 +540,39 @@ class LevelMeter(tk.Canvas):
         self._draw(frac)
 
     def _draw(self, frac):
+        self._last = frac
         self.delete("all")
         w, h = self._mw, self._mh
-        # Subtle segment background.
         filled = int(min(1.0, frac) * w)
-        seg = 4
+        seg = self._seg
         for x in range(0, w, seg):
-            frac = x / w
+            pos = x / w
             lit = x < filled
-            if frac < 0.6:
+            if pos < 0.6:
                 col = "#2fbf63" if lit else "#15301f"
-            elif frac < 0.85:
+            elif pos < 0.85:
                 col = "#e6c200" if lit else "#332d0a"
             else:
                 col = "#ef4040" if lit else "#331414"
-            self.create_rectangle(x + 1, 2, x + seg - 1, h - 2, fill=col, outline="")
+            self.create_rectangle(x + 1, 2, x + seg - 1, h, fill=col, outline="")
         ph = int(min(1.0, self._peak_hold) * w)
         if ph > 1:
-            self.create_rectangle(ph - 1, 1, ph + 1, h - 1, fill="#ffffff", outline="")
+            self.create_rectangle(ph - 1, 1, ph + 1, h + 1, fill="#ffffff",
+                                  outline="")
 
 
 class ToggleSwitch(tk.Frame):
-    """An iPhone-style on/off sliding toggle bound to a tk.BooleanVar.
+    """An on/off sliding toggle bound to a tk.BooleanVar.
 
     Implemented as a Frame holding a fixed-size Canvas (the switch) plus a real
-    ttk.Label (the text). The Label auto-sizes to its content, so the caption can
+    Label (the text). The Label auto-sizes to its content, so the caption can
     NEVER be clipped regardless of length, font, or DPI scaling.
     """
 
-    LABEL_FONT = (FONT, 11)
+    LABEL_FONT = (FONT, 10)
 
     def __init__(self, parent, variable, text="", command=None,
-                 bg=None, width=52, height=28):
+                 bg=None, width=44, height=24):
         if bg is None:
             # Inherit the parent's real background so the switch blends into
             # cards / panels / the window automatically (no color mismatch).
@@ -385,6 +580,7 @@ class ToggleSwitch(tk.Frame):
         super().__init__(parent, bg=bg)
         self.var = variable
         self.command = command
+        self.enabled = True
         s = ui_scale(parent)
         width, height = int(width * s), int(height * s)
         self._w_sw = width
@@ -404,15 +600,16 @@ class ToggleSwitch(tk.Frame):
         self.canvas.bind("<FocusOut>", lambda e: self.canvas.configure(
             highlightthickness=0))
 
+        self.label = None
         if text:
             self.label = tk.Label(self, text=text, bg=bg, fg=COLORS["fg"],
                                   font=self.LABEL_FONT, cursor="hand2")
-            self.label.pack(side="left", padx=(10, 0))
+            self.label.pack(side="left", padx=(8, 0))
             self.label.bind("<Button-1>", self._on_click)
 
         try:
             self._trace = self.var.trace_add("write", lambda *a: self._draw())
-        except Exception:
+        except tk.TclError:
             self._trace = None
         # Remove the trace when the widget dies, otherwise the stale callback
         # raises TclError and aborts every later trace on the same variable.
@@ -427,10 +624,27 @@ class ToggleSwitch(tk.Frame):
             trace, self._trace = self._trace, None
             try:
                 self.var.trace_remove("write", trace)
-            except Exception:
+            except tk.TclError:
                 pass
 
+    def set_enabled(self, on):
+        """Gray the switch out and ignore clicks/keys while disabled."""
+        self.enabled = bool(on)
+        cursor = "hand2" if self.enabled else "arrow"
+        try:
+            self.canvas.configure(cursor=cursor,
+                                  takefocus=1 if self.enabled else 0)
+            if self.label is not None:
+                self.label.configure(
+                    cursor=cursor,
+                    fg=COLORS["fg"] if self.enabled else "#6b717c")
+        except tk.TclError:
+            pass
+        self._draw()
+
     def _on_click(self, _e=None):
+        if not self.enabled:
+            return "break"
         self.var.set(not bool(self.var.get()))
         if self.command:
             self.command()
@@ -444,15 +658,22 @@ class ToggleSwitch(tk.Frame):
             c.delete("all")
             on = bool(self.var.get())
             w, h = self._w_sw, self._h_sw
-            pad = 3
+            pad = max(2, int(h / 9))
             r = (h - 2 * pad) / 2
-            track = COLORS["accent"] if on else "#3a3f48"
+            if self.enabled:
+                track = COLORS["accent"] if on else "#3a3f48"
+                knob = "#ffffff"
+            else:
+                track = COLORS["accent_dim"] if on else "#2c3038"
+                knob = "#8a9099"
             c.create_oval(1, pad, 1 + (h - 2 * pad), h - pad, fill=track, outline="")
             c.create_oval(w - (h - 2 * pad) - 1, pad, w - 1, h - pad,
                           fill=track, outline="")
             c.create_rectangle(1 + r, pad, w - 1 - r, h - pad, fill=track, outline="")
             kx = (w - 1 - r) if on else (1 + r)
-            c.create_oval(kx - r, pad, kx + r, h - pad, fill="#ffffff", outline="")
+            k = r - max(1, int(h / 14))
+            c.create_oval(kx - k, h / 2 - k, kx + k, h / 2 + k, fill=knob,
+                          outline="")
         except tk.TclError:
             pass
 
@@ -461,33 +682,38 @@ class SegmentedControl(tk.Frame):
     """A clearly-visible vertical option selector bound to a StringVar.
 
     Replaces tiny ttk radio buttons: each option is a full-width clickable row,
-    the selected one is highlighted in the accent color.
+    the selected one is highlighted in the accent color. Keyboard: Tab to
+    focus, Up/Down or Left/Right to move, Home/End to jump.
     """
 
-    def __init__(self, parent, variable, options, command=None, bg=None):
-        bg = bg or COLORS["panel"]
-        super().__init__(parent, bg=bg, takefocus=1)
+    def __init__(self, parent, variable, options, command=None, bg=None,
+                 wraplength=None):
+        bg = bg or _widget_bg(parent)
+        super().__init__(parent, bg=bg, takefocus=1, highlightthickness=2,
+                         highlightbackground=bg, highlightcolor=COLORS["accent"])
         self.var = variable
         self.command = command
+        self.enabled = True
         self._values = [v for v, _ in options]
         self._rows = {}  # value -> label widget
+        s = ui_scale(parent)
+        wrap = int(wraplength * s) if wraplength else 0
         for value, text in options:
-            row = tk.Label(self, text="   " + text, anchor="w", justify="left",
-                           font=(FONT, 11), padx=12, pady=9, cursor="hand2",
-                           bd=0)
-            row.pack(fill="x", pady=2)
+            row = tk.Label(self, text=text, anchor="w", justify="left",
+                           font=(FONT, 10), padx=int(12 * s), pady=int(6 * s),
+                           cursor="hand2", bd=0, wraplength=wrap)
+            row.pack(fill="x", pady=(0, 2))
             row.bind("<Button-1>", lambda e, v=value: self._select(v))
             self._rows[value] = row
-        # Keyboard operability: Tab to focus, Up/Down to change selection.
-        self.bind("<Up>", lambda e: self._move(-1))
-        self.bind("<Down>", lambda e: self._move(+1))
-        self.bind("<FocusIn>", lambda e: self.configure(
-            highlightthickness=2, highlightbackground=COLORS["accent"]))
-        self.bind("<FocusOut>", lambda e: self.configure(highlightthickness=0))
+        for key, step in (("<Up>", -1), ("<Left>", -1), ("<Down>", 1),
+                          ("<Right>", 1)):
+            self.bind(key, lambda e, st=step: self._move(st))
+        self.bind("<Home>", lambda e: self._jump(0))
+        self.bind("<End>", lambda e: self._jump(len(self._values) - 1))
         self._refresh()
         try:
             self._trace = self.var.trace_add("write", lambda *a: self._refresh())
-        except Exception:
+        except tk.TclError:
             self._trace = None
         # Remove the trace when the widget dies, otherwise the stale callback
         # raises TclError and aborts every later trace on the same variable.
@@ -501,13 +727,29 @@ class SegmentedControl(tk.Frame):
             trace, self._trace = self._trace, None
             try:
                 self.var.trace_remove("write", trace)
-            except Exception:
+            except tk.TclError:
                 pass
 
+    def set_enabled(self, on):
+        self.enabled = bool(on)
+        try:
+            self.configure(takefocus=1 if self.enabled else 0)
+        except tk.TclError:
+            pass
+        self._refresh()
+
     def _select(self, value):
+        if not self.enabled:
+            return
+        self.focus_set()
         self.var.set(value)
         if self.command:
             self.command()
+
+    def _jump(self, i):
+        if self._values:
+            self._select(self._values[i])
+        return "break"
 
     def _move(self, step):
         try:
@@ -524,66 +766,85 @@ class SegmentedControl(tk.Frame):
             cur = self.var.get()
             for value, row in self._rows.items():
                 if value == cur:
-                    row.configure(bg=COLORS["accent"], fg="#06120f",
-                                  font=(FONT, 11, "bold"))
+                    bg = COLORS["accent"] if self.enabled else COLORS["accent_dim"]
+                    row.configure(bg=bg, fg="#06120f",
+                                  font=(FONT, 10, "bold"),
+                                  cursor="hand2" if self.enabled else "arrow")
                 else:
-                    row.configure(bg=COLORS["panel3"], fg=COLORS["fg"],
-                                  font=(FONT, 11))
+                    row.configure(bg=COLORS["panel3"],
+                                  fg=COLORS["fg"] if self.enabled else "#6b717c",
+                                  font=(FONT, 10),
+                                  cursor="hand2" if self.enabled else "arrow")
         except tk.TclError:
             pass
 
 
 class DeviceRow(ttk.Frame):
-    """A selectable capture device with a gain fader and a live level meter."""
+    """A capture device card: chooser, live meter, volume fader, mute.
+
+    Layout (grid, so the chooser and the meter stretch with the window):
+        [ device chooser ...................... ] [Mute] [Remove]
+        [ live level meter ................................... ]
+        Volume [ fader ........................ ] 100%
+        (optional warning line, e.g. "Already added above")
+    """
 
     def __init__(self, parent, devices, on_remove, on_change=None, preset=None,
                  gain=1.0, muted=False):
-        super().__init__(parent, style="Card.TFrame", padding=10)
+        super().__init__(parent, style="Card.TFrame", padding=(12, 10))
         self.devices = devices
         self.on_change = on_change
         self.muted = bool(muted)
         self._map = {}
         values = []
-        for d in devices:
-            icon = "MIC  " if d["kind"] == "input" else "SPK  "
-            tag = "  [loopback]" if d["kind"] == "loopback" else ""
-            label = f'{icon}{d["name"]}  ({d["hostapi"]}){tag}'
+        for label, d in ux.device_labels(devices):
             self._map[label] = d
             values.append(label)
 
         # Row 0: device chooser + mute + remove
         self.var = tk.StringVar()
         self.combo = ttk.Combobox(self, textvariable=self.var, values=values,
-                                  state="readonly", width=46)
+                                  state="readonly", width=24)
         self.combo.grid(row=0, column=0, columnspan=2, sticky="ew", padx=(0, 8))
         self.mute_btn = tk.Button(self, text="Mute", width=7, relief="flat",
                                   font=(FONT, 10, "bold"), cursor="hand2",
+                                  bd=0, highlightthickness=1,
+                                  highlightbackground=COLORS["panel2"],
+                                  highlightcolor=COLORS["accent"],
                                   command=self._toggle_mute)
-        self.mute_btn.grid(row=0, column=2, sticky="e", padx=(0, 6))
+        self.mute_btn.grid(row=0, column=2, sticky="nse", padx=(0, 8))
         Tooltip(self.mute_btn, "Silences this device in the recording - "
                                "its meter drops to zero while muted.")
-        self.remove_btn = ttk.Button(self, text="Remove", width=8,
+        self.remove_btn = ttk.Button(self, text="\u2715", width=3,
+                                     style="Toolbar.TButton",
                                      command=lambda: on_remove(self))
-        self.remove_btn.grid(row=0, column=3, sticky="e")
+        self.remove_btn.grid(row=0, column=3, sticky="nse")
+        Tooltip(self.remove_btn, "Remove this device from the list")
 
-        # Row 1: gain fader + percent + meter. Range 0..800% so a quiet mic can
+        # Row 1: live meter across the whole card - the first thing to check
+        # is "is this device picking anything up?".
+        self.meter = LevelMeter(self, width=120, height=10)
+        self.meter.grid(row=1, column=0, columnspan=4, sticky="ew",
+                        pady=(8, 0))
+
+        # Row 2: gain fader + percent. Range 0..800% so a quiet mic can
         # actually be boosted. Mousewheel nudges it for easy fine control.
         self.GAIN_MAX = 800
-        ttk.Label(self, text="Volume", style="Card.TLabel").grid(
-            row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(self, text="Volume", style="CardMuted.TLabel").grid(
+            row=2, column=0, sticky="w", pady=(6, 0))
         self.gain_var = tk.DoubleVar(value=float(gain) * 100.0)
         self.scale = ttk.Scale(self, from_=0, to=self.GAIN_MAX, variable=self.gain_var,
-                               command=self._on_gain, length=240,
+                               command=self._on_gain, length=120,
                                style="Horizontal.TScale")
-        self.scale.grid(row=1, column=1, sticky="ew", padx=(8, 8), pady=(10, 0))
+        self.scale.grid(row=2, column=1, sticky="ew", padx=(8, 8), pady=(6, 0))
         self.scale.bind("<MouseWheel>", self._on_wheel)
         Tooltip(self.scale, "Drag or scroll to boost a quiet mic - "
                             "100% is normal, up to 800% for very quiet ones.")
         self.pct_lbl = ttk.Label(self, text=f"{int(float(gain) * 100)}%",
-                                 style="Card.TLabel", width=6)
-        self.pct_lbl.grid(row=1, column=2, sticky="w", pady=(10, 0))
-        self.meter = LevelMeter(self)
-        self.meter.grid(row=1, column=3, sticky="e", pady=(10, 0))
+                                 style="Card.TLabel", width=5)
+        self.pct_lbl.grid(row=2, column=2, sticky="w", pady=(6, 0))
+
+        self.warn_lbl = ttk.Label(self, text="", style="CardWarn.TLabel")
 
         self.columnconfigure(1, weight=1)
 
@@ -609,6 +870,28 @@ class DeviceRow(ttk.Frame):
                 self.var.set(values[0])
 
         self._refresh_mute_btn()
+
+    def set_editable(self, on):
+        """Lock the device choice and Remove while a take is running (the
+        recorder keeps the devices it started with). Mute and Volume stay
+        live because they do apply mid-recording."""
+        try:
+            self.combo.configure(state="readonly" if on else "disabled")
+            self.remove_btn.state(["!disabled"] if on else ["disabled"])
+        except tk.TclError:
+            pass
+
+    def set_warning(self, text):
+        """Show (or clear) a one-line warning under the card's controls."""
+        try:
+            if text:
+                self.warn_lbl.configure(text=text)
+                self.warn_lbl.grid(row=3, column=0, columnspan=4, sticky="w",
+                                   pady=(6, 0))
+            else:
+                self.warn_lbl.grid_remove()
+        except tk.TclError:
+            pass
 
     def _refresh_mute_btn(self):
         if self.muted:
@@ -670,10 +953,16 @@ class GoldBanner(tk.Frame):
         self._flashing = False
         self._flash_after = None
         self._auto_hide = None
+        # Pack in front of this widget (set by the app) so the banner can
+        # never be squeezed out below a tall main layout.
+        self.pack_before = None
 
         self.label = tk.Label(self, text="", bg=COLORS["gold"], fg="#1a1a1a",
-                              font=(FONT, 13, "bold"), anchor="w", justify="left")
+                              font=(FONT, 12, "bold"), anchor="w", justify="left",
+                              wraplength=int(700 * ui_scale(parent)))
         self.label.pack(side="left", padx=18, pady=10, fill="x", expand=True)
+        # Long messages wrap inside the bar instead of running off the window.
+        self.bind("<Configure>", self._rewrap)
 
         self.restart_btn = tk.Button(self, text="Restart recording",
                                      command=self._restart, bg="#1a1a1a",
@@ -692,6 +981,27 @@ class GoldBanner(tk.Frame):
                                 cursor="hand2")
         self.ack_btn.pack(side="right", pady=12)
 
+    def _rewrap(self, e=None):
+        try:
+            used = sum(b.winfo_reqwidth() + 24 for b in (self.restart_btn,
+                                                        self.ack_btn)
+                       if b.winfo_manager())
+            width = (e.width if e is not None else self.winfo_width())
+            self.label.configure(wraplength=max(200, width - used - 60))
+        except tk.TclError:
+            pass
+
+    def _place(self):
+        """Buttons first (they must never be squeezed), then the message."""
+        self.label.pack_forget()
+        self.label.pack(side="left", padx=18, pady=10, fill="x", expand=True)
+        if not self.winfo_manager():
+            kw = {"side": "bottom", "fill": "x"}
+            if self.pack_before is not None:
+                kw["before"] = self.pack_before
+            self.pack(**kw)
+        self._rewrap()
+
     def _ack(self):
         self.stop()
         if self.on_ack:
@@ -709,13 +1019,12 @@ class GoldBanner(tk.Frame):
         # green and hidden the restart button).
         self.config(bg=COLORS["gold"])
         self.label.config(bg=COLORS["gold"], fg="#1a1a1a",
-                          text="   RECORDING PROBLEM:   " + message)
+                          text="RECORDING PROBLEM:  " + message)
         self.restart_btn.pack_forget()
         self.ack_btn.pack_forget()
         self.restart_btn.pack(side="right", padx=(6, 18), pady=12)
         self.ack_btn.pack(side="right", pady=12)
-        if not self.winfo_manager():
-            self.pack(side="bottom", fill="x")
+        self._place()
         if not self._flashing:
             self._flashing = True
         self._flash()
@@ -729,12 +1038,11 @@ class GoldBanner(tk.Frame):
         self._flashing = False
         self.config(bg=COLORS["green"])
         self.label.config(bg=COLORS["green"], fg="#0b0b0b",
-                          text="   RECORDING RECOVERED:   " + message)
+                          text="RECOVERED:  " + message)
         self.restart_btn.pack_forget()
         self.ack_btn.pack_forget()
         self.ack_btn.pack(side="right", padx=(6, 18), pady=12)
-        if not self.winfo_manager():
-            self.pack(side="bottom", fill="x")
+        self._place()
         self._auto_hide = self.after(10000, self.stop)
 
     def _cancel_auto_hide(self):
