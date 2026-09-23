@@ -5,7 +5,7 @@ entry point can close it without importing the whole UI."""
 
 import logging
 
-log = logging.getLogger(__name__)
+log = logging.getLogger("srr.splash")
 
 
 def close_splash():

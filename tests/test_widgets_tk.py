@@ -89,5 +89,23 @@ class WorkAreaTests(unittest.TestCase):
         self.assertGreater(bottom - top, 200)
 
 
+class ToggleSwitchBindingTests(unittest.TestCase):
+    def test_destroy_removes_only_its_parent_binding(self):
+        root = _root_or_skip(self)
+        parent = tk.Frame(root)
+        parent.pack()
+        seen = []
+        parent.bind("<Configure>", lambda e: seen.append("other"), add="+")
+        sw = widgets.ToggleSwitch(parent, tk.BooleanVar(root), text="Switch")
+        sw.pack()
+        self.assertIn(sw._fit_bind, parent.bind("<Configure>"))
+        sw.destroy()
+        script = parent.bind("<Configure>")
+        self.assertNotIn("_fit_label", script)
+        self.assertTrue(script.strip(), "the other binding was removed too")
+        parent.event_generate("<Configure>", width=300, height=40)
+        self.assertEqual(seen, ["other"])
+
+
 if __name__ == "__main__":
     unittest.main()

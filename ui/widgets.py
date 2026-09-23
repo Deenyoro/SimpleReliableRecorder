@@ -656,6 +656,7 @@ class ToggleSwitch(tk.Frame):
             highlightthickness=0))
 
         self.label = None
+        self._fit_bind = None
         if text:
             self.label = tk.Label(self, text=text, bg=bg, fg=COLORS["fg"],
                                   font=self.LABEL_FONT, cursor="hand2")
@@ -663,7 +664,8 @@ class ToggleSwitch(tk.Frame):
             self.label.bind("<Button-1>", self._on_click)
             # Wrap the caption instead of running under a scrollbar when the
             # pane gets narrow (snapped window on a small laptop).
-            parent.bind("<Configure>", self._fit_label, add="+")
+            self._fit_bind = parent.bind("<Configure>", self._fit_label,
+                                         add="+")
 
         try:
             self._trace = self.var.trace_add("write", lambda *a: self._draw())
@@ -689,6 +691,18 @@ class ToggleSwitch(tk.Frame):
         # <Destroy> fires once per descendant; only act on our own.
         if event.widget is not self:
             return
+        if self._fit_bind is not None:
+            # Drop only our callback from the parent's <Configure> script
+            # (unbind(seq, funcid) would wipe every other binding on it).
+            fid, self._fit_bind = self._fit_bind, None
+            try:
+                script = self.master.bind("<Configure>")
+                keep = "\n".join(line for line in script.split("\n")
+                                 if fid not in line)
+                self.master.bind("<Configure>", keep)
+                self.master.deletecommand(fid)
+            except tk.TclError:
+                pass
         if self._trace is not None:
             trace, self._trace = self._trace, None
             try:

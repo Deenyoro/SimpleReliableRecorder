@@ -241,10 +241,6 @@ class GeometryBoundsTests(unittest.TestCase):
         self.assertEqual(g, "1200x800+360+80")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class MinWindowSizeTests(unittest.TestCase):
     """A Windows Snap half of a 1920x1040 work area is 960 px wide; the
     minimum size must allow it at the common laptop scales."""
@@ -262,3 +258,7 @@ class MinWindowSizeTests(unittest.TestCase):
         w, h = ux.min_window_size(1.0, 1366, 728)
         self.assertLessEqual(w, 683)
         self.assertEqual(h, 560)
+
+
+if __name__ == "__main__":
+    unittest.main()
