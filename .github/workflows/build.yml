@@ -257,6 +257,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # Fail before packaging if the crash-safe WAV writer or the recordings
+      # library regress; a broken release is far costlier than a red job.
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -t . -v
+
       - name: Build executable
         run: python build.py --clean
 
