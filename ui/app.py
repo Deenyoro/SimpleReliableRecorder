@@ -4924,11 +4924,26 @@ def _enable_dpi_awareness():
         pass
 
 
+def close_splash():
+    """Close the PyInstaller splash (Windows one-file build) if one is up.
+    A no-op when running from source or when the splash was suppressed."""
+    try:
+        import pyi_splash  # only exists inside a PyInstaller build
+    except ImportError:
+        return
+    try:
+        if pyi_splash.is_alive():
+            pyi_splash.close()
+    except Exception:  # never let the splash block startup
+        log.debug("closing the splash screen failed", exc_info=True)
+
+
 def run():
     _enable_dpi_awareness()
     try:
         app = App()
     except Exception as e:
+        close_splash()  # the error box must not hide behind the splash
         import traceback
         tb = traceback.format_exc()
         log.error("FATAL startup error: %s\n%s", e, tb)
@@ -4950,4 +4965,7 @@ def run():
         except tk.TclError:
             pass
         raise
+    # The window is built; close the splash once it has actually painted,
+    # so there is never a moment with nothing on screen.
+    app.after(150, close_splash)
     app.mainloop()
