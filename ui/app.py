@@ -2072,7 +2072,8 @@ class App(tk.Tk):
             out_dir=self.last_outputs.get("out_dir", ""),
             audio=audio, video=(vids[0] if vids else ""),
             video_segments=vids,
-            created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            created=(getattr(self, "_session_started", None)
+                     or datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         if self._last_take_secs:
             self._lib_meta[entry["id"]] = (self._meta_key(entry),
                                            self._last_take_secs,
@@ -3949,7 +3950,8 @@ class App(tk.Tk):
 
         # ISO-style, file-safe session folder + base name (research-backed:
         # YYYY-MM-DD, no spaces or special chars, sorts chronologically).
-        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        started = datetime.now()
+        stamp = started.strftime("%Y-%m-%d_%H-%M-%S")
         out_dir = os.path.join(out_dir, f"SRR_{stamp}")
         try:
             os.makedirs(out_dir, exist_ok=True)
@@ -3963,6 +3965,9 @@ class App(tk.Tk):
             return None
         base = f"SRR_{stamp}"
         self._session_base = base
+        # The list's Recorded column shows when the take STARTED, the same
+        # moment its automatic name ('Recording 23 Sep 2026, 17:44') shows.
+        self._session_started = started.strftime("%Y-%m-%d %H:%M:%S")
 
         # Per-process session dir: with a shared fixed dir, two app instances
         # interleave heartbeats and either one's stop flag kills BOTH
