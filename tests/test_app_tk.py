@@ -59,6 +59,10 @@ class _Stand:
     _combine_progress = App._combine_progress if App else None
     _combine_progress_text = App._combine_progress_text if App else None
     start_recording = App.start_recording if App else None
+    _build_strip = App._build_strip if App else None
+    _layout_strip = App._layout_strip if App else None
+    _show_strip = App._show_strip if App else None
+    _hide_strip = App._hide_strip if App else None
 
     def __init__(self, root):
         self.root = root
@@ -70,6 +74,9 @@ class _Stand:
 
     def after(self, ms, fn=None):
         return self.root.after(ms, fn)
+
+    def after_cancel(self, job):
+        return self.root.after_cancel(job)
 
     def _poll_err(self, key, e):
         raise AssertionError(f"{key}: {e}")
@@ -205,6 +212,76 @@ class MnemonicTests(unittest.TestCase):
         ev = types.SimpleNamespace(state=0)
         App._mnemonic(ev, stop)
         self.assertEqual(pressed, ["stop"])
+
+
+@unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
+class SavedStripTests(unittest.TestCase):
+    """The done moment in a narrow window (Snap half of a laptop at 125% /
+    150%): Open folder, Rename and Play must stay whole; the summary gives
+    way instead."""
+
+    def _strip(self, width):
+        from ui import widgets
+        root = _root_or_skip(self)
+        root.deiconify()
+        widgets._ui_scale = None
+        widgets.apply_dark_theme(root)
+        st = _Stand(root)
+        st._s = 1.0
+        st._strip_job = None
+        outer = ttk.Frame(root, width=width, height=200)
+        outer.grid_propagate(False)
+        outer.columnconfigure(0, weight=1)
+        outer.pack()
+        st._build_strip(outer)
+        self._root, self._st, self._outer = root, st, outer
+        return root, st
+
+    def _check(self, width, expect_stacked):
+        root, st = self._strip(width)
+        summary = "2 tracks  ·  1:02:03  ·  841 MB"
+        st._show_strip("ok", "✓ Saved",
+                       (summary + "  ·  Recording 23 Sep 2026, 17:44",
+                        summary),
+                       [("Open folder", None), ("Rename...", None),
+                        ("Play", None)])
+        root.update()
+        st._layout_strip()
+        root.update()
+        right = st.strip.winfo_rootx() + st.strip.winfo_width()
+        for b in st._strip_actions.winfo_children():
+            self.assertTrue(b.winfo_ismapped(), b.cget("text"))
+            self.assertGreaterEqual(b.winfo_width(), b.winfo_reqwidth(),
+                                    b.cget("text"))
+            self.assertLessEqual(b.winfo_rootx() + b.winfo_width(), right,
+                                 b.cget("text"))
+        self.assertEqual(st._strip_stacked[1], expect_stacked)
+        text = st._strip_text.cget("text")
+        self.assertLessEqual(st._strip_font.measure(text),
+                             st._strip_text.winfo_width() + 1)
+        return text
+
+    def test_wide_window_keeps_one_line_and_the_name(self):
+        text = self._check(1400, expect_stacked=False)
+        self.assertIn("Recording 23 Sep", text)
+
+    def test_snapped_laptop_moves_buttons_under_the_summary(self):
+        text = self._check(560, expect_stacked=True)
+        self.assertTrue(text.startswith("2 tracks"))
+
+    def test_widening_again_puts_buttons_back_beside_the_close_button(self):
+        self._check(560, expect_stacked=True)
+        root = self._root
+        self._outer.configure(width=1400)
+        root.update()
+        self._st._layout_strip()
+        root.update()
+        close = self._st._strip_close
+        for b in self._st._strip_actions.winfo_children():
+            self.assertLessEqual(b.winfo_rootx() + b.winfo_width(),
+                                 close.winfo_rootx(), b.cget("text"))
+        info = self._st._strip_actions.grid_info()
+        self.assertEqual((int(info["row"]), int(info["columnspan"])), (0, 1))
 
 
 if __name__ == "__main__":

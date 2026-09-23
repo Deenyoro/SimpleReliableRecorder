@@ -385,6 +385,16 @@ def end_ellipsize(text, max_px, measure):
     return best
 
 
+def fit_text(candidates, max_px, measure):
+    """The first of `candidates` (longest first) that fits in max_px, else
+    the last one cut with '...' (the result strip drops the name before it
+    shortens the summary)."""
+    for text in candidates:
+        if measure(text) <= max_px:
+            return text
+    return end_ellipsize(candidates[-1], max_px, measure)
+
+
 # --------------------------------------------------------------------------- #
 # Friendly errors
 # --------------------------------------------------------------------------- #
