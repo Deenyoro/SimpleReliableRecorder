@@ -30,6 +30,22 @@ def available():
     return _AVAILABLE
 
 
+def is_valid_hotkey(hotkey):
+    """False only when the keyboard library positively rejects `hotkey`
+    (an unknown key name such as 'adiaeresis'). When it can't tell - lib
+    missing, or it needs privileges to build its key table - say True and
+    let registration report the real outcome."""
+    if not hotkey or not _AVAILABLE:
+        return True
+    try:
+        _kb.parse_hotkey(hotkey)
+    except ValueError:
+        return False
+    except Exception:  # noqa: BLE001 - e.g. ImportError without root on Linux
+        return True
+    return True
+
+
 class HotkeyManager:
     """Registers one push-to-talk/mute hotkey. Reconfigurable at runtime."""
 
