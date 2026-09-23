@@ -1684,8 +1684,11 @@ class App(tk.Tk):
                     self.busy_lbl.pack(side="left", padx=(0, 8))
                     self.busy_bar.pack(side="left")
                     self.busy_cancel.pack(side="left", padx=(8, 0))
-                    if str(self.busy_bar.cget("mode")) == "indeterminate":
-                        self.busy_bar.start(12)
+                # Also when already shown: the next queued job resets the bar
+                # to indeterminate and its marquee must move again (a frozen
+                # bar looks hung). start() is a no-op while it runs.
+                if str(self.busy_bar.cget("mode")) == "indeterminate":
+                    self.busy_bar.start(12)
                 if not self._transcribe_busy:
                     self.busy_cancel.config(state=(
                         "normal" if self._combine_queue else "disabled"))
@@ -2347,8 +2350,8 @@ class App(tk.Tk):
         elif self._finalizing:
             self.status_lbl.config(text="Saving your recording...")
         elif self._combine_busy:
-            self.status_lbl.config(
-                text="Combining... (this can take a while for video)")
+            # Same words as the Recordings footer (percentage, time left).
+            self.status_lbl.config(text=self._combine_progress_text())
         elif self._transcribe_busy:
             self.status_lbl.config(text="Transcribing with Scrivox...")
         else:
@@ -4691,6 +4694,7 @@ class App(tk.Tk):
             self._combine_queue.append((fn, out))
             self._combine_total += 1
             self._set_busy(True, text=self._combine_progress_text())
+            self._restore_status()
             return
         if not self._combine_results:
             self._combine_total = 1 + len(self._combine_queue)
@@ -4743,6 +4747,8 @@ class App(tk.Tk):
         except tk.TclError:
             pass
         self._set_busy(True, text=self._combine_progress_text())
+        if not (self.recording or self._starting or self._finalizing):
+            self._restore_status()
 
     def _combine_done(self, ok, out, detail):
         self._combine_busy = False
