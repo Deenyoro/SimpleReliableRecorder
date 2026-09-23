@@ -53,17 +53,31 @@ def main():
     try:
         from ui.app import run
         run()
-    except Exception:
+    except Exception as exc:
         log.exception("Fatal error in GUI")
-        # Last-resort visible error so failures are never silent.
+        # Last-resort visible error so failures are never silent - in plain
+        # words, with the full traceback left in the log (or shown here only
+        # when there is no log to point at). Startup failures were already
+        # shown by ui.app.run(); don't stack a second box on top.
+        if getattr(exc, "_srr_reported", False):
+            raise
         try:
             import tkinter.messagebox as mb
             import traceback
-            detail = traceback.format_exc()
+            msg = ("Simple Reliable Recorder hit a problem and has to close."
+                   "\n\nAnything already recorded is safe on disk.\n\n"
+                   f"{type(exc).__name__}: {exc}")
             if logging_err:
-                detail = ("(logging also failed to initialize:\n"
-                          + logging_err + ")\n\n" + detail)
-            mb.showerror("SimpleReliableRecorder crashed", detail)
+                msg += ("\n\nDetails (logging also failed to start):\n"
+                        + logging_err + "\n" + traceback.format_exc())
+            else:
+                try:
+                    from recorder import paths
+                    msg += ("\n\nThe full details are in the log folder:\n"
+                            + paths.logs_dir())
+                except Exception:
+                    msg += "\n\n" + traceback.format_exc()
+            mb.showerror("Simple Reliable Recorder", msg)
         except Exception:
             pass
         raise
