@@ -182,6 +182,8 @@ class App(tk.Tk):
         self._scrivox_checked = False
         self._closing = False
         self._quitting = False
+        self._close_asking = False     # quit question on screen (latch)
+        self._close_retry_job = None   # pending on_close retry while starting
         # Re-entrancy latches: dialogs inside start_recording pump the Tk event
         # loop, so a queued second click / tray / hotkey event could re-enter.
         self._starting = False
@@ -4662,17 +4664,55 @@ class App(tk.Tk):
         finalize on the worker while a small 'Saving...' window is shown."""
         if self._closing or self._quitting:
             return
+        if self._close_asking:
+            # A second X click / tray Quit while the question is up: bring
+            # the existing question forward instead of stacking another.
+            self._raise_open_dialog()
+            return
         if self._starting:
             # Let the start finish; then the normal prompt below applies.
-            self.after(250, self.on_close)
+            # One pending retry only, however often X is clicked.
+            if self._close_retry_job is None:
+                def retry():
+                    self._close_retry_job = None
+                    self.on_close()
+                self._close_retry_job = self.after(250, retry)
             return
+        self._close_asking = True  # latch until the questions are answered
+        try:
+            if not self._close_questions():
+                return
+        finally:
+            self._close_asking = False
+        if self.recording or self._finalizing:
+            self._quitting = True
+            if self.recording:
+                self.stop_recording()
+            self._show_closing_window()
+        self._quitting = True
+        self._close_when_idle()
+
+    def _raise_open_dialog(self):
+        dialogs = [w for w in self.winfo_children()
+                   if getattr(w, "_srr_dialog", False)]
+        for w in reversed(dialogs):
+            try:
+                if w.winfo_ismapped():
+                    w.lift()
+                    w.focus_force()
+                    return
+            except tk.TclError:
+                continue
+
+    def _close_questions(self):
+        """Ask whatever must be asked before quitting; False = stay open."""
         if self.recording:
             if not self._confirm(
                     "Stop recording and quit?",
                     "A recording is in progress. Quitting stops it and "
                     "saves everything recorded so far.",
                     yes="Stop and quit", no="Keep recording", kind="warning"):
-                return
+                return False
         if self._combine_busy:
             if not self._confirm(
                     "Quit while combining?",
@@ -4680,7 +4720,7 @@ class App(tk.Tk):
                     "abandoned if you quit now. Your original recordings "
                     "are not affected.",
                     yes="Quit anyway", no="Keep working"):
-                return
+                return False
         if self._transcribe_busy:
             if not self._confirm(
                     "Quit while transcribing?",
@@ -4689,14 +4729,8 @@ class App(tk.Tk):
                     "the recording - but this app won't be around to tell "
                     "you when it's done.",
                     yes="Quit anyway", no="Keep working"):
-                return
-        if self.recording or self._finalizing:
-            self._quitting = True
-            if self.recording:
-                self.stop_recording()
-            self._show_closing_window()
-        self._quitting = True
-        self._close_when_idle()
+                return False
+        return True
 
     def _show_closing_window(self):
         """Hide the main window and show a small progress window while the
