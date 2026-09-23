@@ -416,7 +416,10 @@ class App(tk.Tk):
             pass
         if self.recording and not getattr(self, "_closing", False):
             try:
-                self._raise_gold_alert(f"Internal UI error: {val}")
+                self._raise_gold_alert(
+                    "Something went wrong in the app. Recording continues - "
+                    "check that the timer is still counting. Details are in "
+                    "the activity log (Ctrl+L).")
             except Exception:
                 pass
 
@@ -4132,9 +4135,14 @@ class App(tk.Tk):
         if screen_error:
             # Raised after recording=True so the auto-restart path can act
             # on a start-time screen failure too (audio is still running).
+            # The raw ffmpeg text is in the log; the banner says what it
+            # means and where the details are.
+            log.warning("Screen start failed: %s", screen_error.strip())
+            head, _advice = ux.friendly_error(screen_error)
             self._raise_gold_alert(
-                "Screen recording failed to start - audio is still "
-                f"recording. ({screen_error.strip()[:160]})")
+                "The screen isn't being recorded - sound is. "
+                + (f"{head.rstrip('.')}. " if head else "")
+                + "Details are in the activity log (Ctrl+L).")
 
     def _set_starting_ui(self, on):
         if on:
@@ -4808,7 +4816,8 @@ class App(tk.Tk):
             return
         self._last_wd_reason = reason
         self._last_wd_time = now
-        self._raise_gold_alert(reason)
+        log.warning("Watchdog reported: %s", reason)  # the raw reason
+        self._raise_gold_alert(watchdog.plain_reason(reason))
 
     # ----------------------------------------------------------- combine #
     def _combine_base(self):
