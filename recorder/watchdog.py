@@ -263,6 +263,41 @@ def evaluate_heartbeat(state, raw, hb, mono_now, stale, in_grace):
     return "clear", None
 
 
+# The reasons above are written for the log. People see these instead.
+_PLAIN_REASONS = (
+    ("App not responding",
+     ("The recorder stopped responding. Your recording may have stopped - "
+      "check that the timer is still counting.")),
+    ("not reporting (no heartbeat)",
+     ("The recorder stopped responding. Your recording may have stopped - "
+      "check that the timer is still counting.")),
+    ("AUDIO recording stopped",
+     ("No sound has been saved for a few seconds. Check that your "
+      "microphone is still plugged in, or press Restart recording.")),
+    ("SCREEN recording stopped",
+     ("Screen recording stopped unexpectedly. Sound is still being "
+      "recorded; press Restart recording to get the screen back.")),
+    ("SCREEN recording stalled",
+     ("Screen recording froze - no new video for a few seconds. Sound is "
+      "still being recorded; press Restart recording to get the screen "
+      "back.")),
+    ("no longer running",
+     ("The recorder closed unexpectedly while recording. What was recorded "
+      "so far is saved in your recordings folder. Open the app and press "
+      "Record to continue.")),
+)
+
+
+def plain_reason(reason):
+    """Everyday words for a watchdog reason (the raw text stays in the
+    log); unknown reasons are passed through unchanged."""
+    text = str(reason or "")
+    for key, plain in _PLAIN_REASONS:
+        if key in text:
+            return plain
+    return text
+
+
 def watchdog_main(argv):
     """argv = [session_dir, gui_pid, stale_seconds, alert_sound,
     show_messagebox, gui_create_time?] - trailing args are optional."""
@@ -336,8 +371,7 @@ def watchdog_main(argv):
             if show_messagebox:
                 alerts.message_box(
                     "SimpleReliableRecorder - RECORDING STOPPED",
-                    reason + "\n\nRecording may have stopped. Check the app and "
-                    "restart recording immediately.")
+                    plain_reason(reason))
             elif alert_sound:
                 time.sleep(2.5)  # let the async sound finish before exit
             return
@@ -349,8 +383,7 @@ def watchdog_main(argv):
             def _box():
                 alerts.message_box(
                     "SimpleReliableRecorder - RECORDING STOPPED",
-                    reason + "\n\nRecording may have stopped. Check the app and "
-                    "restart recording immediately.")
+                    plain_reason(reason) + "\n\nCheck the app now.")
                 box_open.clear()
             threading.Thread(target=_box, daemon=True).start()
 
