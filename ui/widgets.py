@@ -23,15 +23,19 @@ COLORS = {
     # brighter than a decorative gray (~6.3:1 on bg, ~5.7:1 on panel).
     "muted": "#9aa1ad",
     "accent": "#4cc2b0",
-    "accent_dim": "#36serial",  # placeholder, overwritten below
+    "accent_dim": "#3a8f83",
     "gold": "#FFC107",
     "gold_bright": "#FFE082",
     "red": "#ef5350",
+    "red_hover": "#f36f6c",
+    "red_active": "#ff7b72",
+    # Record button at rest: a raised surface a step above the panels.
+    "rec_idle": "#353b46",
+    "rec_idle_hover": "#404755",
     "green": "#3ecf7d",
     "blue": "#5ab0f0",
     "border": "#333945",
 }
-COLORS["accent_dim"] = "#3a8f83"
 
 FONT = "Segoe UI"
 
@@ -987,7 +991,7 @@ class DeviceRow(ttk.Frame):
     def _refresh_mute_btn(self):
         if self.muted:
             self.mute_btn.config(text="Muted", bg=COLORS["red"], fg="#0b0b0b",
-                                 activebackground="#ff7b72")
+                                 activebackground=COLORS["red_active"])
         else:
             self.mute_btn.config(text="Mute", bg=COLORS["panel3"],
                                  fg=COLORS["fg"], activebackground=COLORS["accent_dim"])

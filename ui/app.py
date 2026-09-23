@@ -44,6 +44,7 @@ from recorder.config import DEFAULTS, ConfigManager
 from recorder.logging_setup import get_logger, install_inapp_handler
 from recorder.screen import ScreenRecorder, list_monitors
 from ui import ux
+from ui.splash import close_splash
 from ui.widgets import (
     COLORS,
     FONT,
@@ -68,8 +69,8 @@ APP_TITLE = "Simple Reliable Recorder"
 # Record gets its own lighter surface and a red outline so the primary
 # action stands out from Settings and the toolbar buttons.
 _REC_LOOK = {
-    "idle": ("#353b46", "#404755", COLORS["red"]),
-    "recording": (COLORS["red"], "#f36f6c", COLORS["red"]),
+    "idle": (COLORS["rec_idle"], COLORS["rec_idle_hover"], COLORS["red"]),
+    "recording": (COLORS["red"], COLORS["red_hover"], COLORS["red"]),
     "busy": (COLORS["panel3"], COLORS["panel3"], COLORS["panel"]),
 }
 
@@ -1535,7 +1536,7 @@ class App(tk.Tk):
         if mode == "recording":
             b.config(text="  Stop", image=self._rec_square or "", cursor="hand2",
                      bg=bg_now, fg="#ffffff", highlightbackground=outline,
-                     activebackground="#ff7b72", activeforeground="#ffffff",
+                     activebackground=COLORS["red_active"], activeforeground="#ffffff",
                      state="normal", **common)
         elif mode in ("starting", "saving"):
             # Stays "normal" (a disabled image is drawn stippled); the start
@@ -4986,20 +4987,6 @@ def _enable_dpi_awareness():
             ctypes.windll.user32.SetProcessDPIAware()
     except Exception:
         pass
-
-
-def close_splash():
-    """Close the PyInstaller splash (Windows one-file build) if one is up.
-    A no-op when running from source or when the splash was suppressed."""
-    try:
-        import pyi_splash  # only exists inside a PyInstaller build
-    except ImportError:
-        return
-    try:
-        if pyi_splash.is_alive():
-            pyi_splash.close()
-    except Exception:  # never let the splash block startup
-        log.debug("closing the splash screen failed", exc_info=True)
 
 
 def run():
