@@ -78,11 +78,20 @@ def prune(entries):
     kept, removed = [], 0
     for e in entries or []:
         audio = [a for a in e.get("audio", []) if _exists(a)]
+        # A take with screen auto-restarts has several video segments; the
+        # first one ("video") can be gone while later ones remain. Judge the
+        # entry by every segment, and promote the first surviving segment so
+        # the take is not pruned or treated as audio-only.
+        segs = [v for v in (e.get("video_segments") or []) if _exists(v)]
         video = e.get("video", "") if _exists(e.get("video", "")) else ""
+        if not video and segs:
+            video = segs[0]
         if audio or video:
             ne = dict(e)
             ne["audio"] = audio
             ne["video"] = video
+            if "video_segments" in e:
+                ne["video_segments"] = segs
             kept.append(ne)
             continue
         probe = (e.get("out_dir")
