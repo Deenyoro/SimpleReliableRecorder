@@ -190,5 +190,34 @@ class EllipsizeTests(unittest.TestCase):
         self.assertEqual(ux.end_ellipsize("Short", 10, len), "Short")
 
 
+class GeometryBoundsTests(unittest.TestCase):
+    def test_big_window_on_4k_is_kept(self):
+        # Round 1 halved screens >= 2000 px tall: 2400x1600 came back
+        # as 2400x1080 on a 3840x2160 display.
+        self.assertEqual(ux.sane_geometry("2400x1600+100+50", 3840, 2160),
+                         "2400x1600+100+50")
+
+    def test_window_is_moved_fully_on_screen(self):
+        self.assertEqual(ux.sane_geometry("1920x1080+200+100", 1920, 1080),
+                         "1920x1080+0+0")
+        g = ux.parse_geometry(ux.sane_geometry("1200x800+900+500",
+                                               1920, 1080))
+        self.assertLessEqual(g[2] + g[0], 1920)
+        self.assertLessEqual(g[3] + g[1], 1080)
+
+    def test_secondary_monitor_left_of_primary_is_kept(self):
+        self.assertEqual(ux.parse_geometry("1200x800+-1700+100"),
+                         (1200, 800, -1700, 100))
+        self.assertEqual(
+            ux.sane_geometry("1200x800+-1700+100", 1920, 1080,
+                             bounds=(-1920, 0, 0, 1040)),
+            "1200x800+-1700+100")
+
+    def test_gone_monitor_is_centred_on_the_given_area(self):
+        g = ux.sane_geometry("1200x800+2500+100", 1920, 1080,
+                             bounds=(0, 0, 1920, 1040))
+        self.assertEqual(g, "1200x800+360+80")
+
+
 if __name__ == "__main__":
     unittest.main()
