@@ -6,7 +6,6 @@ LevelMeter, DeviceRow, GoldBanner) so ui/app.py is unaffected by visual tweaks.
 
 import math
 import tkinter as tk
-from tkinter import font as tkfont
 from tkinter import ttk
 
 # Modern flat dark palette.
@@ -406,9 +405,6 @@ class ToggleSwitch(tk.Frame):
             highlightthickness=0))
 
         if text:
-            # Determine a label style whose background matches our parent so the
-            # text blends in (panels use a different bg than the window).
-            style_name = "Panel.TLabel" if bg == COLORS["panel"] else "TLabel"
             self.label = tk.Label(self, text=text, bg=bg, fg=COLORS["fg"],
                                   font=self.LABEL_FONT, cursor="hand2")
             self.label.pack(side="left", padx=(10, 0))
