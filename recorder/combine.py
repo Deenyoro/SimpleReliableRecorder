@@ -17,6 +17,8 @@ stderr of `ffmpeg -i <file>` - see _probe_media().
 import os
 import re
 import subprocess
+import threading
+from contextlib import contextmanager
 
 from . import ffmpeg_tools
 from .ffmpeg_tools import CREATE_NO_WINDOW, _startupinfo
@@ -35,17 +37,102 @@ _CHANNELS_RE = re.compile(r"(\d+)\s+channels")
 _PART_RE = re.compile(r"^(?P<base>.+)_part(?P<num>\d+)$")
 
 
-def _run(cmd, timeout=None, out_path=None):
+# --------------------------------------------------------------------------- #
+# Progress: callers that want a percentage wrap the operation in
+# report_progress(cb); cb(fraction 0..1) is then called from the worker
+# thread as ffmpeg reports how far it has written (-progress pipe:1).
+# --------------------------------------------------------------------------- #
+_progress_local = threading.local()
+_PROGRESS_RE = re.compile(r"^out_time_(?:us|ms)=(\d+)\s*$")
+
+
+@contextmanager
+def report_progress(callback):
+    """Within this block, every ffmpeg run on this thread reports progress
+    to callback(fraction) when its output length is known."""
+    prev = getattr(_progress_local, "cb", None)
+    _progress_local.cb = callback
+    try:
+        yield
+    finally:
+        _progress_local.cb = prev
+
+
+def progress_seconds(line):
+    """Seconds written so far from one ffmpeg -progress line, else None.
+    (ffmpeg's out_time_ms is in microseconds too, despite the name.)"""
+    m = _PROGRESS_RE.match(line.strip())
+    return int(m.group(1)) / 1e6 if m else None
+
+
+def _run_streaming(cmd, timeout, expected, cb):
+    """subprocess.run() look-alike that also feeds ffmpeg's -progress
+    output to cb. Raises subprocess.TimeoutExpired like run() does."""
+    cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + list(cmd[1:])
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True,
+                            encoding="utf-8", errors="replace",
+                            creationflags=CREATE_NO_WINDOW,
+                            startupinfo=_startupinfo())
+    err = []
+    reader = threading.Thread(target=lambda: err.append(proc.stderr.read()),
+                              daemon=True)
+    reader.start()
+    killed = threading.Event()
+
+    def kill():
+        killed.set()
+        proc.kill()
+    timer = threading.Timer(timeout, kill) if timeout else None
+    if timer:
+        timer.daemon = True
+        timer.start()
+    last = -1.0
+    try:
+        for line in proc.stdout:
+            secs = progress_seconds(line)
+            if secs is None:
+                if not line.startswith("progress=end"):
+                    continue
+                secs = expected
+            frac = max(0.0, min(1.0, secs / expected))
+            if frac - last >= 0.005 or frac >= 1.0:
+                last = frac
+                try:
+                    cb(frac)
+                except Exception:  # a UI hiccup must not stop the merge
+                    log.debug("progress callback failed", exc_info=True)
+        proc.wait()
+    finally:
+        if timer:
+            timer.cancel()
+        reader.join(timeout=5)
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                pipe.close()
+            except OSError:
+                log.debug("closing ffmpeg pipe failed", exc_info=True)
+    if killed.is_set():
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return subprocess.CompletedProcess(cmd, proc.returncode, "",
+                                       err[0] if err else "")
+
+
+def _run(cmd, timeout=None, out_path=None, expected=None):
+    cb = getattr(_progress_local, "cb", None)
     log.info("combine: %s", " ".join(cmd))
     try:
-        # encoding pinned: ffmpeg echoes file paths as UTF-8; the default
-        # locale codepage (cp1252) raises UnicodeDecodeError on non-ASCII
-        # recording names and failed the whole merge.
-        res = subprocess.run(cmd, capture_output=True, text=True,
-                             encoding="utf-8", errors="replace",
-                             timeout=timeout,
-                             creationflags=CREATE_NO_WINDOW,
-                             startupinfo=_startupinfo())
+        if cb is not None and expected and expected > 0:
+            res = _run_streaming(cmd, timeout, float(expected), cb)
+        else:
+            # encoding pinned: ffmpeg echoes file paths as UTF-8; the
+            # default locale codepage (cp1252) raises UnicodeDecodeError on
+            # non-ASCII recording names and failed the whole merge.
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace",
+                                 timeout=timeout,
+                                 creationflags=CREATE_NO_WINDOW,
+                                 startupinfo=_startupinfo())
     except subprocess.TimeoutExpired:
         # subprocess.run kills the child before raising; drop the partial file.
         log.error("combine timed out after %ss, ffmpeg killed: %s",
@@ -138,6 +225,20 @@ def _timeout_for(paths):
         if d:
             total += d
     return max(_MIN_TIMEOUT, int(4 * total))
+
+
+def _duration(path):
+    return _probe_media(path)["duration"] or 0.0
+
+
+def _groups_length(groups, durs=None):
+    """Output length of logical tracks played side by side: the longest
+    track, where each track is its rollover parts end to end."""
+    durs = durs or {}
+    best = 0.0
+    for g in groups:
+        best = max(best, sum(durs.get(p) or _duration(p) for p in g))
+    return best
 
 
 def _group_parts(paths):
@@ -273,8 +374,10 @@ def combine_av(video_path, audio_paths, out_path, audio_mode="mix"):
     else:  # single plain audio file
         cmd += ["-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy", "-c:a", "aac", "-b:a", "256k", out_path]
-    return _run(cmd, timeout=_timeout_for([video_path] + files),
-                out_path=out_path)
+    durs = {p: _duration(p) for p in [video_path] + files}
+    timeout = max(_MIN_TIMEOUT, int(4 * sum(durs.values())))
+    expected = max(durs[video_path], _groups_length(groups, durs))
+    return _run(cmd, timeout=timeout, out_path=out_path, expected=expected)
 
 
 def combine_take(video_paths, audio_paths, out_path, audio_mode="mix"):
@@ -326,7 +429,7 @@ def merge_audio_to_channels(audio_paths, out_path):
     filt.append(f"{''.join(pads)}amerge=inputs={len(pads)}[aout]")
     cmd += ["-filter_complex", ";".join(filt), "-map", "[aout]", out_path]
     return _run(cmd, timeout=max(_MIN_TIMEOUT, int(4 * total)),
-                out_path=out_path)
+                out_path=out_path, expected=total)
 
 
 def mix_audio_to_stereo(audio_paths, out_path):
@@ -356,7 +459,9 @@ def mix_audio_to_stereo(audio_paths, out_path):
         filt.append(f"{''.join(pads)}amix=inputs={len(pads)}:normalize=0[aout]")
         cmd += ["-filter_complex", ";".join(filt),
                 "-map", "[aout]", "-ac", "2", out_path]
-    return _run(cmd, timeout=_timeout_for(files), out_path=out_path)
+    durs = {p: _duration(p) for p in files}
+    return _run(cmd, timeout=max(_MIN_TIMEOUT, int(4 * sum(durs.values()))),
+                out_path=out_path, expected=_groups_length(groups, durs))
 
 
 # Output formats offered by the Convert dialog. Maps a friendly label to
@@ -481,7 +586,12 @@ def convert(entry, out_path, fmt_label, audio_mode="mix"):
         cmd += ["-c:a", acodec] + vargs
 
     cmd += [out_path]
-    return _run(cmd, timeout=_timeout_for(all_inputs), out_path=out_path)
+    durs = {p: _duration(p) for p in all_inputs}
+    expected = _groups_length(groups, durs)
+    if want_video:
+        expected = max(expected, durs.get(video) or 0.0)
+    return _run(cmd, timeout=max(_MIN_TIMEOUT, int(4 * sum(durs.values()))),
+                out_path=out_path, expected=expected)
 
 
 def concat_sessions(sessions, out_path, include_video=False):
@@ -523,12 +633,15 @@ def concat_sessions(sessions, out_path, include_video=False):
     seg_video_infos = []   # per session: list of probe dicts (parallel)
     seg_video_dur = []     # per session: summed video duration (or 0.0)
     total_dur = 0.0
+    out_len = 0.0          # expected output length (drives the % shown)
     for s in sessions:
         files = [a for a in s.get("audio", []) if a and os.path.isfile(a)]
         groups = _group_parts(files)
         seg_audio_files.append(groups)
+        adurs = {}
         for a in files:
             d = _probe_media(a)["duration"]
+            adurs[a] = d or 0.0
             if d:
                 total_dur += d
         vids = _svids(s)
@@ -545,6 +658,8 @@ def concat_sessions(sessions, out_path, include_video=False):
         seg_video_files.append(vids)
         seg_video_infos.append(infos)
         seg_video_dur.append(vdur)
+        out_len += (vdur if (do_video and vdur) or not files
+                    else _groups_length(groups, adurs))
 
     if do_video:
         allw = [i["width"] for infos in seg_video_infos for i in infos
@@ -649,4 +764,4 @@ def concat_sessions(sessions, out_path, include_video=False):
         filt.append(f"{ins}concat=n={len(seg_audio_labels)}:v=0:a=1[aout]")
         cmd += ["-filter_complex", ";".join(filt),
                 "-map", "[aout]", out_path]
-    return _run(cmd, timeout=timeout, out_path=out_path)
+    return _run(cmd, timeout=timeout, out_path=out_path, expected=out_len)
