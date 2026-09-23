@@ -657,6 +657,9 @@ class ToggleSwitch(tk.Frame):
                                   font=self.LABEL_FONT, cursor="hand2")
             self.label.pack(side="left", padx=(8, 0))
             self.label.bind("<Button-1>", self._on_click)
+            # Wrap the caption instead of running under a scrollbar when the
+            # pane gets narrow (snapped window on a small laptop).
+            parent.bind("<Configure>", self._fit_label, add="+")
 
         try:
             self._trace = self.var.trace_add("write", lambda *a: self._draw())
@@ -666,6 +669,17 @@ class ToggleSwitch(tk.Frame):
         # raises TclError and aborts every later trace on the same variable.
         self.bind("<Destroy>", self._on_destroy)
         self._draw()
+
+    def _fit_label(self, event):
+        if self.label is None or event.widget is not self.master:
+            return
+        s = ui_scale(self)
+        avail = event.width - self._w_sw - int(32 * s)
+        try:
+            if avail >= int(120 * s):
+                self.label.configure(wraplength=avail, justify="left")
+        except tk.TclError:
+            pass
 
     def _on_destroy(self, event):
         # <Destroy> fires once per descendant; only act on our own.
@@ -937,10 +951,14 @@ class DeviceRow(ttk.Frame):
                 self.combo.grid_configure(columnspan=3)
                 self.mute_btn.grid_configure(row=2, column=3, pady=(6, 0),
                                              padx=(0, 0), sticky="nsew")
+                # Remove shares Mute's column: stretch it so the chooser
+                # runs right up to it (no dead gap in between).
+                self.remove_btn.grid_configure(sticky="nsew")
             else:
                 self.combo.grid_configure(columnspan=2)
                 self.mute_btn.grid_configure(row=0, column=2, pady=0,
                                              padx=(0, 8), sticky="nse")
+                self.remove_btn.grid_configure(sticky="nse")
         except tk.TclError:
             pass
 

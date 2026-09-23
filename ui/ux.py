@@ -430,6 +430,19 @@ def parse_geometry(geom):
     return tuple(int(g) for g in m.groups())
 
 
+def min_window_size(scale, work_w, work_h):
+    """Smallest main-window size (client area, px) at a UI `scale`.
+
+    Never wider than a Windows Snap half of the monitor's work area (minus
+    the resize frame), so the recorder can sit next to Teams/Zoom at 100%,
+    125% and 150% on a 1920 screen; never taller than the work area. Below
+    the design size the panes wrap, ellipsize and scroll instead."""
+    frame = int(16 * scale)
+    w = min(int(820 * scale), work_w // 2 - frame, work_w - 40)
+    h = min(int(560 * scale), work_h - 40)
+    return max(320, w), max(240, h)
+
+
 def sane_geometry(geom, screen_w, screen_h, min_w=400, min_h=300,
                   bounds=None):
     """Validate a saved 'WxH+X+Y' so it fits on screen; returns a (possibly

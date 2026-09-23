@@ -255,9 +255,10 @@ class App(tk.Tk):
                                                        if g else None)
         pl, pt, pr, pb = work_area(self)[0]  # primary monitor
         pw, ph = pr - pl, pb - pt
-        # Small enough for a snapped half of a 1920 screen at 150%, big
-        # enough that nothing important is hidden (panes scroll below this).
-        self.minsize(min(int(820 * s), pw - 40), min(int(560 * s), ph - 40))
+        # Fits a Snap half of the monitor at any scale (960 px on a 1920
+        # screen at 100/125/150%); below the design size panes wrap/scroll.
+        self.minsize(*ux.min_window_size(s, min(pw, right - left),
+                                         min(ph, bottom - top)))
         geom = ux.sane_geometry(self.cfg.get("window_geometry"), pw, ph,
                                 bounds=(left, top, right, bottom))
         if geom:

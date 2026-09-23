@@ -221,3 +221,22 @@ class GeometryBoundsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MinWindowSizeTests(unittest.TestCase):
+    """A Windows Snap half of a 1920x1040 work area is 960 px wide; the
+    minimum size must allow it at the common laptop scales."""
+
+    def test_snap_half_fits_at_common_scales(self):
+        for scale in (1.0, 1.25, 1.5, 2.0):
+            w, h = ux.min_window_size(scale, 1920, 1040)
+            self.assertLessEqual(w, 960 - 16, scale)
+            self.assertLessEqual(h, 1040 - 40, scale)
+
+    def test_design_size_kept_when_there_is_room(self):
+        self.assertEqual(ux.min_window_size(1.0, 3840, 2100), (820, 560))
+
+    def test_small_screen(self):
+        w, h = ux.min_window_size(1.0, 1366, 728)
+        self.assertLessEqual(w, 683)
+        self.assertEqual(h, 560)
