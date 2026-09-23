@@ -57,6 +57,7 @@ from ui.widgets import (
     apply_dark_theme,
     set_dark_titlebar,
     ui_scale,
+    work_area,
 )
 
 log = get_logger("gui")
@@ -234,30 +235,29 @@ class App(tk.Tk):
         log.info("GUI ready. %d devices.", len(self.all_devices))
 
     def _place_window(self):
-        """Restore the last window size/position when it still fits this
-        screen; otherwise size proportionally and start maximized."""
+        """Restore the last window size/position when it still fits the
+        monitor it was on (secondary monitors included); otherwise size
+        proportionally on the primary monitor and start maximized."""
         s = self._s
-        try:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            # A single monitor's height; with vertically stacked monitors
-            # winfo_screenheight can report the combined height, so clamp it.
-            mon_h = sh if sh < 2000 else sh // 2
-        except tk.TclError:
-            sw, mon_h = 1366, 768
+        g = ux.parse_geometry(self.cfg.get("window_geometry"))
+        (left, top, right, bottom), _found = work_area(self, g[2:] + g[:2]
+                                                       if g else None)
+        pl, pt, pr, pb = work_area(self)[0]  # primary monitor
+        pw, ph = pr - pl, pb - pt
         # Small enough for a snapped half of a 1920 screen at 150%, big
         # enough that nothing important is hidden (panes scroll below this).
-        self.minsize(min(int(820 * s), sw - 40), min(int(560 * s), mon_h - 80))
-        geom = ux.sane_geometry(self.cfg.get("window_geometry"), sw, mon_h)
+        self.minsize(min(int(820 * s), pw - 40), min(int(560 * s), ph - 40))
+        geom = ux.sane_geometry(self.cfg.get("window_geometry"), pw, ph,
+                                bounds=(left, top, right, bottom))
         if geom:
             self.geometry(geom)
             zoom = bool(self.cfg.get("window_zoomed"))
         else:
-            w = max(min(sw - 40, int(1000 * s)), int(sw * 0.66))
-            h = max(min(mon_h - 80, int(700 * s)), int(mon_h * 0.85))
-            w, h = min(w, sw), min(h, mon_h)
-            x = max(0, (sw - w) // 2)
-            y = max(0, (mon_h - h) // 3)
+            w = max(min(pw - 40, int(1000 * s)), int(pw * 0.66))
+            h = max(min(ph - 40, int(700 * s)), int(ph * 0.85))
+            w, h = min(w, pw), min(h, ph)
+            x = pl + max(0, (pw - w) // 2)
+            y = pt + max(0, (ph - h) // 3)
             self.geometry(f"{w}x{h}+{x}+{y}")
             zoom = True
         if zoom:
@@ -1307,18 +1307,20 @@ class App(tk.Tk):
         # clamped to the screen so Close is always reachable.
         win.update_idletasks()
         try:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-            mon_h = sh if sh < 2000 else sh // 2  # stacked-monitor clamp
+            # Fit the monitor the main window is on (not half the virtual
+            # screen, and not always the primary one).
+            (ml, mt, mr, mb), _ = work_area(self, (
+                self.winfo_rootx(), self.winfo_rooty(),
+                self.winfo_width(), self.winfo_height()))
             need_w = max(b.winfo_reqwidth() for b in bodies) + int(60 * s)
             need_h = (max(b.winfo_reqheight() for b in bodies)
                       + bottom.winfo_reqheight() + int(110 * s))
-            w = min(max(need_w, int(600 * s)), sw - 40)
-            h = min(max(need_h, int(440 * s)), mon_h - 80)
+            w = min(max(need_w, int(600 * s)), mr - ml - 40)
+            h = min(max(need_h, int(440 * s)), mb - mt - 60)
             x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
             y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 4)
-            x = max(0, min(x, sw - w))
-            y = max(0, min(y, mon_h - h - 40))
+            x = max(ml, min(x, mr - w))
+            y = max(mt, min(y, mb - h - 40))
             win.geometry(f"{w}x{h}+{x}+{y}")
             win.minsize(min(int(520 * s), w), min(int(380 * s), h))
         except (tk.TclError, ValueError):

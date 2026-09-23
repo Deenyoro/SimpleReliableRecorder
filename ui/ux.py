@@ -404,25 +404,45 @@ def friendly_error(text):
 # --------------------------------------------------------------------------- #
 # Window geometry persistence
 # --------------------------------------------------------------------------- #
-_GEOM_RE = re.compile(r"^(\d+)x(\d+)([+-]-?\d+)([+-]-?\d+)$")
+_GEOM_RE = re.compile(r"^(\d+)x(\d+)([+-]\d+)([+-]\d+)$")
 
 
-def sane_geometry(geom, screen_w, screen_h, min_w=400, min_h=300):
-    """Validate a saved 'WxH+X+Y' so it fits the current screen; returns a
-    (possibly clamped) geometry string, or None when unusable (e.g. the saved
-    monitor is gone). Never restores a window off-screen."""
-    m = _GEOM_RE.match((geom or "").strip())
+def parse_geometry(geom):
+    """'WxH+X+Y' (Tk writes '+-1920+0' for a monitor left of the primary)
+    -> (w, h, x, y), or None."""
+    m = _GEOM_RE.match((geom or "").strip().replace("+-", "-"))
     if not m:
         return None
-    w, h = int(m.group(1)), int(m.group(2))
-    x, y = int(m.group(3)), int(m.group(4))
+    return tuple(int(g) for g in m.groups())
+
+
+def sane_geometry(geom, screen_w, screen_h, min_w=400, min_h=300,
+                  bounds=None):
+    """Validate a saved 'WxH+X+Y' so it fits on screen; returns a (possibly
+    clamped) geometry string, or None when unusable.
+
+    `bounds` = (left, top, right, bottom) of the area the window must fit
+    in - on Windows the work area of the monitor the window was saved on
+    (which may have negative coordinates), or of the primary monitor when
+    that monitor is gone. Defaults to the whole (screen_w x screen_h)
+    screen. The window is shrunk to fit and moved fully inside."""
+    g = parse_geometry(geom)
+    if g is None:
+        return None
+    w, h, x, y = g
     if w < min_w or h < min_h:
         return None
-    w, h = min(w, screen_w), min(h, screen_h)
-    # At least 120 px of the title bar must remain on the screen.
-    if x > screen_w - 120 or x + w < 120 or y < -8 or y > screen_h - 60:
-        x = max(0, (screen_w - w) // 2)
-        y = max(0, (screen_h - h) // 3)
-    x = max(-8, min(x, screen_w - 120))
-    y = max(0, min(y, screen_h - 60))
-    return f"{w}x{h}+{x}+{y}"
+    left, top, right, bottom = bounds or (0, 0, screen_w, screen_h)
+    aw, ah = max(1, right - left), max(1, bottom - top)
+    w, h = min(w, aw), min(h, ah)
+    # Mostly outside the area (e.g. saved on a monitor that is gone):
+    # centre it instead of just nudging a sliver into view.
+    if x >= right - 120 or x + w <= left + 120 or y >= bottom - 60 \
+            or y + h <= top + 60:
+        x = left + (aw - w) // 2
+        y = top + (ah - h) // 3
+    # Fully inside. A window snapped to the left edge legitimately sits a
+    # few px left of it (Windows 10/11 frames have an invisible border).
+    x = max(left - 8, min(x, right - w))
+    y = max(top, min(y, bottom - h))
+    return f"{w}x{h}+{x}+{y}"  # Tk reads '+-1920' as x = -1920

@@ -318,6 +318,57 @@ def set_dark_titlebar(win):
         pass
 
 
+def _win_rect_work_area(rect=None):
+    """Windows only: work area (left, top, right, bottom) of the monitor
+    that contains `rect` = (x, y, w, h), or of the primary monitor when
+    rect is None. None when rect is on no monitor, or not on Windows."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+        user32 = ctypes.windll.user32
+        if rect is None:
+            hmon = user32.MonitorFromPoint(wintypes.POINT(0, 0), 1)  # PRIMARY
+        else:
+            x, y, w, h = rect
+            r = wintypes.RECT(int(x), int(y), int(x + w), int(y + h))
+            hmon = user32.MonitorFromRect(ctypes.byref(r), 0)  # DEFAULTTONULL
+        if not hmon:
+            return None
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(info)):
+            return None
+        wa = info.rcWork
+        return (wa.left, wa.top, wa.right, wa.bottom)
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def work_area(widget, rect=None):
+    """Where a window may go: on Windows the work area (taskbar excluded)
+    of the monitor holding `rect` (primary when rect is None or on no
+    monitor); elsewhere Tk's screen size. Returns (left, top, right,
+    bottom) and whether rect was found on a monitor."""
+    wa = _win_rect_work_area(rect)
+    if wa is not None:
+        return wa, True
+    if sys.platform == "win32":
+        prim = _win_rect_work_area(None)
+        if prim is not None:
+            return prim, rect is None
+    try:
+        sw, sh = widget.winfo_screenwidth(), widget.winfo_screenheight()
+    except tk.TclError:
+        sw, sh = 1366, 768
+    return (0, 0, sw, sh), True
+
+
 class Tooltip:
     """Delayed, theme-matched hover tooltip for any widget."""
 

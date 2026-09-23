@@ -80,5 +80,14 @@ class ToggleSwitchTests(unittest.TestCase):
         self.assertTrue(var.get())
 
 
+class WorkAreaTests(unittest.TestCase):
+    def test_work_area_is_a_real_rectangle(self):
+        root = _root_or_skip(self)
+        (left, top, right, bottom), found = widgets.work_area(root)
+        self.assertTrue(found)
+        self.assertGreater(right - left, 200)
+        self.assertGreater(bottom - top, 200)
+
+
 if __name__ == "__main__":
     unittest.main()
