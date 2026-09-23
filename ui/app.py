@@ -532,11 +532,17 @@ class App(tk.Tk):
             if self.settings_win is None:
                 # Never silent: say it where the user is looking.
                 self._show_strip(
-                    "warn", "Hotkey is off",
-                    f"The push-to-talk key '{key}' couldn't be set up "
-                    "(another app may be using it).",
+                    "warn", "Hotkey is off", self._hotkey_problem(key),
                     [("Change key...", lambda: self._open_settings(tab=3))])
         self._update_hotkey_status()
+
+    @staticmethod
+    def _hotkey_problem(key):
+        if not hotkeys.is_valid_hotkey(key):
+            return (f"'{key}' isn't a key name the hotkey can use. Click "
+                    "'Set key...' and pick another key.")
+        return (f"Couldn't use '{key}' - another app may own it. Try "
+                "another key.")
 
     def _update_hotkey_status(self):
         lbl = self._hotkey_status_lbl
@@ -553,8 +559,7 @@ class App(tk.Tk):
                 lbl.configure(text="Choose a key to turn the hotkey on.",
                               style="PanelWarn.TLabel")
             elif not self._hotkey_ok:
-                lbl.configure(text=f"Couldn't use '{key}' - another app may "
-                                   "own it. Try another key.",
+                lbl.configure(text=self._hotkey_problem(key),
                               style="PanelError.TLabel")
             else:
                 lbl.configure(text=f"Active: {key}",
@@ -1366,6 +1371,10 @@ class App(tk.Tk):
                 return "break"
             combo = ux.hotkey_from_event(e.keysym, int(e.state),
                                          windows=(sys.platform == "win32"))
+            if combo and not hotkeys.is_valid_hotkey(combo):
+                shown.configure(text=f"'{combo}' can't be used as a "
+                                     "hotkey. Try a function key (F1-F12).")
+                return "break"
             if combo:
                 shown.configure(text=combo)
                 self.ptt_hotkey_var.set(combo)
