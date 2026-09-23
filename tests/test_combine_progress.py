@@ -36,6 +36,9 @@ FAKE_FFMPEG = textwrap.dedent('''\
     import sys, time
     mode = "{mode}"
     sys.stderr.write("ffmpeg version fake\\n")
+    if mode == "slow" and len(sys.argv) > 1 and sys.argv[-1].endswith(".mp4"):
+        with open(sys.argv[-1], "w") as fh:  # a half-written output file
+            fh.write("partial")
     for us in (0, 2500000, 5000000, 7500000):
         print("out_time_us=%d" % us)
         print("progress=continue", flush=True)
@@ -87,6 +90,45 @@ class StreamingRunTests(unittest.TestCase):
         ok, _detail = combine._run([self._fake("ok")], timeout=30,
                                    expected=10.0)
         self.assertTrue(ok)
+
+
+@unittest.skipUnless(os.name == "posix", "fake ffmpeg is a shebang script")
+class CancelRunningJobTests(unittest.TestCase):
+    """Cancel stops the job that is running (not only queued ones): ffmpeg
+    is killed, the unfinished file is removed, the result says so."""
+
+    _fake = StreamingRunTests._fake
+
+    def test_cancel_kills_ffmpeg_and_drops_the_partial_file(self):
+        import threading
+        import time
+        out = os.path.join(tempfile.mkdtemp(prefix="srr-cancel-"), "o.mp4")
+        token = combine.CancelToken()
+        threading.Timer(0.8, token.cancel).start()
+        t0 = time.monotonic()
+        with combine.cancellable(token):
+            ok, detail = combine._run([self._fake("slow"), "-i", "in.wav",
+                                       out], timeout=60, out_path=out)
+        self.assertLess(time.monotonic() - t0, 3.0, "ffmpeg was not stopped")
+        self.assertFalse(ok)
+        self.assertEqual(detail, combine.CANCELLED)
+        self.assertFalse(os.path.exists(out))
+
+    def test_cancelled_job_does_not_start_another_run(self):
+        token = combine.CancelToken()
+        token.cancel()
+        with combine.cancellable(token):
+            ok, detail = combine._run(["/nonexistent/ffmpeg"], timeout=5)
+        self.assertEqual((ok, detail), (False, combine.CANCELLED))
+
+    def test_progress_still_reported_with_a_token(self):
+        seen = []
+        with combine.report_progress(seen.append), \
+                combine.cancellable(combine.CancelToken()):
+            ok, _detail = combine._run([self._fake("ok")], timeout=30,
+                                       expected=10.0)
+        self.assertTrue(ok)
+        self.assertEqual(seen[-1], 1.0)
 
 
 if __name__ == "__main__":

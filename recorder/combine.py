@@ -58,6 +58,64 @@ def report_progress(callback):
         _progress_local.cb = prev
 
 
+# --------------------------------------------------------------------------- #
+# Cancel: a job wrapped in cancellable(token) runs its ffmpeg through Popen
+# and registers the process on the token, so token.cancel() from the UI
+# thread stops it; the unfinished output file is then dropped the same way
+# as after a timeout.
+# --------------------------------------------------------------------------- #
+CANCELLED = "Cancelled - the unfinished file was removed."
+
+
+class CancelToken:
+    """Thread-safe 'stop this job': kills the ffmpeg that is running for it
+    (if any) and makes later runs of the same job return at once."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self.cancelled = False
+
+    def cancel(self):
+        with self._lock:
+            self.cancelled = True
+            proc = self._proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:
+                log.debug("killing ffmpeg on cancel failed", exc_info=True)
+
+    def _attach(self, proc):
+        with self._lock:
+            self._proc = proc
+            return self.cancelled
+
+    def _detach(self):
+        with self._lock:
+            self._proc = None
+
+
+class _Cancelled(subprocess.TimeoutExpired):
+    """The user pressed Cancel. A TimeoutExpired so the one cleanup path
+    that drops the unfinished output file handles both."""
+
+    def __init__(self, cmd):
+        super().__init__(cmd, 0)
+
+
+@contextmanager
+def cancellable(token):
+    """Within this block, every ffmpeg run on this thread can be stopped
+    with token.cancel()."""
+    prev = getattr(_progress_local, "token", None)
+    _progress_local.token = token
+    try:
+        yield token
+    finally:
+        _progress_local.token = prev
+
+
 def progress_seconds(line):
     """Seconds written so far from one ffmpeg -progress line, else None.
     (ffmpeg's out_time_ms is in microseconds too, despite the name.)"""
@@ -65,9 +123,11 @@ def progress_seconds(line):
     return int(m.group(1)) / 1e6 if m else None
 
 
-def _run_streaming(cmd, timeout, expected, cb):
+def _run_streaming(cmd, timeout, expected, cb, token=None):
     """subprocess.run() look-alike that also feeds ffmpeg's -progress
-    output to cb. Raises subprocess.TimeoutExpired like run() does."""
+    output to cb (when given and the length is known) and can be stopped
+    through `token`. Raises subprocess.TimeoutExpired like run() does, and
+    _Cancelled when the token stopped it."""
     cmd = [cmd[0], "-progress", "pipe:1", "-nostats"] + list(cmd[1:])
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True,
@@ -78,6 +138,8 @@ def _run_streaming(cmd, timeout, expected, cb):
     reader = threading.Thread(target=lambda: err.append(proc.stderr.read()),
                               daemon=True)
     reader.start()
+    if token is not None and token._attach(proc):
+        proc.kill()  # cancelled between the check in _run and Popen
     killed = threading.Event()
 
     def kill():
@@ -90,6 +152,8 @@ def _run_streaming(cmd, timeout, expected, cb):
     last = -1.0
     try:
         for line in proc.stdout:
+            if cb is None or not expected:
+                continue
             secs = progress_seconds(line)
             if secs is None:
                 if not line.startswith("progress=end"):
@@ -106,12 +170,16 @@ def _run_streaming(cmd, timeout, expected, cb):
     finally:
         if timer:
             timer.cancel()
+        if token is not None:
+            token._detach()
         reader.join(timeout=5)
         for pipe in (proc.stdout, proc.stderr):
             try:
                 pipe.close()
             except OSError:
                 log.debug("closing ffmpeg pipe failed", exc_info=True)
+    if token is not None and token.cancelled:
+        raise _Cancelled(cmd)
     if killed.is_set():
         raise subprocess.TimeoutExpired(cmd, timeout)
     return subprocess.CompletedProcess(cmd, proc.returncode, "",
@@ -120,10 +188,15 @@ def _run_streaming(cmd, timeout, expected, cb):
 
 def _run(cmd, timeout=None, out_path=None, expected=None):
     cb = getattr(_progress_local, "cb", None)
+    token = getattr(_progress_local, "token", None)
+    if token is not None and token.cancelled:
+        return False, CANCELLED
     log.info("combine: %s", " ".join(cmd))
     try:
-        if cb is not None and expected and expected > 0:
-            res = _run_streaming(cmd, timeout, float(expected), cb)
+        if token is not None or (cb is not None and expected
+                                 and expected > 0):
+            res = _run_streaming(cmd, timeout, float(expected or 0), cb,
+                                 token)
         else:
             # encoding pinned: ffmpeg echoes file paths as UTF-8; the
             # default locale codepage (cp1252) raises UnicodeDecodeError on
@@ -133,15 +206,22 @@ def _run(cmd, timeout=None, out_path=None, expected=None):
                                  timeout=timeout,
                                  creationflags=CREATE_NO_WINDOW,
                                  startupinfo=_startupinfo())
-    except subprocess.TimeoutExpired:
-        # subprocess.run kills the child before raising; drop the partial file.
-        log.error("combine timed out after %ss, ffmpeg killed: %s",
-                  timeout, out_path)
+    except subprocess.TimeoutExpired as exc:
+        # subprocess.run kills the child before raising (and Cancel kills
+        # the streaming one); drop the partial file.
+        cancelled = isinstance(exc, _Cancelled)
+        if cancelled:
+            log.info("combine cancelled by the user: %s", out_path)
+        else:
+            log.error("combine timed out after %ss, ffmpeg killed: %s",
+                      timeout, out_path)
         if out_path:
             try:
                 os.remove(out_path)
             except OSError:
                 pass
+        if cancelled:
+            return False, CANCELLED
         raise RuntimeError(
             f"ffmpeg did not finish within {timeout} seconds and was stopped. "
             "The incomplete output file was removed; the original recordings "
