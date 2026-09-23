@@ -2443,6 +2443,7 @@ class App(tk.Tk):
         if bind_return:
             win.bind("<Return>", on_return)
         win.bind("<Escape>", lambda e: cancel())
+        self._add_mnemonics(win)
         win.protocol("WM_DELETE_WINDOW", cancel)
         win.update_idletasks()
         try:
@@ -2465,6 +2466,43 @@ class App(tk.Tk):
         except tk.TclError:
             pass  # not viewable yet; the dialog still works without a grab
         (focus or win).focus_set()
+
+    @staticmethod
+    def _add_mnemonics(win):
+        """Windows-style Alt+letter access keys for a dialog's buttons: the
+        first free letter of each label is underlined and Alt+letter
+        presses it (e.g. Alt+K = Keep recording, Alt+S = Stop and quit)."""
+        buttons = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if isinstance(c, ttk.Button):
+                    buttons.append(c)
+                walk(c)
+        walk(win)
+        used = set()
+        for b in buttons:
+            try:
+                text = str(b.cget("text"))
+            except tk.TclError:
+                continue
+            for i, ch in enumerate(text):
+                k = ch.lower()
+                if k.isalpha() and k not in used:
+                    used.add(k)
+                    b.configure(underline=i)
+                    win.bind(f"<Alt-KeyPress-{k}>",
+                             lambda e, b=b: App._mnemonic(e, b))
+                    break
+
+    @staticmethod
+    def _mnemonic(event, button):
+        # AltGr arrives as Ctrl+Alt on Windows: AltGr+Q types '@' on a
+        # German keyboard and must not press a button.
+        if int(event.state) & ux.STATE_CONTROL:
+            return None
+        button.invoke()
+        return "break"
 
     def _dialog_body(self, win, heading, message, kind="info"):
         """Heading + wrapped message in a padded frame; returns the frame."""
