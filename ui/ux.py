@@ -323,19 +323,28 @@ def total_size(paths_):
 # still fit, so a narrow (snapped) window drops Contents first instead of
 # squeezing Name to a few letters or pushing Size off the edge.
 LIBRARY_COLUMN_ORDER = ("name", "created", "length", "contents", "size")
-LIBRARY_COLUMN_PRIORITY = ("created", "length", "size", "contents")
+# Length before Recorded: an auto-named take's Name already IS its date, so
+# Recorded is the first thing to give up for Name's sake.
+LIBRARY_COLUMN_PRIORITY = ("length", "created", "size", "contents")
 
 
-def library_columns(avail, widths, name_min):
+def library_columns(avail, widths, name_min, name_want=None):
     """Return the columns to display (in display order) for a list that is
-    `avail` px wide, given each optional column's preferred width."""
+    `avail` px wide, given each optional column's preferred width.
+
+    Length only needs Name to keep `name_min`; every other column is shown
+    only while Name still gets `name_want` (a whole auto-generated name), so
+    'Recording 22 Sep 2026, 16:40' is not cut to keep a Recorded column that
+    repeats its date."""
+    want = max(name_min, name_want or name_min)
     shown = {"name"}
-    used = name_min
+    extra = 0
     for col in LIBRARY_COLUMN_PRIORITY:
         w = widths.get(col, 0)
-        if used + w <= avail:
+        need = name_min if col == "length" else want
+        if need + extra + w <= avail:
             shown.add(col)
-            used += w
+            extra += w
     return [c for c in LIBRARY_COLUMN_ORDER if c in shown]
 
 

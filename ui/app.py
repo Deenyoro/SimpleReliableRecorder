@@ -1804,6 +1804,7 @@ class App(tk.Tk):
             "size": f.measure("999 MB") + pad,
         }
         self._lib_name_min = f.measure("Recording 22 Sep 20") + pad
+        self._lib_name_want = f.measure("Recording 22 Sep 2026, 16:40") + pad
         self._lib_cols_shown = None
         self._lib_font = f
         self._lib_name_px = 0
@@ -1886,7 +1887,7 @@ class App(tk.Tk):
         if avail <= 1:
             return
         shown = ux.library_columns(avail - 4, self._lib_col_widths,
-                                   self._lib_name_min)
+                                   self._lib_name_min, self._lib_name_want)
         if shown != self._lib_cols_shown:
             self._lib_cols_shown = shown
             tree.configure(displaycolumns=shown)
@@ -2162,7 +2163,12 @@ class App(tk.Tk):
         has_media = any(e.get("audio") or e.get("video") for e in sel)
         self.lib_btn_transcribe.state(["!disabled"] if has_media
                                       else ["disabled"])
-        text = f"{ux.plural(n, 'recording')} selected."
+        if n == 1:
+            # The full name, even when the list had to shorten it with '…'.
+            name = ux.friendly_recording_name(sel[0].get("name", ""))
+            text = f"Selected: {name}."
+        else:
+            text = f"{ux.plural(n, 'recording')} selected."
         if any_video and not all_video:
             text += (" 'Make one video' needs a screen recording in every "
                      "selected one.")

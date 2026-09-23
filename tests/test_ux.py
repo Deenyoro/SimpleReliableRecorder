@@ -175,6 +175,21 @@ class LibraryColumnTests(unittest.TestCase):
         self.assertEqual(ux.library_columns(500, self.W, 180),
                          ["name", "created", "length", "size"])
 
+    def test_narrow_list_keeps_length_before_recorded(self):
+        # Room for one small column only: Length wins, the date-like
+        # Recorded column goes (an auto name already carries the date).
+        self.assertEqual(ux.library_columns(260, self.W, 180),
+                         ["name", "length"])
+
+    def test_recorded_goes_before_an_auto_name_is_cut(self):
+        # 180 (min) + 70 + 150 = 400 fits, but the whole name wants 250:
+        # Recorded would only repeat the date the name already shows, so it
+        # is skipped (a small Size column still fits beside the full name).
+        self.assertEqual(ux.library_columns(420, self.W, 180, 250),
+                         ["name", "length", "size"])
+        self.assertEqual(ux.library_columns(480, self.W, 180, 250),
+                         ["name", "created", "length"])
+
     def test_tiny_list_keeps_a_readable_name(self):
         self.assertEqual(ux.library_columns(200, self.W, 180), ["name"])
 
