@@ -148,6 +148,11 @@ class App(tk.Tk):
         self._record_start_mono = 0.0
         self._take_id = 0
         self._restart_inflight = {}
+        # CaptureSource lists handed to a worker that is still opening the
+        # devices (async start / mid-take restart). Mute and Volume changes
+        # made in that window are written straight into them, so the take
+        # never runs with a stale mute - that is a privacy promise.
+        self._pending_sources = []
         self.last_outputs = {}
         self._restart_cooldown = {}
         self._restart_counts = {}
@@ -166,8 +171,8 @@ class App(tk.Tk):
         # Output paths promised to queued/running jobs but not on disk yet, so
         # _unique_path can't hand the same name to two queued jobs.
         self._pending_out_paths = set()
-        # Fallback lane for UI callbacks whose after() scheduling failed (see
-        # _safe_after); drained by _poll so completions can never be lost.
+        # Worker threads hand their UI callbacks to the Tk thread through this
+        # queue (see _safe_after / _pump_ui_calls).
         self._ui_calls = queue.Queue()
         self._transcribe_busy = False
         # Optional Scrivox integration: when no Scrivox install is found, every
@@ -218,6 +223,7 @@ class App(tk.Tk):
         self._setup_hotkeys()
         self._install_shortcuts()
         self._poll()
+        self._pump_ui_calls()
         self._meter_loop()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.bind("<Configure>", self._track_geometry, add="+")
@@ -348,23 +354,41 @@ class App(tk.Tk):
 
     # ------------------------------------------------------- tray + hotkeys #
     def _safe_after(self, fn):
-        """Schedule fn on the Tk thread, ignoring it if we're shutting down or
-        the interpreter is already gone (prevents TclError from tray/hotkey
-        threads firing into a destroyed window)."""
+        """Schedule fn on the Tk thread, ignoring it if we're shutting down.
+
+        Worker threads (recorder start/stop, combine, tray, hotkeys) never
+        call into Tk themselves - a Tk call from another thread can crash or
+        deadlock on Windows. They drop the callback into a queue that the Tk
+        thread drains every few milliseconds (_pump_ui_calls)."""
+        if getattr(self, "_closing", False):
+            return
+        if threading.current_thread() is threading.main_thread():
+            try:
+                self.after(0, fn)
+                return
+            except Exception:
+                pass
+        try:
+            self._ui_calls.put(fn)
+        except Exception:
+            pass
+
+    def _pump_ui_calls(self):
+        """Tk thread: run callbacks queued by worker threads. Each one is
+        guarded on its own so one failure can't starve the rest."""
         if getattr(self, "_closing", False):
             return
         try:
-            self.after(0, fn)
-        except Exception:
-            # after() from a worker thread can fail while the main thread is
-            # not dispatching events (e.g. a blocking wait loop). Silently
-            # dropping the callback here once left _combine_busy stuck True
-            # forever - every later merge was refused with "already running".
-            # Park the callback instead; _poll runs it on the Tk thread.
-            try:
-                self._ui_calls.put(fn)
-            except Exception:
-                pass
+            for _ in range(50):
+                fn = self._ui_calls.get_nowait()
+                try:
+                    fn()
+                except Exception as e:
+                    self._poll_err("uicall", e)
+        except queue.Empty:
+            pass
+        if not getattr(self, "_closing", False):
+            self.after(40, self._pump_ui_calls)
 
     def report_callback_exception(self, exc, val, tb):
         """Tk swallows callback exceptions into stderr - which is None in a
@@ -3245,6 +3269,7 @@ class App(tk.Tk):
             label = row.current_source_label()
             g = row.get_gain()
             if label:
+                self._set_pending_level(label, gain=g)
                 if self.recording and self.audio_rec:
                     self.audio_rec.set_gain(label, g)
                 elif self.level_monitor:
@@ -3254,6 +3279,7 @@ class App(tk.Tk):
             label = row.current_source_label()
             m = row.is_muted()
             if label:
+                self._set_pending_level(label, muted=m)
                 if self.recording and self.audio_rec:
                     self.audio_rec.set_muted(label, m)
                 if self.level_monitor:
@@ -3265,6 +3291,38 @@ class App(tk.Tk):
             self._save_settings()
             self._check_duplicate_rows()
             self._refresh_monitor()
+
+    def _set_pending_level(self, label, gain=None, muted=None):
+        """Apply a Mute/Volume change to sources a worker is still opening
+        (the recorder reads these objects, so it takes effect at once)."""
+        for sources in self._pending_sources:
+            for src in sources:
+                if src.label != label:
+                    continue
+                if gain is not None:
+                    src.gain = float(gain)
+                if muted is not None:
+                    src.muted = bool(muted)
+
+    def _drop_pending(self, sources):
+        self._pending_sources = [p for p in self._pending_sources
+                                 if p is not sources]
+
+    def _apply_row_levels(self, rec):
+        """Push every card's current Mute and Volume into a recorder that
+        just finished opening - whatever the user (or the push-to-talk key)
+        changed while it was starting wins over the values it started with."""
+        if rec is None:
+            return
+        for row in self._device_rows:
+            label = row.current_source_label()
+            if not label:
+                continue
+            try:
+                rec.set_gain(label, row.get_gain())
+                rec.set_muted(label, row.is_muted())
+            except Exception:
+                log.debug("re-applying levels failed", exc_info=True)
 
     def _remove_row(self, row):
         if self.recording or self._starting:
@@ -3486,6 +3544,7 @@ class App(tk.Tk):
         # encoders, ~1.3 s each) happens on a worker so the window never
         # shows "Not Responding" right after Record is pressed.
         self._set_starting_ui(True)
+        self._pending_sources.append(plan["sources"])
 
         def work():
             res = self._start_worker(plan)
@@ -3643,6 +3702,7 @@ class App(tk.Tk):
         """Back on the Tk thread: enter the recording state, or explain why
         nothing started."""
         self._starting = False
+        self._drop_pending(plan["sources"])
         if self._closing or self._quitting:
             # The user quit while we were starting: finalize whatever opened.
             for rec in (res["audio"], res["screen"]):
@@ -3663,6 +3723,7 @@ class App(tk.Tk):
             return
         self.audio_rec = res["audio"]
         self.screen_rec = res["screen"]
+        self._apply_row_levels(self.audio_rec)
         if self.audio_rec is not None:
             self.last_outputs["audio"] = list(self.audio_rec.output_files)
         if self.screen_rec is not None:
@@ -4135,6 +4196,7 @@ class App(tk.Tk):
         sr = int(self.cfg.get("audio_target_samplerate"))
         take = self._take_id
         self._restart_inflight["audio"] = True
+        self._pending_sources.append(sources)
 
         def work():
             rec = None
@@ -4146,11 +4208,14 @@ class App(tk.Tk):
             except Exception as e:
                 log.exception("Audio restart failed: %s", e)
                 rec = None
-            self._safe_after(lambda: self._restart_audio_done(take, rec))
+            self._safe_after(lambda: self._restart_audio_done(take, rec,
+                                                              sources))
         threading.Thread(target=work, name="audio-restart", daemon=True).start()
 
-    def _restart_audio_done(self, take, rec):
+    def _restart_audio_done(self, take, rec, sources=None):
         self._restart_inflight["audio"] = False
+        if sources is not None:
+            self._drop_pending(sources)
         if rec is None:
             return
         if not self.recording or take != self._take_id:
@@ -4166,6 +4231,7 @@ class App(tk.Tk):
             threading.Thread(target=_stop, daemon=True).start()
             return
         self.audio_rec = rec
+        self._apply_row_levels(rec)
         self.last_outputs.setdefault("audio", []).extend(rec.output_files)
         log.info("Audio subsystem restarted -> %s", rec.output_files)
         self._note_recovered("Audio recording")
@@ -4293,17 +4359,6 @@ class App(tk.Tk):
             self._drain_log()
         except Exception as e:
             self._poll_err("log", e)
-        # Run any UI callbacks whose direct after() scheduling failed. Each is
-        # guarded on its own so one bad callback can't starve the rest.
-        try:
-            for _ in range(50):
-                fn = self._ui_calls.get_nowait()
-                try:
-                    fn()
-                except Exception as e:
-                    self._poll_err("uicall", e)
-        except queue.Empty:
-            pass
         if self.recording:
             try:
                 self._update_status_lights()
