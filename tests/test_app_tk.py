@@ -58,6 +58,8 @@ class _Stand:
     _combine_done = App._combine_done if App else None
     _combine_progress = App._combine_progress if App else None
     _combine_progress_text = App._combine_progress_text if App else None
+    _update_cancel_button = App._update_cancel_button if App else None
+    _cancel_queued_jobs = App._cancel_queued_jobs if App else None
     start_recording = App.start_recording if App else None
     _build_strip = App._build_strip if App else None
     _layout_strip = App._layout_strip if App else None
@@ -282,6 +284,55 @@ class SavedStripTests(unittest.TestCase):
                                  close.winfo_rootx(), b.cget("text"))
         info = self._st._strip_actions.grid_info()
         self.assertEqual((int(info["row"]), int(info["columnspan"])), (0, 1))
+
+
+@unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
+class CancelRunningJobTests(unittest.TestCase):
+    def test_cancel_stops_the_running_job(self):
+        root = _root_or_skip(self)
+        st = _Stand(root)
+        foot = ttk.Frame(root)
+        foot.pack()
+        st.busy_lbl = ttk.Label(foot)
+        st.busy_bar = ttk.Progressbar(foot, mode="indeterminate", length=100)
+        st.busy_cancel = ttk.Button(foot, text="Cancel",
+                                    command=st._cancel_queued_jobs)
+        st._transcribe_busy = False
+        st._combine_busy = False
+        st._combine_queue, st._combine_results = [], []
+        st._combine_total = 0
+        st._pending_out_paths = set()
+        st._refresh_library = lambda *a, **k: None
+        strips = []
+        st._show_strip = lambda *a, **k: strips.append(a)
+        st._error = lambda *a, **k: strips.append(("ERROR",) + a)
+        st._pump_ui_calls()
+        started = threading.Event()
+
+        def job():  # stands in for ffmpeg: runs until the token says stop
+            from recorder import combine
+            started.set()
+            token = combine._progress_local.token
+            end = time.monotonic() + 10
+            while not token.cancelled and time.monotonic() < end:
+                time.sleep(0.02)
+            return False, "killed"
+
+        out = os.path.join(tempfile.mkdtemp(prefix="srr-test-"), "o.mp4")
+        st._run_combine(job, out)
+        self.assertTrue(_pump_until(root, started.is_set))
+        root.update()
+        self.assertEqual(str(st.busy_cancel.cget("state")), "normal",
+                         "the running job could not be cancelled")
+        self.assertEqual(st.busy_cancel.cget("text"), "Cancel")
+        st._run_combine(job, out + "2")  # a second one waits in the queue
+        self.assertEqual(st.busy_cancel.cget("text"), "Cancel all")
+        st.busy_cancel.invoke()
+        self.assertTrue(_pump_until(root, lambda: not st._combine_busy
+                                    and strips))
+        self.assertEqual(strips[0][0], "info")  # 'Cancelled', not an error
+        self.assertEqual(strips[0][1], "Cancelled")
+        st._closing = True
 
 
 if __name__ == "__main__":

@@ -1816,28 +1816,42 @@ class App(tk.Tk):
                 if str(self.busy_bar.cget("mode")) == "indeterminate":
                     self.busy_bar.start(12)
                 if not self._transcribe_busy:
-                    self.busy_cancel.config(state=(
-                        "normal" if self._combine_queue else "disabled"))
+                    self._update_cancel_button()
             else:
                 self.busy_bar.stop()
                 self.busy_bar.config(mode="indeterminate", value=0)
-                self.busy_cancel.config(text="Cancel remaining",
+                self.busy_cancel.config(text="Cancel",
                                         command=self._cancel_queued_jobs)
                 for w in (self.busy_lbl, self.busy_bar, self.busy_cancel):
                     w.pack_forget()
         except tk.TclError:
             pass
 
+    def _update_cancel_button(self):
+        """'Cancel' for one job, 'Cancel all' when more are waiting; usable
+        while a combine/convert job runs (the running one is stopped too)."""
+        token = getattr(self, "_combine_token", None)
+        running = (getattr(self, "_combine_busy", False) and token is not None
+                   and not token.cancelled)
+        live = running or bool(self._combine_queue)
+        self.busy_cancel.config(
+            text="Cancel all" if self._combine_queue else "Cancel",
+            state="normal" if live else "disabled")
+
     def _cancel_queued_jobs(self):
-        """Drop combine/convert jobs that haven't started; the running one
-        finishes (stopping ffmpeg mid-write would leave a broken file)."""
+        """Cancel: drop the combine/convert jobs that haven't started and
+        stop the one that is running (its unfinished file is removed; the
+        original recordings are never touched)."""
         dropped, self._combine_queue = self._combine_queue, []
         for _fn, out in dropped:
             self._pending_out_paths.discard(out)
             self._combine_results.append((False, out,
                                           "Cancelled before it started."))
-        if dropped:
-            self.busy_lbl.config(text="Finishing the current job...")
+        token = getattr(self, "_combine_token", None)
+        if token is not None and getattr(self, "_combine_busy", False):
+            token.cancel()
+            log.info("Cancel pressed: stopping the running job")
+        self.busy_lbl.config(text="Cancelling...")
         self.busy_cancel.config(state="disabled")
 
     def _build_library(self, parent):
@@ -4854,6 +4868,7 @@ class App(tk.Tk):
         if not self._combine_results:
             self._combine_total = 1 + len(self._combine_queue)
         self._combine_busy = True
+        token = self._combine_token = combine.CancelToken()
         self._restore_status()
         self._combine_frac = None
         self._combine_t0 = time.monotonic()
@@ -4870,10 +4885,13 @@ class App(tk.Tk):
 
         def work():
             try:
-                with combine.report_progress(progress):
+                with combine.report_progress(progress), \
+                        combine.cancellable(token):
                     ok, detail = fn()
             except Exception as e:
                 ok, detail = False, str(e)
+            if token.cancelled and not ok:
+                detail = combine.CANCELLED
             self._safe_after(lambda: self._combine_done(ok, out, detail))
         threading.Thread(target=work, name="combine", daemon=True).start()
 
@@ -4926,7 +4944,8 @@ class App(tk.Tk):
         self._refresh_library()  # the merged files may add new session folders
         saved = [o for k, o, _ in results if k]
         failed = [(o, d) for k, o, d in results if not k
-                  and d != "Cancelled before it started."]
+                  and d not in ("Cancelled before it started.",
+                                combine.CANCELLED)]
         cancelled = len(results) - len(saved) - len(failed)
         if saved:
             first = saved[0]
