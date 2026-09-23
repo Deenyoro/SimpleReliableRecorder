@@ -390,6 +390,15 @@ class App(tk.Tk):
         guarded on its own so one failure can't starve the rest."""
         if getattr(self, "_closing", False):
             return
+        # Schedule the next round FIRST: a callback that opens a modal
+        # dialog (e.g. "Couldn't combine") runs a nested event loop until
+        # it is closed, and everything queued behind it - Stop finishing,
+        # alerts, progress - must keep flowing meanwhile.
+        # Tighter while a take is live so push-to-talk edges from the
+        # hotkey thread land within ~one capture block (no clipped first
+        # syllable); relaxed otherwise to keep idle CPU low.
+        live = self.recording or getattr(self, "_starting", False)
+        self.after(10 if live else 40, self._pump_ui_calls)
         try:
             for _ in range(50):
                 fn = self._ui_calls.get_nowait()
@@ -399,12 +408,6 @@ class App(tk.Tk):
                     self._poll_err("uicall", e)
         except queue.Empty:
             pass
-        if not getattr(self, "_closing", False):
-            # Tighter while a take is live so push-to-talk edges from the
-            # hotkey thread land within ~one capture block (no clipped
-            # first syllable); relaxed otherwise to keep idle CPU low.
-            live = self.recording or getattr(self, "_starting", False)
-            self.after(10 if live else 40, self._pump_ui_calls)
 
     def report_callback_exception(self, exc, val, tb):
         """Tk swallows callback exceptions into stderr - which is None in a
