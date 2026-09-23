@@ -366,12 +366,9 @@ class App(tk.Tk):
             try:
                 self.after(0, fn)
                 return
-            except Exception:
-                pass
-        try:
-            self._ui_calls.put(fn)
-        except Exception:
-            pass
+            except tk.TclError:
+                log.debug("after() failed; queueing the callback instead")
+        self._ui_calls.put(fn)
 
     def _pump_ui_calls(self):
         """Tk thread: run callbacks queued by worker threads. Each one is
@@ -735,15 +732,43 @@ class App(tk.Tk):
         self.after(80, self._init_sash)
 
     def _init_sash(self):
+        """Keep the Sources | Recordings split sensible at every window
+        size: proportional, with a floor for each side, and biased toward
+        the list in narrow (snapped) windows. Once the user drags the sash,
+        their proportion is kept instead."""
+        self._sash_ratio = None
+        self._paned.bind("<Configure>", self._place_sash, add="+")
+        self._paned.bind("<ButtonRelease-1>", self._remember_sash, add="+")
+        self._place_sash()
+
+    def _sash_target(self, w):
+        s = self._s
+        left_min, right_min = int(330 * s), int(380 * s)
+        if self._sash_ratio is not None:
+            pos = int(w * self._sash_ratio)
+        else:
+            # Device cards read well from ~400 px; the rest goes to the list.
+            pos = min(int(w * 0.42), int(540 * s))
+            pos = max(pos, min(int(420 * s), w - int(560 * s)))
+        pos = min(pos, w - right_min)
+        return max(min(left_min, w // 2), pos)
+
+    def _place_sash(self, _event=None):
         try:
-            self.update_idletasks()
+            w = self._paned.winfo_width()
+            if w <= 50:
+                return
+            pos = self._sash_target(w)
+            if abs(self._paned.sashpos(0) - pos) > 1:
+                self._paned.sashpos(0, pos)
+        except tk.TclError:
+            pass
+
+    def _remember_sash(self, _event=None):
+        try:
             w = self._paned.winfo_width()
             if w > 50:
-                # Sources need room for a readable device name; the list
-                # copes better with less.
-                s = self._s
-                pos = max(int(w * 0.44), min(int(470 * s), w - int(360 * s)))
-                self._paned.sashpos(0, pos)
+                self._sash_ratio = self._paned.sashpos(0) / float(w)
         except tk.TclError:
             pass
 
@@ -854,18 +879,28 @@ class App(tk.Tk):
         else:
             self.screen_opts.pack_forget()
 
-    def _flow(self, frame, items, gap=8):
+    def _flow(self, frame, items, gap=8, visible=None, gaps=None):
         """Lay buttons out left to right and wrap onto the next line when
-        the pane is too narrow (small windows, 150% scaling)."""
+        the pane is too narrow (small windows, 150% scaling). `visible(w)`
+        hides items; `gaps` maps an item to extra space before it. Returns
+        the relayout function so callers can re-run it after a change."""
+        gaps = gaps or {}
+
         def relayout(_e=None):
+            shown = [w for w in items if visible is None or visible(w)]
+            for w in items:
+                if w not in shown:
+                    w.place_forget()
             width = frame.winfo_width()
             if width <= 1:
-                width = sum(w.winfo_reqwidth() + gap for w in items)
+                width = sum(w.winfo_reqwidth() + gap for w in shown)
             x = y = line_h = 0
-            for w in items:
+            for w in shown:
                 rw, rh = w.winfo_reqwidth(), w.winfo_reqheight()
-                if x and x + rw > width:
-                    x, y, line_h = 0, y + line_h + gap, 0
+                extra = gaps.get(w, 0) if x else 0
+                if x and x + extra + rw > width:
+                    x, y, line_h, extra = 0, y + line_h + gap, 0, 0
+                x += extra
                 w.place(x=x, y=y)
                 x += rw + gap
                 line_h = max(line_h, rh)
@@ -873,6 +908,7 @@ class App(tk.Tk):
                 frame.configure(height=y + line_h)
         relayout()
         frame.bind("<Configure>", relayout, add="+")
+        return relayout
 
     def _wrap_label(self, parent, text, style="Muted.TLabel", width=440):
         """A label that wraps to whatever width its container gives it
@@ -1648,17 +1684,17 @@ class App(tk.Tk):
         Tooltip(refresh_btn, "Look in the save folder for recordings made "
                              "outside this app.")
 
-        tb = ttk.Frame(parent, style="TFrame")
+        # The toolbar wraps onto a second line in a narrow (snapped) window
+        # instead of cutting buttons off at the pane edge.
+        tb = ttk.Frame(parent, style="TFrame", height=int(30 * s))
         tb.grid(row=1, column=0, sticky="ew", pady=(8, 8))
         self.lib_btn_open = ttk.Button(tb, text="Open folder",
                                        style="Toolbar.TButton",
                                        command=self._open_selected_library)
-        self.lib_btn_open.pack(side="left")
         Tooltip(self.lib_btn_open, "Open the selected recording's folder "
                                    "(or double-click it).")
         self.lib_btn_combine = ttk.Menubutton(tb, text="Combine",
                                               direction="below")
-        self.lib_btn_combine.pack(side="left", padx=(8, 0))
         self.lib_combine_menu = tk.Menu(
             self.lib_btn_combine, tearoff=0, bg=COLORS["panel2"],
             fg=COLORS["fg"], activebackground=COLORS["accent"],
@@ -1678,7 +1714,6 @@ class App(tk.Tk):
         self.lib_btn_convert = ttk.Button(
             tb, text="Convert...", style="Toolbar.TButton",
             command=self._convert_selected_library)
-        self.lib_btn_convert.pack(side="left", padx=(8, 0))
         Tooltip(self.lib_btn_convert, "Export each selected recording to "
                                       "another format (MP4, MP3, MKV, WAV...).")
         # Only shown when a Scrivox install is detected (see _refresh_library).
@@ -1690,9 +1725,14 @@ class App(tk.Tk):
         self.lib_btn_remove = ttk.Button(tb, text="Remove",
                                          style="Toolbar.TButton",
                                          command=self._remove_selected_library)
-        self.lib_btn_remove.pack(side="right")
         Tooltip(self.lib_btn_remove, "Remove from this list (Del). Files on "
                                      "disk are never deleted.")
+        self._lib_tb_relayout = self._flow(
+            tb, [self.lib_btn_open, self.lib_btn_combine, self.lib_btn_convert,
+                 self.lib_btn_transcribe, self.lib_btn_remove],
+            visible=lambda w: (w is not self.lib_btn_transcribe
+                               or bool(self._scrivox_exe)),
+            gaps={self.lib_btn_remove: int(16 * s)})
 
         tf = ttk.Frame(parent, style="TFrame")
         tf.grid(row=2, column=0, sticky="nsew")
@@ -1702,17 +1742,37 @@ class App(tk.Tk):
         tree = ttk.Treeview(tf, columns=cols, show="headings",
                             selectmode="extended")
         self.lib_tree = tree
-        spec = {"name": ("Name", 200, True, "w"),
-                "created": ("Recorded", 140, False, "w"),
-                "length": ("Length", 70, False, "e"),
-                "contents": ("Contents", 130, False, "w"),
-                "size": ("Size", 76, False, "e")}
+        # Preferred widths come from the text they must hold, so they are
+        # right at any DPI and with any font.
+        f = tkfont.Font(family=FONT, size=10)
+        pad = int(20 * s)
+        self._lib_col_widths = {
+            "created": f.measure("28 Sep 2026, 10:00") + pad,
+            "length": f.measure("10:00:00") + pad,
+            "contents": f.measure("3 tracks + screen") + pad,
+            "size": f.measure("999 MB") + pad,
+        }
+        self._lib_name_min = f.measure("Recording 22 Sep 20") + pad
+        self._lib_cols_shown = None
+        self._lib_font = f
+        self._lib_name_px = 0
+        self._lib_relabel_job = None
+        spec = {"name": ("Name", "w"), "created": ("Recorded", "w"),
+                "length": ("Length", "e"), "contents": ("Contents", "w"),
+                "size": ("Size", "e")}
         for c in cols:
-            title, width, stretch, anchor = spec[c]
+            title, anchor = spec[c]
             tree.heading(c, text=title, anchor=anchor,
                          command=lambda c=c: self._sort_library(c))
-            tree.column(c, width=int(width * s), minwidth=int(56 * s),
-                        stretch=stretch, anchor=anchor)
+            if c == "name":
+                tree.column(c, width=self._lib_name_min * 2,
+                            minwidth=self._lib_name_min, stretch=True,
+                            anchor=anchor)
+            else:
+                w = self._lib_col_widths[c]
+                tree.column(c, width=w, minwidth=w, stretch=False,
+                            anchor=anchor)
+        tree.bind("<Configure>", self._fit_library_columns, add="+")
         vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
 
         def _yset(lo, hi):
@@ -1736,6 +1796,7 @@ class App(tk.Tk):
         tree.bind("<Delete>", lambda e: self._remove_selected_library())
         tree.bind("<Control-a>", lambda e: (self._set_all_ticks(True), "break")[1])
         tree.bind("<Button-3>", self._on_library_right_click)
+        tree.bind("<Button-1>", self._on_library_click, add="+")
 
         foot = ttk.Frame(parent, style="TFrame")
         foot.grid(row=3, column=0, sticky="ew", pady=(8, 0))
@@ -1762,11 +1823,55 @@ class App(tk.Tk):
                   width=1, style="TFrame").pack(side="right")
         self._refresh_library()
 
+    def _fit_library_columns(self, _event=None):
+        """Show only the columns that fit; Name takes what is left. In a
+        snapped window Contents goes first, then Size - never a Name column
+        squeezed to 'Record' or a Size column pushed off the edge."""
+        tree = self.lib_tree
+        try:
+            avail = tree.winfo_width()
+        except tk.TclError:
+            return
+        if avail <= 1:
+            return
+        shown = ux.library_columns(avail - 4, self._lib_col_widths,
+                                   self._lib_name_min)
+        if shown != self._lib_cols_shown:
+            self._lib_cols_shown = shown
+            tree.configure(displaycolumns=shown)
+        rest = sum(self._lib_col_widths[c] for c in shown if c != "name")
+        name_w = max(self._lib_name_min, avail - rest - 4)
+        if int(tree.column("name", "width")) != name_w:
+            tree.column("name", width=name_w)
+        if name_w != self._lib_name_px:
+            # Names that don't fit end in '…' instead of being cut mid-letter.
+            self._lib_name_px = name_w
+            if self._lib_relabel_job:
+                self.after_cancel(self._lib_relabel_job)
+            self._lib_relabel_job = self.after(60, self._relabel_library)
+
+    def _relabel_library(self):
+        self._lib_relabel_job = None
+        for iid, e in self._lib_iids.items():
+            if self.lib_tree.exists(iid):
+                self.lib_tree.item(iid, values=self._lib_values(e))
+
     def _on_library_double(self, event):
         iid = self.lib_tree.identify_row(event.y)
         if iid and iid in self._lib_iids:
             self._open_entry_folder(self._lib_iids[iid])
         return "break"
+
+    def _on_library_click(self, event):
+        """Clicking empty space below the rows clears the selection, as in
+        Explorer."""
+        if self.lib_tree.identify_region(event.x, event.y) in ("nothing", ""):
+            self.lib_tree.selection_set(())
+            self.lib_tree.focus_set()
+
+    def _select_all_library(self):
+        self._set_all_ticks(True)
+        self.lib_tree.focus_set()
 
     def _on_library_right_click(self, event):
         iid = self.lib_tree.identify_row(event.y)
@@ -1811,6 +1916,10 @@ class App(tk.Tk):
                     self.lib_tree.selection_set(iid)
                     self.lib_tree.focus(iid)
                     self.lib_tree.see(iid)
+                    # Keyboard-ready: F2 renames, Enter opens, Del removes.
+                    # (F9 is bound everywhere, so Record still works.)
+                    if self.grab_current() is None:
+                        self.lib_tree.focus_set()
                     break
             self._update_library_buttons()
         return entry
@@ -1887,11 +1996,7 @@ class App(tk.Tk):
         if self._scrivox_checked and not self._transcribe_busy:
             self._scrivox_exe = scrivox_bridge.find_scrivox(
                 self.cfg.get("scrivox_path"))
-        if self._scrivox_exe:
-            if not self.lib_btn_transcribe.winfo_manager():
-                self.lib_btn_transcribe.pack(side="left", padx=(8, 0))
-        else:
-            self.lib_btn_transcribe.pack_forget()
+        self._lib_tb_relayout()
         self._update_library_buttons()
         self._fill_library_meta()
 
@@ -1903,7 +2008,11 @@ class App(tk.Tk):
         else:
             length, size = "...", "..."
         n_audio = len(e.get("audio") or [])
-        return (ux.friendly_recording_name(e.get("name", "")),
+        name = ux.friendly_recording_name(e.get("name", ""))
+        if self._lib_name_px:
+            name = ux.end_ellipsize(name, self._lib_name_px - int(14 * self._s),
+                                    self._lib_font.measure)
+        return (name,
                 ux.friendly_created(e.get("created") or ""),
                 length, ux.contents_text(n_audio, 1 if e.get("video") else 0),
                 size)
@@ -1965,6 +2074,9 @@ class App(tk.Tk):
                 self.lib_tree.item(iid, values=self._lib_values(e))
         if self._lib_sort[0] in ("length", "size"):
             self._refresh_library()
+        # Rows added while that pass was running (a rename, a rescan, a new
+        # take) still show '...': fill them in now. No-op when all are done.
+        self._fill_library_meta()
 
     def _update_library_buttons(self):
         """Enable the actions that fit the current selection, and say in
@@ -2854,6 +2966,8 @@ class App(tk.Tk):
                 label="Transcribe with Scrivox...",
                 command=lambda: self._transcribe_entries([entry]))
         menu.add_separator()
+        menu.add_command(label="Select all", accelerator="Ctrl+A",
+                         command=self._select_all_library)
         menu.add_command(label="Remove from list...", accelerator="Del",
                          command=self._remove_selected_library)
         try:

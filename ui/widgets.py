@@ -847,6 +847,11 @@ class DeviceRow(ttk.Frame):
         self.warn_lbl = ttk.Label(self, text="", style="CardWarn.TLabel")
 
         self.columnconfigure(1, weight=1)
+        # In a narrow pane (snapped window, minimum size, 150%) Mute moves
+        # down next to Volume so the device name keeps the whole top line.
+        self._narrow = False
+        self._narrow_px = int(470 * ui_scale(parent))
+        self.bind("<Configure>", self._on_resize, add="+")
 
         matched = False
         if preset:
@@ -870,6 +875,23 @@ class DeviceRow(ttk.Frame):
                 self.var.set(values[0])
 
         self._refresh_mute_btn()
+
+    def _on_resize(self, event):
+        narrow = event.width < self._narrow_px
+        if narrow == self._narrow:
+            return
+        self._narrow = narrow
+        try:
+            if narrow:
+                self.combo.grid_configure(columnspan=3)
+                self.mute_btn.grid_configure(row=2, column=3, pady=(6, 0),
+                                             padx=(0, 0), sticky="nsew")
+            else:
+                self.combo.grid_configure(columnspan=2)
+                self.mute_btn.grid_configure(row=0, column=2, pady=0,
+                                             padx=(0, 8), sticky="nse")
+        except tk.TclError:
+            pass
 
     def set_editable(self, on):
         """Lock the device choice and Remove while a take is running (the

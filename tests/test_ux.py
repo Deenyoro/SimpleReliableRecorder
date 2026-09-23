@@ -160,5 +160,35 @@ class GeometryTests(unittest.TestCase):
         self.assertIsNone(ux.sane_geometry("10x10+0+0", 1920, 1080))
 
 
+COL_W = {"created": 150, "length": 70, "contents": 140, "size": 70}
+
+
+class LibraryColumnTests(unittest.TestCase):
+    W = COL_W
+
+    def test_wide_list_shows_everything_in_order(self):
+        self.assertEqual(ux.library_columns(1000, self.W, 180),
+                         ["name", "created", "length", "contents", "size"])
+
+    def test_snapped_list_drops_contents_before_size(self):
+        # 180 + 150 + 70 + 70 = 470 fits; + contents would not.
+        self.assertEqual(ux.library_columns(500, self.W, 180),
+                         ["name", "created", "length", "size"])
+
+    def test_tiny_list_keeps_a_readable_name(self):
+        self.assertEqual(ux.library_columns(200, self.W, 180), ["name"])
+
+
+class EllipsizeTests(unittest.TestCase):
+    def test_end_ellipsize_keeps_the_start(self):
+        out = ux.end_ellipsize("Weekly standup with the design team", 10, len)
+        self.assertTrue(out.startswith("Weekly"))
+        self.assertTrue(out.endswith("…"))
+        self.assertLessEqual(len(out), 10)
+
+    def test_short_text_untouched(self):
+        self.assertEqual(ux.end_ellipsize("Short", 10, len), "Short")
+
+
 if __name__ == "__main__":
     unittest.main()

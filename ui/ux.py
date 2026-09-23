@@ -304,6 +304,27 @@ def total_size(paths_):
     return total
 
 
+# Recordings list: which optional columns fit. Name always shows and gets
+# the leftover width; the others are added in order of usefulness while they
+# still fit, so a narrow (snapped) window drops Contents first instead of
+# squeezing Name to a few letters or pushing Size off the edge.
+LIBRARY_COLUMN_ORDER = ("name", "created", "length", "contents", "size")
+LIBRARY_COLUMN_PRIORITY = ("created", "length", "size", "contents")
+
+
+def library_columns(avail, widths, name_min):
+    """Return the columns to display (in display order) for a list that is
+    `avail` px wide, given each optional column's preferred width."""
+    shown = {"name"}
+    used = name_min
+    for col in LIBRARY_COLUMN_PRIORITY:
+        w = widths.get(col, 0)
+        if used + w <= avail:
+            shown.add(col)
+            used += w
+    return [c for c in LIBRARY_COLUMN_ORDER if c in shown]
+
+
 def middle_ellipsize(text, max_px, measure):
     """Shorten `text` in the middle until measure(text) <= max_px so both the
     drive and the distinctive tail of a path survive."""
@@ -316,6 +337,23 @@ def middle_ellipsize(text, max_px, measure):
         head = keep - keep // 2
         tail = keep // 2
         cand = text[:head] + "…" + (text[-tail:] if tail else "")
+        if measure(cand) <= max_px:
+            best = cand
+            lo = keep + 1
+        else:
+            hi = keep - 1
+    return best
+
+
+def end_ellipsize(text, max_px, measure):
+    """Cut `text` at the end with '…' so measure(text) <= max_px (list
+    names: the start of a name is the part people recognise)."""
+    if max_px <= 0 or measure(text) <= max_px:
+        return text
+    lo, hi, best = 0, len(text), "…"
+    while lo <= hi:
+        keep = (lo + hi) // 2
+        cand = text[:keep].rstrip() + "…"
         if measure(cand) <= max_px:
             best = cand
             lo = keep + 1
