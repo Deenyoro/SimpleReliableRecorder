@@ -178,6 +178,8 @@ class App(tk.Tk):
         self._combine_queue = []
         self._combine_results = []
         self._combine_total = 0
+        self._combine_frac = None      # 0..1 once ffmpeg reports progress
+        self._combine_t0 = 0.0
         # Output paths promised to queued/running jobs but not on disk yet, so
         # _unique_path can't hand the same name to two queued jobs.
         self._pending_out_paths = set()
@@ -4655,12 +4657,23 @@ class App(tk.Tk):
             self._combine_total = 1 + len(self._combine_queue)
         self._combine_busy = True
         self._restore_status()
+        self._combine_frac = None
+        self._combine_t0 = time.monotonic()
+        try:
+            self.busy_bar.stop()
+            self.busy_bar.config(mode="indeterminate", value=0)
+        except (tk.TclError, AttributeError):
+            pass
         self._set_busy(True, text=self._combine_progress_text())
         log.info("Combine started -> %s", out)
 
+        def progress(frac):
+            self._safe_after(lambda: self._combine_progress(frac))
+
         def work():
             try:
-                ok, detail = fn()
+                with combine.report_progress(progress):
+                    ok, detail = fn()
             except Exception as e:
                 ok, detail = False, str(e)
             self._safe_after(lambda: self._combine_done(ok, out, detail))
@@ -4669,10 +4682,32 @@ class App(tk.Tk):
     def _combine_progress_text(self):
         total = max(1, self._combine_total)
         i = min(total, len(self._combine_results) + 1)
-        return "Combining..." if total == 1 else f"Combining {i} of {total}..."
+        base = "Combining" if total == 1 else f"Combining {i} of {total}"
+        frac = getattr(self, "_combine_frac", None)
+        if frac is None:
+            return base + "..."
+        text = f"{base} - {int(frac * 100)}%"
+        eta = ux.eta_text(time.monotonic() - self._combine_t0, frac)
+        return f"{text}, {eta}" if eta else text
+
+    def _combine_progress(self, frac):
+        """ffmpeg reported how far it got: show a real percentage (and a
+        rough time left) instead of an endless marquee."""
+        if not self._combine_busy:
+            return
+        self._combine_frac = frac
+        try:
+            if str(self.busy_bar.cget("mode")) != "determinate":
+                self.busy_bar.stop()
+                self.busy_bar.config(mode="determinate", maximum=100)
+            self.busy_bar.config(value=frac * 100)
+        except tk.TclError:
+            pass
+        self._set_busy(True, text=self._combine_progress_text())
 
     def _combine_done(self, ok, out, detail):
         self._combine_busy = False
+        self._combine_frac = None
         self._pending_out_paths.discard(out)
         ok = bool(ok) and os.path.isfile(out)
         if ok:

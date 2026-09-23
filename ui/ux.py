@@ -294,6 +294,20 @@ def take_summary(n_audio, n_video, seconds, total_bytes):
     return "  ·  ".join(bits)
 
 
+def eta_text(elapsed, fraction):
+    """'about 3 min left' from how long a job has run and how far it got;
+    '' until there is enough to go on (the first seconds jump around)."""
+    if fraction <= 0.03 or fraction >= 1.0 or elapsed < 3:
+        return ""
+    left = elapsed * (1.0 - fraction) / fraction
+    if left < 45:
+        return "less than a minute left"
+    mins = round(left / 60.0)
+    if mins < 60:
+        return f"about {max(1, mins)} min left"
+    return f"about {left / 3600.0:.1f} h left"
+
+
 def total_size(paths_):
     total = 0
     for p in paths_ or []:
