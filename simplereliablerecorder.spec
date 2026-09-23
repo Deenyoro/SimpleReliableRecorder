@@ -50,6 +50,16 @@ elif sys.platform == "darwin":
 else:
     hiddenimports += ["pystray._xorg", "pystray._appindicator"]
 
+# Splash screen (Windows): the one-file exe unpacks ~100 MB (ffmpeg, numpy)
+# before any Python runs, which used to mean several seconds with nothing
+# on screen after a double-click. The bootloader shows this image right
+# away; ui.app.run() closes it once the main window has painted, and the
+# watchdog child suppresses it (PYINSTALLER_SUPPRESS_SPLASH_SCREEN).
+# Set SRR_NO_SPLASH=1 to build without it.
+_splash_png = os.path.join("assets", "splash.png")
+_want_splash = (sys.platform == "win32" and os.path.isfile(_splash_png)
+                and os.environ.get("SRR_NO_SPLASH") != "1")
+
 a = Analysis(
     ["main.py"],
     pathex=[],
@@ -65,9 +75,22 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+_splash_parts = []
+if _want_splash:
+    splash = Splash(
+        _splash_png,
+        binaries=a.binaries,
+        datas=a.datas,
+        text_pos=None,
+        minify_script=True,
+        always_on_top=False,
+    )
+    _splash_parts = [splash, splash.binaries]
+
 exe = EXE(
     pyz,
     a.scripts,
+    *_splash_parts,
     a.binaries,
     a.zipfiles,
     a.datas,

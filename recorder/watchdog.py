@@ -142,14 +142,18 @@ def spawn_watchdog(session_dir, gui_pid, stale_seconds=6, alert_sound=True,
         args.append(str(psutil.Process(gui_pid).create_time()))
     except Exception:
         pass
+    env = None
     if paths.is_frozen():
         cmd = [sys.executable] + args
+        # The same .exe shows a splash screen while it unpacks; the hidden
+        # watcher must not flash it every time a recording starts.
+        env = dict(os.environ, PYINSTALLER_SUPPRESS_SPLASH_SCREEN="1")
     else:
         main_py = os.path.join(paths.exe_dir(), "main.py")
         cmd = [sys.executable, main_py] + args
     try:
         proc = subprocess.Popen(cmd, creationflags=CREATE_NO_WINDOW,
-                                startupinfo=_startupinfo())
+                                startupinfo=_startupinfo(), env=env)
         log.info("Spawned watchdog process pid=%s: %s", proc.pid, " ".join(cmd))
         return proc
     except Exception as e:

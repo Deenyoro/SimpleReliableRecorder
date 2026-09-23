@@ -36,6 +36,16 @@ def _safe_setup_logging(tag):
         return log, err
 
 
+def _close_splash():
+    """Close the PyInstaller splash if one is showing (frozen builds)."""
+    try:
+        import pyi_splash
+        if pyi_splash.is_alive():
+            pyi_splash.close()
+    except Exception:  # noqa: BLE001 - not frozen, or no splash
+        return
+
+
 def main():
     multiprocessing.freeze_support()
     argv = sys.argv[1:]
@@ -43,6 +53,7 @@ def main():
     if argv and argv[0] == "--watchdog":
         # Watcher role: minimal, no GUI. Argument validation lives in
         # watchdog_main itself; pass everything through unchanged.
+        _close_splash()  # normally suppressed by the parent already
         _safe_setup_logging("watchdog")
         from recorder.watchdog import watchdog_main
         watchdog_main(argv[1:])
@@ -61,6 +72,7 @@ def main():
         # shown by ui.app.run(); don't stack a second box on top.
         if getattr(exc, "_srr_reported", False):
             raise
+        _close_splash()
         try:
             import tkinter.messagebox as mb
             import traceback
