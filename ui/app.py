@@ -64,6 +64,15 @@ log = get_logger("gui")
 
 APP_TITLE = "Simple Reliable Recorder"
 
+# Record button colours per state: (normal bg, hover bg, outline). Idle
+# Record gets its own lighter surface and a red outline so the primary
+# action stands out from Settings and the toolbar buttons.
+_REC_LOOK = {
+    "idle": ("#353b46", "#404755", COLORS["red"]),
+    "recording": (COLORS["red"], "#f36f6c", COLORS["red"]),
+    "busy": (COLORS["panel3"], COLORS["panel3"], COLORS["panel"]),
+}
+
 
 class _TreeSelVar:
     """BooleanVar-like view of one Treeview row's selection, so code (and
@@ -1402,14 +1411,16 @@ class App(tk.Tk):
     def _make_record_icons(self):
         """Red dot (idle) and white square (recording) images for the big
         button - the red record dot every Windows recorder uses."""
-        size = max(14, int(16 * self._s))
+        size = max(18, int(22 * self._s))
         try:
             from PIL import Image, ImageDraw, ImageTk
         except ImportError:
             return None, None
-        dot = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        ImageDraw.Draw(dot).ellipse([1, 1, size - 2, size - 2],
+        # Drawn 4x and scaled down so the dot has a smooth edge.
+        big = Image.new("RGBA", (size * 4, size * 4), (0, 0, 0, 0))
+        ImageDraw.Draw(big).ellipse([4, 4, size * 4 - 5, size * 4 - 5],
                                     fill=(239, 83, 80, 255))
+        dot = big.resize((size, size), Image.LANCZOS)
         sq = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         m = max(2, size // 6)
         ImageDraw.Draw(sq).rectangle([m, m, size - 1 - m, size - 1 - m],
@@ -1434,6 +1445,12 @@ class App(tk.Tk):
             highlightcolor=COLORS["fg"], disabledforeground="#c7ccd4")
         self.record_btn.grid(row=0, column=0, rowspan=3, sticky="nsw",
                              padx=(0, 20))
+        self._rec_mode = "idle"
+        self._rec_hover = False
+        self.record_btn.bind("<Enter>", lambda e: self._rec_hover_set(True),
+                             add="+")
+        self.record_btn.bind("<Leave>", lambda e: self._rec_hover_set(False),
+                             add="+")
         self._style_record_btn("idle")
         Tooltip(self.record_btn, "Start or stop recording (F9 works from "
                                  "anywhere in this window).")
@@ -1482,15 +1499,26 @@ class App(tk.Tk):
         self.screen_light.pack(anchor="w", pady=(2, 0))
         self._idle_lights()
 
+    def _rec_hover_set(self, on):
+        self._rec_hover = on
+        look = _REC_LOOK.get(self._rec_mode, _REC_LOOK["busy"])
+        try:
+            self.record_btn.config(bg=look[1] if on else look[0])
+        except tk.TclError:
+            pass
+
     def _style_record_btn(self, mode):
-        """idle: neutral button with a red dot. recording: red Stop.
-        busy: disabled with a word saying what is happening."""
+        """idle: red dot + 'Record' on a raised surface with a red outline.
+        recording: red Stop. busy: a word saying what is happening."""
         b = self.record_btn
         s = self._s
         common = {"width": int(150 * s)} if self._rec_dot else {"width": 10}
+        self._rec_mode = mode if mode in ("idle", "recording") else "busy"
+        bg, hover, outline = _REC_LOOK[self._rec_mode]
+        bg_now = hover if self._rec_hover else bg
         if mode == "recording":
             b.config(text="  Stop", image=self._rec_square or "", cursor="hand2",
-                     bg=COLORS["red"], fg="#ffffff",
+                     bg=bg_now, fg="#ffffff", highlightbackground=outline,
                      activebackground="#ff7b72", activeforeground="#ffffff",
                      state="normal", **common)
         elif mode in ("starting", "saving"):
@@ -1498,15 +1526,15 @@ class App(tk.Tk):
             # and stop latches already ignore clicks while busy.
             b.config(text="Starting..." if mode == "starting"
                      else "Saving...", image=self._rec_blank or "",
-                     bg=COLORS["panel3"], fg=COLORS["muted"],
-                     activebackground=COLORS["panel3"],
+                     bg=bg, fg=COLORS["muted"], highlightbackground=outline,
+                     activebackground=bg,
                      activeforeground=COLORS["muted"], cursor="watch",
                      state="normal", **common)
             return
         else:
             b.config(text="  Record", image=self._rec_dot or "", cursor="hand2",
-                     bg=COLORS["panel3"], fg=COLORS["fg"],
-                     activebackground="#3a404b", activeforeground=COLORS["fg"],
+                     bg=bg_now, fg="#ffffff", highlightbackground=outline,
+                     activebackground="#4a5261", activeforeground="#ffffff",
                      state="normal", **common)
             if not self._rec_dot:
                 b.config(text="●  Record")
@@ -3042,10 +3070,19 @@ class App(tk.Tk):
             return
         parent_dir = os.path.dirname(old_dir)
         old_base = os.path.basename(old_dir)
-        new_name = self._ask_text(
-            "Rename recording",
-            "New name for the folder and every track inside it:",
-            initial=old_base, ok_text="Rename")
+        shown = ux.friendly_recording_name(old_base)
+        if shown != old_base:
+            # An automatic name: the list shows it as a date, so don't
+            # prefill the raw 'SRR_2026-...' folder name.
+            prompt = (f"Currently '{shown}'. Type a name for this "
+                      "recording - its folder and every track inside it "
+                      "are renamed to match:")
+            initial = ""
+        else:
+            prompt = "New name for the folder and every track inside it:"
+            initial = old_base
+        new_name = self._ask_text("Rename recording", prompt,
+                                  initial=initial, ok_text="Rename")
         if not new_name:
             return
         # Sanitize to a safe, cross-platform name (no reserved chars).
@@ -4085,18 +4122,7 @@ class App(tk.Tk):
                              [("Show log", lambda: (
                                  self.log_open_var.get() or self._toggle_log()))])
             return
-        audio = entry.get("audio") or []
-        vids = entry.get("video_segments") or ([entry["video"]]
-                                               if entry.get("video") else [])
-        text = ux.take_summary(len(audio), 1 if vids else 0,
-                               self._last_take_secs,
-                               ux.total_size(audio + vids))
-        folder = entry.get("out_dir") or ""
-        self._show_strip(
-            "ok", "✓ Saved", f"{text}  ·  {os.path.basename(folder)}",
-            [("Open folder", lambda: self._open_entry_folder(entry)),
-             ("Rename...", lambda: self._rename_entry(entry)),
-             ("Play", lambda: self._play_entry(entry))])
+        text = self._show_saved_strip(entry)
         if self.tray is not None and self.state() in ("iconic", "withdrawn"):
             icon = getattr(self.tray, "_icon", None)
             try:
@@ -4106,6 +4132,29 @@ class App(tk.Tk):
                 log.debug("tray notify failed", exc_info=True)
         self._set_status_note("Saved. Press Record (F9) to start another "
                               "recording.", ms=8000)
+
+    def _show_saved_strip(self, entry):
+        """'Saved - 2 tracks - 3:12 - 41 MB - Recording 23 Sep 2026, 06:52'
+        with Open folder / Rename / Play. Uses the same name as the list."""
+        audio = entry.get("audio") or []
+        vids = entry.get("video_segments") or ([entry["video"]]
+                                               if entry.get("video") else [])
+        text = ux.take_summary(len(audio), 1 if vids else 0,
+                               self._last_take_secs,
+                               ux.total_size(audio + vids))
+        name = ux.friendly_recording_name(entry.get("name") or "")
+        self._show_strip(
+            "ok", "✓ Saved", f"{text}  ·  {name}",
+            [("Open folder", lambda: self._open_entry_folder(entry)),
+             ("Rename...", lambda: self._rename_from_strip(entry)),
+             ("Play", lambda: self._play_entry(entry))])
+        return text
+
+    def _rename_from_strip(self, entry):
+        before = entry.get("name")
+        self._rename_entry(entry)
+        if entry.get("name") != before and not self.recording:
+            self._show_saved_strip(entry)  # show the new name right away
 
     def _offer_stop_combine(self):
         """Honor the 'When screen+audio ends' setting: ask / combine /
@@ -4178,8 +4227,10 @@ class App(tk.Tk):
         if self.screen_rec is not None:
             bits.append("the screen")
         what = " + ".join(bits) if bits else "..."
-        folder = os.path.basename(self.last_outputs.get("out_dir") or "")
-        return f"Recording {what} into {folder}. Press Stop (F9) when done."
+        name = ux.friendly_recording_name(
+            getattr(self, "_session_base", "") or "")
+        return (f"Recording {what} as '{name}'. Press Stop (F9) when "
+                "done.")
 
     def _update_title(self):
         """The taskbar hover shows the state: '* REC 00:12:04 - ...'."""
