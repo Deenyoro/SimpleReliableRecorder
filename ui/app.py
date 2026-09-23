@@ -399,7 +399,11 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         if not getattr(self, "_closing", False):
-            self.after(40, self._pump_ui_calls)
+            # Tighter while a take is live so push-to-talk edges from the
+            # hotkey thread land within ~one capture block (no clipped
+            # first syllable); relaxed otherwise to keep idle CPU low.
+            live = self.recording or getattr(self, "_starting", False)
+            self.after(10 if live else 40, self._pump_ui_calls)
 
     def report_callback_exception(self, exc, val, tb):
         """Tk swallows callback exceptions into stderr - which is None in a
@@ -2471,6 +2475,8 @@ class App(tk.Tk):
             pass  # not viewable yet; the dialog still works without a grab
         (focus or win).focus_set()
 
+    _NO_MNEMONIC = frozenset({"ok", "cancel", "close"})
+
     @staticmethod
     def _add_mnemonics(win):
         """Windows-style Alt+letter access keys for a dialog's buttons: the
@@ -2490,13 +2496,20 @@ class App(tk.Tk):
                 text = str(b.cget("text"))
             except tk.TclError:
                 continue
+            # Enter and Esc already press these; an underlined 'K' in OK
+            # only adds noise.
+            if text.strip().lower() in App._NO_MNEMONIC:
+                continue
             for i, ch in enumerate(text):
                 k = ch.lower()
-                if k.isalpha() and k not in used:
+                if "a" <= k <= "z" and k not in used:
                     used.add(k)
                     b.configure(underline=i)
-                    win.bind(f"<Alt-KeyPress-{k}>",
-                             lambda e, b=b: App._mnemonic(e, b))
+                    # Both cases: with Caps Lock on, Tk reports the
+                    # uppercase keysym, and Windows access keys ignore case.
+                    for ks in (k, k.upper()):
+                        win.bind(f"<Alt-KeyPress-{ks}>",
+                                 lambda e, b=b: App._mnemonic(e, b))
                     break
 
     @staticmethod

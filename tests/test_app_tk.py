@@ -180,5 +180,32 @@ class StartOffTheTkThreadTests(unittest.TestCase):
         st._closing = True
 
 
+@unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
+class MnemonicTests(unittest.TestCase):
+    def test_access_keys_ignore_caps_lock_and_skip_ok(self):
+        root = _root_or_skip(self)
+        win = tk.Toplevel(root)
+        pressed = []
+        stop = ttk.Button(win, text="Stop and quit",
+                          command=lambda: pressed.append("stop"))
+        keep = ttk.Button(win, text="Keep recording",
+                          command=lambda: pressed.append("keep"))
+        ok = ttk.Button(win, text="OK", command=lambda: pressed.append("ok"))
+        for b in (stop, keep, ok):
+            b.pack()
+        App._add_mnemonics(win)
+        self.assertEqual(int(stop.cget("underline")), 0)
+        self.assertEqual(int(keep.cget("underline")), 0)
+        self.assertEqual(int(ok.cget("underline")), -1)
+        for seq in ("<Alt-KeyPress-s>", "<Alt-KeyPress-S>",
+                    "<Alt-KeyPress-k>", "<Alt-KeyPress-K>"):
+            self.assertTrue(win.bind(seq), seq)
+        self.assertFalse(win.bind("<Alt-KeyPress-o>"))
+        # Caps Lock on: Tk reports the uppercase keysym.
+        ev = types.SimpleNamespace(state=0)
+        App._mnemonic(ev, stop)
+        self.assertEqual(pressed, ["stop"])
+
+
 if __name__ == "__main__":
     unittest.main()
