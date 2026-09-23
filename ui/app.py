@@ -1472,13 +1472,16 @@ class App(tk.Tk):
         Tooltip(self.record_btn, "Start or stop recording (F9 works from "
                                  "anywhere in this window).")
 
+        # A font of its own so a narrow header can step the timer down.
+        self._timer_font = tkfont.Font(family="Segoe UI Semibold", size=24)
+        ttk.Style(self).configure("Timer.TLabel", font=self._timer_font)
         self.elapsed_lbl = ttk.Label(bar, text="00:00:00", style="Timer.TLabel")
         self.elapsed_lbl.grid(row=0, column=1, sticky="w")
         self.status_lbl = ttk.Label(bar, text=self._idle_text(),
                                     style="Bar.TLabel")
         self.status_lbl.grid(row=1, column=1, sticky="ew")
         self.status_lbl.bind("<Configure>", lambda e: self.status_lbl.configure(
-            wraplength=max(200, e.width - 4)))
+            wraplength=max(60, e.width - 4)))
 
         # Where files go - the top question from new users. Looks like a
         # link, opens the folder; "Change..." picks another one.
@@ -1504,6 +1507,11 @@ class App(tk.Tk):
 
         right = ttk.Frame(bar, style="Bar.TFrame")
         right.grid(row=0, column=2, rowspan=3, sticky="ne", padx=(16, 0))
+        self._bar, self._bar_right = bar, right
+        self._hdr_compact = False
+        bar.bind("<Configure>", self._fit_header, add="+")
+        # "Audio: recording" is wider than "Audio: ready": refit then too.
+        right.bind("<Configure>", self._fit_header, add="+")
         self.settings_btn = ttk.Button(right, text="Settings",
                                        command=self._open_settings)
         self.settings_btn.pack(anchor="e")
@@ -1515,6 +1523,37 @@ class App(tk.Tk):
         self.screen_light = StatusLight(lights, "Screen", bg=COLORS["panel"])
         self.screen_light.pack(anchor="w", pady=(2, 0))
         self._idle_lights()
+
+    def _fit_header(self, _event=None):
+        """Narrow header (snapped window on a laptop at 125%/150%): a
+        slimmer Record button and a timer that steps down in size, so the
+        time and the status stay whole instead of being cut off."""
+        try:
+            s = self._s
+            w = self._bar.winfo_width()
+            if w <= 1:
+                return
+            compact = w < int(720 * s)
+            if compact != self._hdr_compact:
+                self._hdr_compact = compact
+                self._style_record_btn(self._rec_style)
+                if self.recording:
+                    self.status_lbl.config(
+                        text=self._recording_status_text())
+            avail = (w - 32 - self.record_btn.winfo_reqwidth() - 20
+                     - self._bar_right.winfo_reqwidth() - 16 - 4)
+            widths = getattr(self, "_timer_widths", None)
+            if widths is None:
+                widths = self._timer_widths = {
+                    n: tkfont.Font(family="Segoe UI Semibold",
+                                   size=n).measure("00:00:00")
+                    for n in range(24, 11, -2)}
+            size = next((n for n in range(24, 11, -2) if widths[n] <= avail),
+                        12)
+            if int(self._timer_font.cget("size")) != size:
+                self._timer_font.configure(size=size)
+        except (tk.TclError, AttributeError):
+            pass
 
     def _rec_hover_set(self, on):
         self._rec_hover = on
@@ -1529,7 +1568,13 @@ class App(tk.Tk):
         recording: red Stop. busy: a word saying what is happening."""
         b = self.record_btn
         s = self._s
-        common = {"width": int(150 * s)} if self._rec_dot else {"width": 10}
+        self._rec_style = mode
+        narrow = getattr(self, "_hdr_compact", False)
+        if self._rec_dot:
+            common = {"width": int((112 if narrow else 150) * s),
+                      "padx": int((10 if narrow else 18) * s)}
+        else:
+            common = {"width": 10}
         self._rec_mode = mode if mode in ("idle", "recording") else "busy"
         bg, hover, outline = _REC_LOOK[self._rec_mode]
         bg_now = hover if self._rec_hover else bg
@@ -1558,16 +1603,34 @@ class App(tk.Tk):
 
     def _update_saveto(self):
         """Middle-ellipsize the save path to the space available so both the
-        drive and the folder name stay readable."""
+        drive and the folder name stay readable. In a very narrow header
+        the link shows just the folder's name, and 'Change...' steps aside
+        (Settings > Saving still changes it)."""
         try:
+            s = self._s
             path = self.cfg.resolved_save_folder()
-            avail = (self._saveto_row.winfo_width()
-                     - self._saveto_prefix.winfo_reqwidth()
-                     - self._saveto_change.winfo_reqwidth() - int(30 * self._s))
-            if avail < 60:
-                avail = int(360 * self._s)
-            self.saveto_lbl.config(text=ux.middle_ellipsize(
-                path, avail, self._saveto_font.measure))
+            row_w = self._saveto_row.winfo_width()
+            if row_w <= 1:
+                avail = int(360 * s)  # not laid out yet
+                show_change = True
+            else:
+                base = row_w - self._saveto_prefix.winfo_reqwidth() - int(
+                    30 * s)
+                change_w = self._saveto_change.winfo_reqwidth() + int(12 * s)
+                show_change = base - change_w >= int(140 * s)
+                avail = max(int(24 * s), base - (change_w if show_change
+                                                 else 0))
+            if show_change and not self._saveto_change.winfo_manager():
+                self._saveto_change.pack(side="left", padx=(12, 0))
+            elif not show_change and self._saveto_change.winfo_manager():
+                self._saveto_change.pack_forget()
+            measure = self._saveto_font.measure
+            if measure(path) > avail and avail < int(160 * s):
+                name = os.path.basename(os.path.normpath(path)) or path
+                text = ux.end_ellipsize(name, avail, measure)
+            else:
+                text = ux.middle_ellipsize(path, avail, measure)
+            self.saveto_lbl.config(text=text)
         except tk.TclError:
             pass
 
@@ -1613,7 +1676,12 @@ class App(tk.Tk):
 
     def _build_strip(self, parent):
         """A slim result strip under the command bar: 'Saved - 2 tracks -
-        3:12 - 41 MB  [Open folder] [Rename] [Play]'. Hidden until needed."""
+        3:12 - 41 MB  [Open folder] [Rename] [Play]'. Hidden until needed.
+
+        The buttons are what people came for, so they always keep their
+        width: the summary gives way first (the name drops, then the rest
+        is shortened with '...'), and in a narrow window (snapped, 125% or
+        150%) the buttons move to a second line under the summary."""
         s = self._s
         self.strip = tk.Frame(parent, bg=COLORS["panel2"],
                               highlightthickness=0)
@@ -1623,35 +1691,85 @@ class App(tk.Tk):
         inner = ttk.Frame(self.strip, style="StripOk.TFrame",
                           padding=(12, 8, 8, 8))
         inner.pack(side="left", fill="both", expand=True)
+        inner.columnconfigure(1, weight=1)
+        self._strip_inner = inner
         self._strip_title = ttk.Label(inner, style="StripOk.TLabel")
-        self._strip_title.pack(side="left")
+        self._strip_title.grid(row=0, column=0, sticky="w")
         self._strip_text = ttk.Label(inner, style="Strip.TLabel")
-        self._strip_text.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        self._strip_text.grid(row=0, column=1, sticky="ew", padx=(10, 0))
+        self._strip_actions = ttk.Frame(inner, style="StripOk.TFrame")
         self._strip_close = ttk.Button(inner, text="✕", width=3,
                                        style="Toolbar.TButton",
                                        command=self._hide_strip)
-        self._strip_close.pack(side="right")
+        self._strip_close.grid(row=0, column=3, sticky="e")
         Tooltip(self._strip_close, "Dismiss")
-        self._strip_actions = ttk.Frame(inner, style="StripOk.TFrame")
-        self._strip_actions.pack(side="right", padx=(8, 8))
+        self._strip_font = tkfont.Font(family=FONT, size=10)
+        self._strip_texts = ("",)
+        self._strip_stacked = None
+        inner.bind("<Configure>", self._layout_strip, add="+")
+
+    def _layout_strip(self, _event=None):
+        """Buttons beside the summary when there is room for both, else on
+        their own line below it; the summary is fitted to what is left."""
+        inner = self._strip_inner
+        try:
+            w = inner.winfo_width()
+            if w <= 1:
+                return
+            s = self._s
+            gap = int(10 * s)
+            fixed = (self._strip_title.winfo_reqwidth() + gap
+                     + self._strip_close.winfo_reqwidth() + 20)
+            acts = (self._strip_actions.winfo_reqwidth() + int(16 * s)
+                    if self._strip_actions.winfo_children() else 0)
+            full = self._strip_font.measure(self._strip_texts[0])
+            # Side by side only if the whole summary fits next to the
+            # buttons, or at least a readable part of it does.
+            room = w - fixed - acts
+            stacked = bool(acts) and room < min(full, int(260 * s))
+            key = (bool(acts), stacked)
+            if key != self._strip_stacked:
+                self._strip_stacked = key
+                if not acts:
+                    self._strip_actions.grid_remove()
+                elif stacked:
+                    self._strip_actions.grid(row=1, column=0, columnspan=4,
+                                             sticky="w", padx=0, pady=(8, 0))
+                else:
+                    # grid() keeps options it isn't given: reset the span
+                    # and gap of the stacked layout explicitly.
+                    self._strip_actions.grid(row=0, column=2, columnspan=1,
+                                             sticky="e", padx=(8, 8),
+                                             pady=0)
+            avail = w - fixed - (0 if stacked else acts)
+            self._strip_text.configure(text=ux.fit_text(
+                self._strip_texts, avail, self._strip_font.measure))
+        except (tk.TclError, AttributeError):
+            pass
 
     def _show_strip(self, kind, title, text, actions=(), timeout_ms=None):
-        """kind: 'ok' (green), 'warn' (gold) or 'info' (accent)."""
+        """kind: 'ok' (green), 'warn' (gold) or 'info' (accent). `text` may
+        be a tuple of ever shorter versions; the longest that fits is shown."""
         color = {"ok": COLORS["green"], "warn": COLORS["gold"]}.get(
             kind, COLORS["accent"])
         style = {"ok": "StripOk", "warn": "StripWarn"}.get(kind, "StripInfo")
+        texts = tuple(text) if isinstance(text, (tuple, list)) else (text,)
         try:
             self._strip_accent.configure(bg=color)
             self._strip_title.configure(text=title, style=f"{style}.TLabel")
-            self._strip_text.configure(text=text)
+            self._strip_texts = texts
+            self._strip_text.configure(text=texts[0])
             for w in self._strip_actions.winfo_children():
                 w.destroy()
             for i, (label, fn) in enumerate(actions):
                 ttk.Button(self._strip_actions, text=label,
                            style="Accent.TButton" if i == 0 else "Toolbar.TButton",
                            command=fn).pack(side="left", padx=(0, 6))
+            self._strip_actions.update_idletasks()  # measure the new buttons
+            self._strip_stacked = None  # the buttons changed: lay out again
             if not self.strip.winfo_manager():
                 self.strip.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            self._layout_strip()
             if self._strip_job:
                 self.after_cancel(self._strip_job)
                 self._strip_job = None
@@ -4217,7 +4335,7 @@ class App(tk.Tk):
                                ux.total_size(audio + vids))
         name = ux.friendly_recording_name(entry.get("name") or "")
         self._show_strip(
-            "ok", "✓ Saved", f"{text}  ·  {name}",
+            "ok", "✓ Saved", (f"{text}  ·  {name}", text),
             [("Open folder", lambda: self._open_entry_folder(entry)),
              ("Rename...", lambda: self._rename_from_strip(entry)),
              ("Play", lambda: self._play_entry(entry))])
@@ -4300,6 +4418,9 @@ class App(tk.Tk):
         if self.screen_rec is not None:
             bits.append("the screen")
         what = " + ".join(bits) if bits else "..."
+        if getattr(self, "_hdr_compact", False):
+            # Narrow header: the name is in the list and the title bar.
+            return f"Recording {what}. Press Stop (F9) when done."
         name = ux.friendly_recording_name(
             getattr(self, "_session_base", "") or "")
         return (f"Recording {what} as '{name}'. Press Stop (F9) when "

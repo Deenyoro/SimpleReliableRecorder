@@ -204,6 +204,13 @@ class EllipsizeTests(unittest.TestCase):
     def test_short_text_untouched(self):
         self.assertEqual(ux.end_ellipsize("Short", 10, len), "Short")
 
+    def test_fit_text_drops_the_name_before_cutting(self):
+        full, short = "2 tracks · 0:02 · Recording 23 Sep", "2 tracks · 0:02"
+        self.assertEqual(ux.fit_text((full, short), 100, len), full)
+        self.assertEqual(ux.fit_text((full, short), 20, len), short)
+        cut = ux.fit_text((full, short), 10, len)
+        self.assertTrue(cut.startswith("2 tracks") and cut.endswith("…"))
+
 
 class GeometryBoundsTests(unittest.TestCase):
     def test_big_window_on_4k_is_kept(self):
