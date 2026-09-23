@@ -335,5 +335,34 @@ class CancelRunningJobTests(unittest.TestCase):
         st._closing = True
 
 
+@unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
+class PumpKeepsRunningTests(unittest.TestCase):
+    def test_modal_dialog_from_a_worker_callback_does_not_stall_others(self):
+        """An error dialog opened from a queued callback waits in a nested
+        event loop; callbacks queued behind it (Stop finishing, alerts)
+        must still run while it is open."""
+        root = _root_or_skip(self)
+        st = _Stand(root)
+        st._pump_ui_calls()
+        closed = tk.BooleanVar(root, False)
+        ran = []
+
+        def modal():  # like _error(): waits until the user closes it
+            ran.append("dialog")
+            root.after(3000, lambda: closed.set(True))  # safety net
+            root.wait_variable(closed)
+            ran.append("dialog closed")
+
+        def later():
+            ran.append("later")
+            closed.set(True)  # 'the user closes the dialog' afterwards
+        st._ui_calls.put(modal)
+        threading.Thread(target=lambda: (time.sleep(0.2),
+                                         st._ui_calls.put(later))).start()
+        self.assertTrue(_pump_until(root, lambda: "dialog closed" in ran))
+        self.assertEqual(ran, ["dialog", "later", "dialog closed"])
+        st._closing = True
+
+
 if __name__ == "__main__":
     unittest.main()
