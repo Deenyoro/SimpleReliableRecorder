@@ -126,9 +126,13 @@ def list_devices():
     return inputs, outputs
 
 
-def default_devices():
-    """Return (default_input_dict, default_output_dict) or (None, None)."""
-    inputs, outputs = list_devices()
+def default_devices(devices=None):
+    """Return (default_input_dict, default_output_dict) or (None, None).
+
+    devices: optional (inputs, outputs) from an earlier list_devices() call,
+    so a caller that already enumerated doesn't pay for it again.
+    """
+    inputs, outputs = devices if devices is not None else list_devices()
     di = do = None
     try:
         dm = sc.default_microphone()
@@ -150,9 +154,12 @@ def default_devices():
     return di, do
 
 
-def resolve_selection(sel):
-    """Resolve a saved {name, kind, hostapi} selection to a live device dict."""
-    inputs, outputs = list_devices()
+def resolve_selection(sel, devices=None):
+    """Resolve a saved {name, kind, hostapi} selection to a live device dict.
+
+    devices: optional (inputs, outputs) to resolve against (see
+    default_devices)."""
+    inputs, outputs = devices if devices is not None else list_devices()
     pool = inputs if sel.get("kind") == "input" else outputs
     name = sel.get("name", "")
     sid = sel.get("id", "")

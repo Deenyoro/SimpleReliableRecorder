@@ -93,6 +93,12 @@ DEFAULTS = {
     "alert_taskbar_flash": True,  # flash the taskbar button (FlashWindowEx)
     "alert_messagebox": True,     # watchdog process pops an OS message box
     "watchdog_enabled": True,     # run the separate watcher process at all
+
+    # --- window / view (UI conveniences; safe to delete) ---
+    "window_geometry": "",        # last normal "WxH+X+Y"; "" = size to screen
+    "window_zoomed": True,        # start maximized
+    "log_open": False,            # activity log drawer expanded
+    "library_sort": "-created",   # column, "-" prefix = descending
 }
 
 
