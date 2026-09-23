@@ -1,8 +1,12 @@
 """Main GUI for SimpleReliableRecorder.
 
-Simple by design: pick devices, balance levels, hit RECORD. Everything else
+Simple by design: pick devices, balance levels, hit Record. Everything else
 (crash-safe writing, resilience, the gold alert, screen capture, combine) hangs
 off that core flow.
+
+Threading rule: Tk is only touched from the Tk thread. Slow work (opening
+devices, ffmpeg, finalizing, folder scans) runs on worker threads that hand
+results back through _safe_after().
 """
 
 import os
@@ -13,65 +17,90 @@ import threading
 import time
 import tkinter as tk
 from datetime import datetime
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from tkinter import font as tkfont
 
-from recorder import (alerts, combine, ffmpeg_tools, hotkeys, library, paths,
-                      screen as screenmod, scrivox_bridge, tray, watchdog)
-from recorder.audio import (AudioRecorder, CaptureSource, LevelMonitor,
-                            default_devices, list_devices, resolve_selection)
-from recorder.config import ConfigManager
+from recorder import (
+    alerts,
+    combine,
+    ffmpeg_tools,
+    hotkeys,
+    library,
+    paths,
+    scrivox_bridge,
+    tray,
+    watchdog,
+)
+from recorder import screen as screenmod
+from recorder.audio import (
+    AudioRecorder,
+    CaptureSource,
+    LevelMonitor,
+    default_devices,
+    list_devices,
+    resolve_selection,
+)
+from recorder.config import DEFAULTS, ConfigManager
 from recorder.logging_setup import get_logger, install_inapp_handler
 from recorder.screen import ScreenRecorder, list_monitors
-from ui.widgets import (COLORS, FONT, DeviceRow, GoldBanner, ScrollFrame,
-                        SegmentedControl, StatusLight, ToggleSwitch, Tooltip,
-                        apply_dark_theme)
+from ui import ux
+from ui.widgets import (
+    COLORS,
+    FONT,
+    DeviceRow,
+    GoldBanner,
+    ScrollFrame,
+    SegmentedControl,
+    StatusLight,
+    ToggleSwitch,
+    Tooltip,
+    apply_dark_theme,
+    set_dark_titlebar,
+    ui_scale,
+)
 
 log = get_logger("gui")
 
+APP_TITLE = "Simple Reliable Recorder"
 
-def _ellipsize(s, n=46):
-    """Middle-ellipsis so both the start and the distinctive tail survive."""
-    return s if len(s) <= n else s[: n // 2 - 1] + "..." + s[-(n // 2 - 2):]
+
+class _TreeSelVar:
+    """BooleanVar-like view of one Treeview row's selection, so code (and
+    the screenshot harness) that ticked rows through row["var"] keeps
+    working with the real multi-select list."""
+
+    def __init__(self, tree, iid):
+        self.tree, self.iid = tree, iid
+
+    def get(self):
+        try:
+            return self.iid in self.tree.selection()
+        except tk.TclError:
+            return False
+
+    def set(self, on):
+        try:
+            if on:
+                self.tree.selection_add(self.iid)
+            else:
+                self.tree.selection_remove(self.iid)
+        except tk.TclError:
+            pass
 
 
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("SimpleReliableRecorder")
+        self.title(APP_TITLE)
         apply_dark_theme(self)
-        try:
-            _dpi = self.winfo_fpixels("1i")
-            if _dpi and _dpi > 0:
-                self.tk.call("tk", "scaling", _dpi / 72.0)
-        except Exception:
-            pass
-        # Size to the screen rather than a fixed pixel box (which looks tiny on
-        # high-DPI displays), then start maximized so nothing is cramped.
-        try:
-            sw = self.winfo_screenwidth()
-            sh = self.winfo_screenheight()
-            # A single monitor's height; with vertically stacked monitors
-            # winfo_screenheight can report the combined height, so clamp it.
-            mon_h = sh if sh < 2000 else sh // 2
-            # Proportional to the screen (no hard pixel cap) so it is never tiny
-            # on a wide/high-DPI display even if maximizing does not take.
-            w = max(1100, int(sw * 0.66))
-            h = max(760, int(mon_h * 0.85))
-            x = max(0, (sw - w) // 2)
-            y = max(0, (mon_h - h) // 3)
-            self.geometry(f"{w}x{h}+{x}+{y}")
-            self.minsize(min(1000, sw - 40), min(700, mon_h - 80))
-        except Exception:
-            self.geometry("1280x860")
-            self.minsize(1000, 700)
-        # Maximize after the window is actually mapped - calling zoomed during
-        # __init__ is unreliable on multi-monitor / high-DPI Windows.
-        self.after(60, self._maximize)
+        self._s = ui_scale(self)
+        self.cfg = ConfigManager()
+        self._place_window()
         ip = paths.icon_path()
         if ip:
             try:
                 self.iconbitmap(ip)
-            except Exception:
+            except tk.TclError:
                 pass
         # Build normal + recording (red) window icons. Swapping the window icon
         # is what makes the TASKBAR button turn red while recording on Windows.
@@ -79,33 +108,33 @@ class App(tk.Tk):
         self._icon_recording = None
         self._build_window_icons()
 
-        self.cfg = ConfigManager()
-        self._cleanup_stale_sessions()
+        # One enumeration for the whole startup pass (restoring rows and the
+        # default mic/playback used to re-enumerate 3-5 times before the
+        # window could appear).
         self.inputs, self.outputs = list_devices()
         self.all_devices = self.inputs + self.outputs
-        self.encoders = ffmpeg_tools.probe_encoders()
+        # The ffmpeg encoder probe spawns a process (up to 20 s on a slow or
+        # AV-scanned machine). Only screen recording needs it, so it runs in
+        # the background and the window paints immediately.
+        self.encoders = {"cpu": True}
+        self._encoders_ready = threading.Event()
+        threading.Thread(target=self._probe_encoders, name="encoder-probe",
+                         daemon=True).start()
 
         # Recordings library: prune entries whose files were moved/deleted, keep
         # the rest so the user can combine past takes without reopening the app.
+        # Scanning the save folder for older takes happens in the background
+        # (see _startup_background) so a big or network folder can't delay the
+        # first paint.
         self._library, _pruned = library.prune(self.cfg.get("recordings") or [])
-        # Back-fill recordings that exist on disk but predate the library (or
-        # were made by an older build) by scanning the save folder.
-        try:
-            known_dirs = {e.get("out_dir") for e in self._library}
-            discovered = library.scan_folder(
-                self.cfg.resolved_save_folder(), existing_dirs=known_dirs)
-            if discovered:
-                # Oldest first so newest-first display stays chronological.
-                discovered.sort(key=lambda e: e.get("created", ""))
-                self._library.extend(discovered)
-                _pruned = True
-                log.info("Imported %d existing recording(s) into the library.",
-                         len(discovered))
-        except Exception as e:
-            log.warning("Library scan skipped: %s", e)
         if _pruned:
             self.cfg.set("recordings", self._library)
         self._lib_rows = []
+        self._lib_iids = {}
+        self._lib_meta = {}
+        self._lib_meta_busy = False
+        sort = str(self.cfg.get("library_sort") or "-created")
+        self._lib_sort = (sort.lstrip("-") or "created", sort.startswith("-"))
         self._lib_seq = len(self._library)
 
         # recording state
@@ -117,10 +146,13 @@ class App(tk.Tk):
         self.recording = False
         self.alerting = False
         self._record_start_mono = 0.0
+        self._take_id = 0
+        self._restart_inflight = {}
         self.last_outputs = {}
         self._restart_cooldown = {}
         self._restart_counts = {}
         self._log_queue = queue.Queue()
+        self._log_unseen = 0
         self._device_rows = []
         self.level_monitor = None
         self._save_job = None
@@ -130,6 +162,7 @@ class App(tk.Tk):
         # instead of refusing everything after the first.
         self._combine_queue = []
         self._combine_results = []
+        self._combine_total = 0
         # Output paths promised to queued/running jobs but not on disk yet, so
         # _unique_path can't hand the same name to two queued jobs.
         self._pending_out_paths = set()
@@ -139,11 +172,11 @@ class App(tk.Tk):
         self._transcribe_busy = False
         # Optional Scrivox integration: when no Scrivox install is found, every
         # Scrivox-related control stays hidden (users without it never see it).
-        self._scrivox_exe = scrivox_bridge.find_scrivox(
-            self.cfg.get("scrivox_path"))
-        if self._scrivox_exe:
-            log.info("Scrivox detected: %s", self._scrivox_exe)
+        # Detection (registry, PATH, folder sweep) runs in the background.
+        self._scrivox_exe = None
+        self._scrivox_checked = False
         self._closing = False
+        self._quitting = False
         # Re-entrancy latches: dialogs inside start_recording pump the Tk event
         # loop, so a queued second click / tray / hotkey event could re-enter.
         self._starting = False
@@ -156,6 +189,14 @@ class App(tk.Tk):
         self._last_wd_time = 0.0
         self._poll_err_ts = {}
         self._hotkey_job = None
+        self._hotkey_ok = True
+        self._hotkey_status_lbl = None
+        self._settings_tab = 0
+        self._settings_lockables = []
+        self._settings_rec_note = None
+        self._strip_job = None
+        self._last_take_secs = 0.0
+        self._normal_geom = None
 
         self.settings_win = None
         self.tray = None
@@ -175,11 +216,112 @@ class App(tk.Tk):
         self._refresh_monitor()
         self._setup_tray()
         self._setup_hotkeys()
+        self._install_shortcuts()
         self._poll()
         self._meter_loop()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
-        log.info("GUI ready. %d devices, encoders=%s", len(self.all_devices),
-                 self.encoders)
+        self.bind("<Configure>", self._track_geometry, add="+")
+        self.after(50, lambda: set_dark_titlebar(self))
+        self.after(150, self._startup_background)
+        log.info("GUI ready. %d devices.", len(self.all_devices))
+
+    def _place_window(self):
+        """Restore the last window size/position when it still fits this
+        screen; otherwise size proportionally and start maximized."""
+        s = self._s
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+            # A single monitor's height; with vertically stacked monitors
+            # winfo_screenheight can report the combined height, so clamp it.
+            mon_h = sh if sh < 2000 else sh // 2
+        except tk.TclError:
+            sw, mon_h = 1366, 768
+        # Small enough for a snapped half of a 1920 screen at 150%, big
+        # enough that nothing important is hidden (panes scroll below this).
+        self.minsize(min(int(820 * s), sw - 40), min(int(560 * s), mon_h - 80))
+        geom = ux.sane_geometry(self.cfg.get("window_geometry"), sw, mon_h)
+        if geom:
+            self.geometry(geom)
+            zoom = bool(self.cfg.get("window_zoomed"))
+        else:
+            w = max(min(sw - 40, int(1000 * s)), int(sw * 0.66))
+            h = max(min(mon_h - 80, int(700 * s)), int(mon_h * 0.85))
+            w, h = min(w, sw), min(h, mon_h)
+            x = max(0, (sw - w) // 2)
+            y = max(0, (mon_h - h) // 3)
+            self.geometry(f"{w}x{h}+{x}+{y}")
+            zoom = True
+        if zoom:
+            # Maximize after the window is actually mapped - calling zoomed
+            # during __init__ is unreliable on multi-monitor / high-DPI Windows.
+            self.after(60, self._maximize)
+
+    def _track_geometry(self, event):
+        """Remember the un-maximized size/position so it can be restored."""
+        if event.widget is not self:
+            return
+        try:
+            if self.state() == "normal":
+                self._normal_geom = self.geometry()
+        except tk.TclError:
+            pass
+
+    def _probe_encoders(self):
+        try:
+            enc = ffmpeg_tools.probe_encoders() or {"cpu": True}
+        except Exception as e:
+            log.warning("Encoder probe failed (%s); using CPU encoding.", e)
+            enc = {"cpu": True}
+        self.encoders = enc
+        self._encoders_ready.set()
+        log.info("Video encoders available: %s", enc)
+
+    def _startup_background(self):
+        """Slow, disk-bound startup work off the Tk thread: stale session
+        cleanup, Scrivox detection and the save-folder scan that back-fills
+        older recordings into the library."""
+        known = {e.get("out_dir") for e in self._library}
+        folder = self.cfg.resolved_save_folder()
+        override = self.cfg.get("scrivox_path")
+
+        def work():
+            self._cleanup_stale_sessions()
+            try:
+                exe = scrivox_bridge.find_scrivox(override)
+            except Exception as e:
+                log.warning("Scrivox detection failed: %s", e)
+                exe = None
+            try:
+                found = library.scan_folder(folder, existing_dirs=known)
+            except Exception as e:
+                log.warning("Library scan skipped: %s", e)
+                found = []
+            self._safe_after(lambda: self._apply_scan(found, exe))
+        threading.Thread(target=work, name="startup-scan", daemon=True).start()
+
+    def _apply_scan(self, found, exe, announce=False):
+        self._scrivox_checked = True
+        if not self._transcribe_busy:
+            self._scrivox_exe = exe
+            if exe:
+                log.info("Scrivox detected: %s", exe)
+        if found:
+            known = {e.get("out_dir") for e in self._library}
+            fresh = [e for e in found if e.get("out_dir") not in known]
+            if fresh:
+                self._library.extend(fresh)
+                # Keep the list chronological so back-filled old recordings
+                # don't show up above yesterday's takes.
+                self._library.sort(key=lambda e: e.get("created") or "")
+                self.cfg.set("recordings", self._library)
+                log.info("Imported %d existing recording(s) into the library.",
+                         len(fresh))
+        self._refresh_library()
+        if announce:
+            n = len(found or [])
+            self._set_status_note("Found " + ux.plural(n, "new recording")
+                                  if n else "The list is up to date.")
 
     def _cleanup_stale_sessions(self):
         """Best-effort removal of session dirs left by dead instances (the
@@ -247,6 +389,20 @@ class App(tk.Tk):
             on_quit=lambda: self._safe_after(self.on_close),
             is_recording=lambda: self.recording)
         self.tray.start()
+
+    def _apply_tray_setting(self):
+        """Start or stop the tray icon as soon as the setting changes."""
+        want = bool(self.tray_var.get())
+        if want and self.tray is None:
+            self._setup_tray()
+            if self.tray is not None and self.recording:
+                self.tray.set_recording(True)
+        elif not want and self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                log.debug("tray stop failed", exc_info=True)
+            self.tray = None
 
     def _build_window_icons(self):
         """Create the normal and recording (red) window/taskbar icons via PIL."""
@@ -335,10 +491,48 @@ class App(tk.Tk):
             # press actually flips it instead of being a no-op.
             initial_state=lambda: self._hotkey_target_muted(
                 self.ptt_target_var.get()))
-        if self.ptt_enabled_var.get() and not ok:
+        enabled = bool(self.ptt_enabled_var.get())
+        key = self.ptt_hotkey_var.get().strip()
+        self._hotkey_ok = bool(ok) or not enabled or not key
+        if not self._hotkey_ok:
             log.warning("Hotkey '%s' could not be registered - "
-                        "push-to-talk is INACTIVE.",
-                        self.ptt_hotkey_var.get().strip())
+                        "push-to-talk is INACTIVE.", key)
+            if self.settings_win is None:
+                # Never silent: say it where the user is looking.
+                self._show_strip(
+                    "warn", "Hotkey is off",
+                    f"The push-to-talk key '{key}' couldn't be set up "
+                    "(another app may be using it).",
+                    [("Change key...", lambda: self._open_settings(tab=3))])
+        self._update_hotkey_status()
+
+    def _update_hotkey_status(self):
+        lbl = self._hotkey_status_lbl
+        if lbl is None:
+            return
+        try:
+            if not lbl.winfo_exists():
+                self._hotkey_status_lbl = None
+                return
+            key = self.ptt_hotkey_var.get().strip()
+            if not self.ptt_enabled_var.get():
+                lbl.configure(text="", style="PanelMuted.TLabel")
+            elif not key:
+                lbl.configure(text="Choose a key to turn the hotkey on.",
+                              style="PanelWarn.TLabel")
+            elif not self._hotkey_ok:
+                lbl.configure(text=f"Couldn't use '{key}' - another app may "
+                                   "own it. Try another key.",
+                              style="PanelError.TLabel")
+            else:
+                lbl.configure(text=f"Active: {key}",
+                              style="PanelMuted.TLabel")
+            if lbl.cget("text"):
+                lbl.grid()
+            else:
+                lbl.grid_remove()
+        except tk.TclError:
+            pass
 
     def _hotkey_target_muted(self, target):
         """True when every device the hotkey targets is currently muted."""
@@ -390,8 +584,7 @@ class App(tk.Tk):
         '<name>|<kind>' key stored in config; blank = all microphones."""
         self._ptt_keymap = {"All microphones": ""}
         values = ["All microphones"]
-        for d in self.all_devices:
-            label = f'{d["name"]} [{d["kind"]}]'
+        for label, d in ux.device_labels(self.all_devices):
             key = f'{d["name"]}|{d["kind"]}'
             self._ptt_keymap[label] = key
             values.append(label)
@@ -404,7 +597,6 @@ class App(tk.Tk):
         label = self.ptt_device_combo.get()
         self.ptt_target_var.set(self._ptt_keymap.get(label, ""))
 
-    # ------------------------------------------------------------------ UI #
     def _make_vars(self):
         """Create every Tk variable up front so both the main window and the
         Settings window can bind to the same state. Any change autosaves."""
@@ -435,6 +627,7 @@ class App(tk.Tk):
         self.ptt_target_var = tk.StringVar(value=cfg.get("ptt_target"))
         self.ptt_mode_var = tk.StringVar(value=cfg.get("ptt_mode"))
         self.scrivox_path_var = tk.StringVar(value=cfg.get("scrivox_path"))
+        self.log_open_var = tk.BooleanVar(value=bool(cfg.get("log_open")))
         for v in (self.live_levels_var, self.output_mode, self.subtype,
                   self.screen_enabled, self.monitor_var, self.encoder_var,
                   self.container_var, self.codec_var, self.fps_var,
@@ -447,112 +640,188 @@ class App(tk.Tk):
                   self.scrivox_path_var):
             v.trace_add("write", lambda *a: self._save_settings())
         self.live_levels_var.trace_add("write", lambda *a: self._refresh_monitor())
+        # The tray starts/stops live instead of "takes effect next launch".
+        self.tray_var.trace_add(
+            "write", lambda *a: self.after_idle(self._apply_tray_setting))
         # Debounced: rebinding on every keystroke of the hotkey field would
         # briefly register single-character global hotkeys and (in ptt mode)
         # mute the mics the moment the user types the first letter.
         for v in (self.ptt_enabled_var, self.ptt_hotkey_var,
                   self.ptt_target_var, self.ptt_mode_var):
             v.trace_add("write", lambda *a: self._request_hotkey_reconfig())
+        for v in (self.screen_enabled, self.output_mode):
+            v.trace_add("write", lambda *a: self._restore_status())
+        self.screen_enabled.trace_add("write", lambda *a: self._idle_lights())
 
     def _build_ui(self):
-        root = ttk.Frame(self, style="TFrame")
-        root.pack(fill="both", expand=True, padx=14, pady=12)
+        """Command bar on top (Record, timer, status, where files go), a
+        notice strip for results, then Sources | Recordings side by side and
+        a collapsible activity log. Grid everywhere so it reflows."""
+        outer = ttk.Frame(self, style="TFrame", padding=(16, 12, 16, 12))
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+        self._outer = outer
 
-        header = ttk.Frame(root, style="TFrame")
-        header.pack(fill="x", pady=(0, 10))
-        ttk.Label(header, text="SimpleReliableRecorder", style="Title.TLabel").pack(side="left")
-        ttk.Button(header, text="Settings", command=self._open_settings).pack(
-            side="left", padx=14)
-        self.audio_light = StatusLight(header, "Audio")
-        self.audio_light.pack(side="right", padx=4)
-        self.screen_light = StatusLight(header, "Screen")
-        self.screen_light.pack(side="right", padx=4)
-        self.audio_light.set_state(COLORS["muted"], ": idle")
-        self.screen_light.set_state(COLORS["muted"], ": off")
-        self.elapsed_lbl = ttk.Label(header, text="00:00:00", style="Header.TLabel")
-        self.elapsed_lbl.pack(side="right", padx=12)
+        bar = ttk.Frame(outer, style="Bar.TFrame", padding=(16, 12))
+        bar.grid(row=0, column=0, sticky="ew")
+        self._build_record(bar)
 
-        body = ttk.Frame(root, style="TFrame")
-        body.pack(fill="both", expand=True)
-        left_scroll = ScrollFrame(body)
-        left_scroll.pack(side="left", fill="both", expand=True, padx=(0, 10))
-        left = left_scroll.body
-        # The right column scrolls too: on a small window the Live log and the
-        # library buttons used to be pushed below the bottom edge with no way
-        # to reach them.
-        right_scroll = ScrollFrame(body)
-        right_scroll.pack(side="left", fill="both", expand=True)
-        right = right_scroll.body
+        self._build_strip(outer)  # row 1, shown on demand
 
-        self._build_devices(left)
-        self._build_screen(left)
+        paned = ttk.Panedwindow(outer, orient="horizontal")
+        paned.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        self._paned = paned
+        left = ttk.Frame(paned, style="TFrame")
+        right = ttk.Frame(paned, style="TFrame")
+        paned.add(left, weight=4)
+        paned.add(right, weight=5)
 
-        self._build_record(right)
+        # Sources pane: heading + a scroll area that only scrolls when needed.
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(1, weight=1)
+        lhead = ttk.Frame(left, style="TFrame")
+        lhead.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        ttk.Label(lhead, text="Sources", style="Section.TLabel").pack(
+            side="left")
+        self.dev_refresh_btn = ttk.Button(lhead, text="Refresh devices",
+                                          style="Toolbar.TButton",
+                                          command=self._refresh_devices)
+        self.dev_refresh_btn.pack(side="right")
+        Tooltip(self.dev_refresh_btn,
+                "Look again for microphones and speakers you plugged in "
+                "or unplugged.")
+        left_scroll = ScrollFrame(left)
+        left_scroll.grid(row=1, column=0, sticky="nsew", pady=(8, 0),
+                         padx=(0, 12))
+        self._build_devices(left_scroll.body)
+        self._build_screen(left_scroll.body)
+
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
         self._build_library(right)
-        self._build_log(right)
+
+        logf = ttk.Frame(outer, style="TFrame")
+        logf.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        self._build_log(logf)
 
         self.banner = GoldBanner(self, on_ack=self._dismiss_alert,
                                  on_restart=self._restart_recording)
+        self.banner.pack_before = outer
+        self.after(80, self._init_sash)
 
-    def _section(self, parent, title):
-        lf = ttk.Labelframe(parent, text=title, style="TLabelframe")
-        lf.pack(fill="x", pady=6)
-        inner = ttk.Frame(lf, style="TFrame")
-        inner.pack(fill="x", padx=12, pady=8)
+    def _init_sash(self):
+        try:
+            self.update_idletasks()
+            w = self._paned.winfo_width()
+            if w > 50:
+                # Sources need room for a readable device name; the list
+                # copes better with less.
+                s = self._s
+                pos = max(int(w * 0.44), min(int(470 * s), w - int(360 * s)))
+                self._paned.sashpos(0, pos)
+        except tk.TclError:
+            pass
+
+    def _install_shortcuts(self):
+        """Keyboard access: F9 everywhere, Ctrl+, settings, Ctrl+O folder,
+        Ctrl+L activity log."""
+        self.bind_all("<F9>", self._on_f9)
+        self.bind("<Control-comma>", lambda e: self._open_settings())
+        self.bind("<Control-o>", lambda e: self._open_folder(
+            self.cfg.resolved_save_folder()))
+        self.bind("<Control-l>", lambda e: self._toggle_log())
+
+    def _on_f9(self, _event=None):
+        # A modal dialog (rename, confirm...) owns the keyboard: F9 must not
+        # start or stop a take behind it. Settings is not modal.
+        grab = self.grab_current()
+        if grab is not None and grab is not self.settings_win:
+            return "break"
+        self._toggle_record()
+        return "break"
+
+    def _section(self, parent, title, pady=(0, 12)):
+        """A titled card: small heading, then a panel with 12 px padding."""
+        box = ttk.Frame(parent, style="TFrame")
+        box.pack(fill="x", pady=pady)
+        if title:
+            ttk.Label(box, text=title, style="Header.TLabel").pack(
+                anchor="w", pady=(0, 6))
+        inner = ttk.Frame(box, style="Panel.TFrame", padding=12)
+        inner.pack(fill="x")
         return inner
 
     def _build_devices(self, parent):
-        inner = self._section(parent, "Audio devices  (mic + system playback)")
-        self.rows_frame = ttk.Frame(inner, style="TFrame")
+        box = ttk.Frame(parent, style="TFrame")
+        box.pack(fill="x")
+        ttk.Label(box, text="Microphone and system sound",
+                  style="Header.TLabel").pack(anchor="w", pady=(0, 6))
+        self.rows_frame = ttk.Frame(box, style="TFrame")
         self.rows_frame.pack(fill="x")
-        btns = ttk.Frame(inner, style="TFrame")
-        btns.pack(fill="x", pady=(10, 0))
-        ttk.Button(btns, text="+ Add device", command=lambda: self._add_row()).pack(side="left")
-        ttk.Button(btns, text="+ Default mic",
-                   command=self._add_default_mic).pack(side="left", padx=6)
-        ttk.Button(btns, text="+ System playback",
-                   command=self._add_system_playback).pack(side="left")
-        # Own row: sharing the row above clipped this pair off the right edge
-        # whenever the window was narrow.
-        btns2 = ttk.Frame(inner, style="TFrame")
-        btns2.pack(fill="x", pady=(6, 0))
+        btns = ttk.Frame(box, style="TFrame")
+        btns.pack(fill="x", pady=(4, 0))
+        self.add_dev_btn = ttk.Button(btns, text="+ Add device",
+                                      style="Toolbar.TButton",
+                                      command=lambda: self._add_row())
+
+        Tooltip(self.add_dev_btn, "Adds the next device that isn't in the "
+                                  "list yet - pick another from its menu.")
+        self.add_mic_btn = ttk.Button(btns, text="+ Default mic",
+                                      style="Toolbar.TButton",
+                                      command=self._add_default_mic)
+
+        self.add_play_btn = ttk.Button(btns, text="+ System sound",
+                                       style="Toolbar.TButton",
+                                       command=self._add_system_playback)
+
+        Tooltip(self.add_play_btn, "Records what you hear through your "
+                                   "speakers or headphones (the other side "
+                                   "of a call, videos, ...).")
+        self._flow(btns, [self.add_dev_btn, self.add_mic_btn,
+                          self.add_play_btn])
+        btns2 = ttk.Frame(box, style="TFrame")
+        btns2.pack(fill="x", pady=(10, 0))
         meters_toggle = ToggleSwitch(btns2, self.live_levels_var,
-                                     text="Live meters")
+                                     text="Show sound levels before recording")
         meters_toggle.pack(side="left")
-        Tooltip(meters_toggle, "Show each device's live level even while not "
-                               "recording, so you can check a mic works.")
-        dev_refresh = ttk.Button(btns2, text="Refresh",
-                                 command=self._refresh_devices)
-        dev_refresh.pack(side="right")
-        Tooltip(dev_refresh, "Re-scan for plugged-in/unplugged devices.")
-        ttk.Label(inner, text="Balance each device with the faders; meters are live.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+        Tooltip(meters_toggle, "Keeps the level meters moving while you're "
+                               "not recording, so you can check a mic works.")
+        self._wrap_label(box, "Tip: speak normally and watch the meter - "
+                         "green to yellow is good, red means too loud.",
+                         style="Muted.TLabel").pack(fill="x", pady=(8, 0))
 
     def _build_screen(self, parent):
-        inner = self._section(parent, "Screen recording  (optional)")
-        top = ttk.Frame(inner, style="TFrame")
-        top.pack(fill="x")
-        ttk.Label(top, text="Record a screen").pack(side="left")
-        ToggleSwitch(top, self.screen_enabled, command=self._toggle_screen).pack(
-            side="left", padx=(12, 0))
+        box = ttk.Frame(parent, style="TFrame")
+        box.pack(fill="x", pady=(16, 0))
+        ttk.Label(box, text="Screen (optional)", style="Header.TLabel").pack(
+            anchor="w", pady=(0, 6))
+        inner = ttk.Frame(box, style="Card.TFrame", padding=(12, 10))
+        inner.pack(fill="x")
+        self.screen_toggle = ToggleSwitch(inner, self.screen_enabled,
+                                          text="Record the screen too",
+                                          command=self._toggle_screen)
+        self.screen_toggle.pack(anchor="w")
 
         # Collapsible options panel: only visible when the toggle is on.
-        self.screen_opts = ttk.Frame(inner, style="TFrame")
-        row = ttk.Frame(self.screen_opts, style="TFrame")
+        self.screen_opts = ttk.Frame(inner, style="Card.TFrame")
+        row = ttk.Frame(self.screen_opts, style="Card.TFrame")
         row.pack(fill="x", pady=(10, 0))
-        ttk.Label(row, text="Monitor:").pack(side="left")
+        ttk.Label(row, text="Which screen:", style="Card.TLabel").pack(
+            side="left")
         self.monitor_combo = ttk.Combobox(row, textvariable=self.monitor_var,
-                                          width=26, state="readonly")
-        self.monitor_combo.pack(side="left", padx=6)
-        ident_btn = ttk.Button(row, text="Identify screens",
-                               command=self._identify_screens)
-        ident_btn.pack(side="left", padx=6)
-        Tooltip(ident_btn, "Flashes a big number on each monitor so you can "
-                           "tell which is which.")
+                                          width=22, state="readonly")
+        self.monitor_combo.pack(side="left", padx=8, fill="x", expand=True)
+        self.ident_btn = ttk.Button(row, text="Identify screens",
+                                    style="Toolbar.TButton",
+                                    command=self._identify_screens)
+        self.ident_btn.pack(side="left")
+        Tooltip(self.ident_btn, "Shows a big number on each screen so you "
+                                "can tell which is which.")
         self._refresh_monitor_list()
         ttk.Label(self.screen_opts,
-                  text="Encoder, quality and crash-safety options are in Settings.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
+                  text="Video quality and file type are in Settings.",
+                  style="CardMuted.TLabel").pack(anchor="w", pady=(8, 0))
         self._toggle_screen()
 
     def _toggle_screen(self):
@@ -561,174 +830,260 @@ class App(tk.Tk):
         else:
             self.screen_opts.pack_forget()
 
-    # --------------------------------------------------------- settings win #
-    def _open_settings(self):
+    def _flow(self, frame, items, gap=8):
+        """Lay buttons out left to right and wrap onto the next line when
+        the pane is too narrow (small windows, 150% scaling)."""
+        def relayout(_e=None):
+            width = frame.winfo_width()
+            if width <= 1:
+                width = sum(w.winfo_reqwidth() + gap for w in items)
+            x = y = line_h = 0
+            for w in items:
+                rw, rh = w.winfo_reqwidth(), w.winfo_reqheight()
+                if x and x + rw > width:
+                    x, y, line_h = 0, y + line_h + gap, 0
+                w.place(x=x, y=y)
+                x += rw + gap
+                line_h = max(line_h, rh)
+            if int(frame.cget("height")) != y + line_h:
+                frame.configure(height=y + line_h)
+        relayout()
+        frame.bind("<Configure>", relayout, add="+")
+
+    def _wrap_label(self, parent, text, style="Muted.TLabel", width=440):
+        """A label that wraps to whatever width its container gives it
+        (a fixed pixel wraplength clipped text at 150% and left big gaps
+        on wide windows)."""
+        lbl = ttk.Label(parent, text=text, style=style, justify="left",
+                        wraplength=int(width * self._s))
+        lbl.bind("<Configure>", lambda e: lbl.configure(
+            wraplength=max(120, e.width - 4)))
+        return lbl
+
+    def _choice_combo(self, parent, key, var, values=None, width=28):
+        """Readonly combobox that shows plain-language labels but reads and
+        writes the unchanged config tokens in `var`."""
+        pairs = [(v, lbl) for v, lbl in ux.CHOICES[key]
+                 if values is None or v in values]
+        disp = tk.StringVar(value=ux.choice_label(key, var.get()))
+        cb = ttk.Combobox(parent, textvariable=disp, state="readonly",
+                          values=[lbl for _, lbl in pairs], width=width)
+        cb.bind("<<ComboboxSelected>>",
+                lambda e: var.set(ux.choice_value(key, disp.get())))
+        trace = var.trace_add(
+            "write", lambda *a: disp.set(ux.choice_label(key, var.get())))
+
+        def _untrace(e):
+            if e.widget is cb:
+                try:
+                    var.trace_remove("write", trace)
+                except tk.TclError:
+                    pass
+        cb.bind("<Destroy>", _untrace, add="+")
+        cb._srr_disp = disp  # keep the display var alive with the widget
+        return cb
+
+    def _open_settings(self, tab=None):
         if self.settings_win is not None and self.settings_win.winfo_exists():
             self.settings_win.deiconify()
             self.settings_win.lift()
             self.settings_win.focus_force()
+            if tab is not None:
+                try:
+                    self._settings_nb.select(tab)
+                except tk.TclError:
+                    pass
             return
+        s = self._s
         win = tk.Toplevel(self)
+        win.withdraw()
         self.settings_win = win
-        win.title("Settings  -  SimpleReliableRecorder")
+        win.title("Settings - " + APP_TITLE)
         win.configure(bg=COLORS["bg"])
-        # Wide enough that the longest single row (FPS / Quality / Crash-safety)
-        # and the resilience toggle labels are fully visible without horizontal
-        # scrolling, but clamped to the screen so the window (and its Close
-        # button) can never open partly off a small display.
-        try:
-            sw = win.winfo_screenwidth()
-            sh = win.winfo_screenheight()
-            mon_h = sh if sh < 2000 else sh // 2  # stacked-monitor clamp
-            w, h = min(760, sw - 40), min(780, mon_h - 80)
-        except Exception:
-            w, h = 760, 780
-        win.geometry(f"{w}x{h}")
-        win.minsize(min(720, w), min(560, h))
         try:
             ip = paths.icon_path()
             if ip:
                 win.iconbitmap(ip)
-        except Exception:
+        except tk.TclError:
             pass
         win.transient(self)
+        self._settings_lockables = []
 
         bottom = ttk.Frame(win, style="TFrame")
-        bottom.pack(side="bottom", fill="x", padx=12, pady=10)
+        bottom.pack(side="bottom", fill="x", padx=16, pady=(8, 16))
         ttk.Button(bottom, text="Open logs folder",
-                   command=lambda: os.startfile(paths.logs_dir())).pack(side="left")
+                   command=lambda: self._open_path(paths.logs_dir())).pack(
+            side="left")
+        ttk.Button(bottom, text="Restore defaults",
+                   command=lambda: _restore_tab()).pack(side="left", padx=8)
         ttk.Button(bottom, text="Close", style="Accent.TButton",
                    command=lambda: _on_settings_close()).pack(side="right")
 
+        self._settings_rec_note = ttk.Label(
+            win, style="Warn.TLabel", wraplength=int(560 * s),
+            text="A recording is running. Changes here apply to the next "
+                 "recording; the greyed-out options can't change mid-take.")
+
         # Tabs instead of one tall scroll: each concern fits on screen and the
-        # safety-critical alerts page is findable by name instead of being
-        # below the fold.
+        # safety-critical alerts page is findable by name.
         nb = ttk.Notebook(win)
-        nb.pack(fill="both", expand=True, padx=12, pady=(12, 0))
-        pages = {}
-        for name in ("Recording", "Saving", "Safety & alerts", "Hotkey & tray"):
+        nb.pack(fill="both", expand=True, padx=16, pady=(16, 0))
+        self._settings_nb = nb
+        pages, bodies = {}, []
+        for name in ("Recording", "Saving", "Safety & alerts",
+                     "Hotkey & tray", "Transcription"):
             pg = ScrollFrame(nb)
             nb.add(pg, text=name)
+            pg.body.configure(padding=(16, 16, 16, 8))
             pages[name] = pg.body
+            bodies.append(pg.body)
 
-        # --- Audio output ---
-        a = self._section(pages["Recording"], "Audio output")
-        modes = [
-            ("separate", "Separate file per device  (safest, default)"),
-            ("channels", "Separate channels in ONE file  (mic=ch1, playback=ch2 ...)"),
-            ("mixed", "Single mixed file"),
+        def form_row(parent, r, label, widget_fn):
+            ttk.Label(parent, text=label, style="Panel.TLabel").grid(
+                row=r, column=0, sticky="w", padx=(0, 12), pady=4)
+            w = widget_fn(parent)
+            w.grid(row=r, column=1, sticky="ew", pady=4)
+            return w
+
+        # --- Recording: audio files ---
+        a = self._section(pages["Recording"], "Audio files")
+        seg = SegmentedControl(a, self.output_mode, [
+            ("separate", "A separate file for each device (safest, default)"),
+            ("channels", "One file, each device on its own channel"),
+            ("mixed", "One mixed file"),
+        ], wraplength=460)
+        seg.pack(fill="x")
+        self._settings_lockables.append(seg)
+        af = ttk.Frame(a, style="Panel.TFrame")
+        af.pack(fill="x", pady=(10, 0))
+        af.columnconfigure(1, weight=1)
+        sub = form_row(af, 0, "Sample format", lambda p: self._choice_combo(
+            p, "audio_subtype", self.subtype))
+        self._settings_lockables.append(sub)
+        ttk.Label(a, text="Audio is saved to disk every ~2 seconds, so a "
+                  "crash loses almost nothing.", style="PanelMuted.TLabel",
+                  wraplength=int(460 * s), justify="left").pack(
+            anchor="w", pady=(6, 0))
+
+        # --- Recording: screen video ---
+        v = self._section(pages["Recording"], "Screen video")
+        vf = ttk.Frame(v, style="Panel.TFrame")
+        vf.pack(fill="x")
+        vf.columnconfigure(1, weight=1)
+        enc_values = ["auto"] + [f for f in ("nvenc", "qsv", "amf",
+                                             "videotoolbox")
+                                 if self.encoders.get(f)] + ["cpu"]
+        rows = [
+            ("Video encoder", lambda p: self._choice_combo(
+                p, "screen_encoder", self.encoder_var, values=enc_values)),
+            ("File type", lambda p: self._choice_combo(
+                p, "screen_container", self.container_var)),
+            ("Codec", lambda p: self._choice_combo(
+                p, "screen_codec", self.codec_var)),
+            ("Frames per second", lambda p: ttk.Spinbox(
+                p, from_=5, to=60, width=6, textvariable=self.fps_var)),
+            ("Quality", lambda p: self._choice_combo(
+                p, "screen_quality", self.quality_var)),
+            ("Crash safety (MP4)", lambda p: self._choice_combo(
+                p, "screen_reliability", self.reliability_var)),
         ]
-        SegmentedControl(a, self.output_mode, modes).pack(fill="x")
-        sub = ttk.Frame(a, style="TFrame")
-        sub.pack(fill="x", pady=(8, 0))
-        ttk.Label(sub, text="Sample format:").pack(side="left")
-        ttk.Combobox(sub, textvariable=self.subtype, width=10, state="readonly",
-                     values=["PCM_16", "FLOAT"]).pack(side="left", padx=6)
-        ttk.Label(sub, text="WAVs are crash-safe (flushed every ~2s).",
-                  style="Muted.TLabel").pack(side="left", padx=8)
+        for i, (label, fn) in enumerate(rows):
+            w = form_row(vf, i, label, fn)
+            if label == "Frames per second":
+                w.grid_configure(sticky="w")
+            self._settings_lockables.append(w)
+        ttk.Label(v, text="MKV files are always crash-safe. For MP4, "
+                  "'Maximum' records in crash-safe pieces and turns them "
+                  "into a normal MP4 when you stop.",
+                  style="PanelMuted.TLabel", wraplength=int(460 * s),
+                  justify="left").pack(anchor="w", pady=(8, 0))
 
-        # --- Screen quality ---
-        s = self._section(pages["Recording"], "Screen recording quality")
-        r1 = ttk.Frame(s, style="TFrame")
-        r1.pack(fill="x")
-        ttk.Label(r1, text="Encoder:").pack(side="left")
-        enc_values = ["auto", "cpu"]
-        for fam in ("nvenc", "qsv", "amf", "videotoolbox"):
-            if self.encoders.get(fam):
-                enc_values.insert(-1, fam)
-        ttk.Combobox(r1, textvariable=self.encoder_var, width=8, state="readonly",
-                     values=enc_values).pack(side="left", padx=6)
-        ttk.Label(r1, text="Container:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(r1, textvariable=self.container_var, width=6, state="readonly",
-                     values=["mkv", "mp4"]).pack(side="left", padx=6)
-        ttk.Label(r1, text="Codec:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(r1, textvariable=self.codec_var, width=6, state="readonly",
-                     values=["h264", "hevc"]).pack(side="left", padx=6)
-
-        r2 = ttk.Frame(s, style="TFrame")
-        r2.pack(fill="x", pady=(8, 0))
-        ttk.Label(r2, text="FPS:").pack(side="left")
-        ttk.Spinbox(r2, from_=5, to=60, width=4,
-                    textvariable=self.fps_var).pack(side="left", padx=4)
-        ttk.Label(r2, text="Quality:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(r2, textvariable=self.quality_var, width=10, state="readonly",
-                     values=["high", "balanced", "small"]).pack(side="left", padx=6)
-        ttk.Label(r2, text="Crash safety:").pack(side="left", padx=(10, 0))
-        ttk.Combobox(r2, textvariable=self.reliability_var, width=12, state="readonly",
-                     values=["hybrid", "fragmented", "standard"]).pack(side="left", padx=6)
-        ttk.Label(s, text="hybrid = crash-safe fragments, auto-cleaned on stop "
-                  "(MKV is always safe).",
-                  style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
-
-        # --- Output location ---
-        o = self._section(pages["Saving"], "Output location")
-        f = ttk.Frame(o, style="TFrame")
+        # --- Saving ---
+        o = self._section(pages["Saving"], "Where recordings are saved")
+        f = ttk.Frame(o, style="Panel.TFrame")
         f.pack(fill="x")
-        ttk.Label(f, text="Save to:").pack(side="left")
-        ttk.Entry(f, textvariable=self.folder_var, width=40).pack(
-            side="left", padx=6, fill="x", expand=True)
-        ttk.Button(f, text="Browse", command=self._browse_folder).pack(side="left")
-        f2 = ttk.Frame(o, style="TFrame")
-        f2.pack(fill="x", pady=(10, 0))
-        ToggleSwitch(f2, self.ask_var, text="Ask for folder each time").pack(side="left")
-        ttk.Label(f2, text="When screen+audio ends:").pack(side="left", padx=(18, 4))
-        ttk.Combobox(f2, textvariable=self.on_stop_var, width=10, state="readonly",
-                     values=["ask", "combine", "separate"]).pack(side="left")
+        ttk.Entry(f, textvariable=self.folder_var, width=30).pack(
+            side="left", fill="x", expand=True)
+        ttk.Button(f, text="Browse...",
+                   command=lambda: self._browse_folder(parent=win)).pack(
+            side="left", padx=(8, 0))
+        ToggleSwitch(o, self.ask_var,
+                     text="Ask where to save each recording").pack(
+            anchor="w", pady=(10, 0))
+        st = self._section(pages["Saving"],
+                           "After recording screen and audio together")
+        sf = ttk.Frame(st, style="Panel.TFrame")
+        sf.pack(fill="x")
+        sf.columnconfigure(1, weight=1)
+        form_row(sf, 0, "Make one video with sound?",
+                 lambda p: self._choice_combo(p, "on_stop_action",
+                                              self.on_stop_var, width=24))
+        ttk.Label(st, text="Your separate tracks are always kept.",
+                  style="PanelMuted.TLabel").pack(anchor="w", pady=(6, 0))
 
         # --- System tray ---
         tsec = self._section(pages["Hotkey & tray"], "System tray")
         ToggleSwitch(tsec, self.tray_var,
                      text="Show a tray icon (turns red while recording)").pack(
-            anchor="w", pady=3)
-        ttk.Label(tsec, text="Takes effect on next launch.",
-                  style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
+            anchor="w")
 
         # --- Push to talk / push to mute ---
         psec = self._section(pages["Hotkey & tray"],
-                             "Push to talk / push to mute hotkey")
+                             "Push-to-talk / push-to-mute hotkey")
         ToggleSwitch(psec, self.ptt_enabled_var,
-                     text="Enable a global hotkey that mutes/unmutes a device").pack(
-            anchor="w", pady=3)
-        pr = ttk.Frame(psec, style="TFrame")
-        pr.pack(fill="x", pady=(8, 0))
-        ttk.Label(pr, text="Hotkey:").pack(side="left")
-        ttk.Entry(pr, textvariable=self.ptt_hotkey_var, width=14).pack(
-            side="left", padx=6)
-        ttk.Label(pr, text="e.g. f8, ctrl+space", style="Muted.TLabel").pack(
-            side="left")
-        pr2 = ttk.Frame(psec, style="TFrame")
-        pr2.pack(fill="x", pady=(8, 0))
-        ttk.Label(pr2, text="Mode:").pack(side="left")
-        ttk.Combobox(pr2, textvariable=self.ptt_mode_var, width=8, state="readonly",
-                     values=["ptt", "ptm", "toggle"]).pack(side="left", padx=6)
-        ttk.Label(pr2, text="Device:").pack(side="left", padx=(10, 0))
-        self.ptt_device_combo = ttk.Combobox(pr2, width=30, state="readonly")
-        self.ptt_device_combo.pack(side="left", padx=6)
+                     text="Use a keyboard shortcut to mute or unmute").pack(
+            anchor="w")
+        pf = ttk.Frame(psec, style="Panel.TFrame")
+        pf.pack(fill="x", pady=(10, 0))
+        pf.columnconfigure(1, weight=1)
+
+        def key_field(p):
+            fr = ttk.Frame(p, style="Panel.TFrame")
+            ttk.Entry(fr, textvariable=self.ptt_hotkey_var, width=14).pack(
+                side="left")
+            ttk.Button(fr, text="Set key...", style="Toolbar.TButton",
+                       command=lambda: self._capture_hotkey(win)).pack(
+                side="left", padx=(8, 0))
+            return fr
+        kf = form_row(pf, 0, "Key", key_field)
+        kf.grid_configure(sticky="w")
+        self._hotkey_status_lbl = ttk.Label(pf, text="",
+                                            style="PanelMuted.TLabel")
+        self._hotkey_status_lbl.grid(row=1, column=1, sticky="w",
+                                     pady=(0, 4))
+        form_row(pf, 2, "What it does", lambda p: self._choice_combo(
+            p, "ptt_mode", self.ptt_mode_var, width=28))
+
+        def dev_field(p):
+            self.ptt_device_combo = ttk.Combobox(p, width=30, state="readonly")
+            return self.ptt_device_combo
+        form_row(pf, 3, "Device", dev_field)
         self._populate_ptt_devices()
         self.ptt_device_combo.bind("<<ComboboxSelected>>",
                                    lambda e: self._on_ptt_device_pick())
-        ttk.Label(psec,
-                  text="ptt = hold to talk (released = muted).  "
-                  "ptm = hold to mute.  toggle = press to flip.  "
-                  "Device blank = all microphones.",
-                  style="Muted.TLabel", wraplength=560, justify="left").pack(
-            anchor="w", pady=(6, 0))
+        ttk.Label(psec, text="Works even when this window is in the "
+                  "background. 'All microphones' mutes every mic you record.",
+                  style="PanelMuted.TLabel", wraplength=int(460 * s),
+                  justify="left").pack(anchor="w", pady=(8, 0))
+        self._update_hotkey_status()
 
         # --- Scrivox transcription (always shown, so the path can be set
         # even when auto-detection finds nothing) ---
         if not self._transcribe_busy:
             self._scrivox_exe = scrivox_bridge.find_scrivox(
                 self.cfg.get("scrivox_path"))
-        xsec = self._section(pages["Saving"], "Transcription (Scrivox)")
-        scrivox_status = ttk.Label(xsec, style="Muted.TLabel", wraplength=560,
-                                   justify="left")
+            self._scrivox_checked = True
+        xsec = self._section(pages["Transcription"], "Scrivox")
+        scrivox_status = ttk.Label(xsec, style="PanelMuted.TLabel",
+                                   wraplength=int(460 * s), justify="left")
         scrivox_status.pack(anchor="w")
-        xpath = ttk.Frame(xsec, style="TFrame")
+        xpath = ttk.Frame(xsec, style="Panel.TFrame")
         xpath.pack(fill="x", pady=(8, 0))
-        ttk.Label(xpath, text="Scrivox location:").pack(side="left")
-        ttk.Entry(xpath, textvariable=self.scrivox_path_var, width=34).pack(
-            side="left", padx=6, fill="x", expand=True)
-        xrow = ttk.Frame(xsec, style="TFrame")
+        ttk.Label(xpath, text="Scrivox location", style="Panel.TLabel").pack(
+            side="left")
+        ttk.Entry(xpath, textvariable=self.scrivox_path_var, width=28).pack(
+            side="left", padx=8, fill="x", expand=True)
+        xrow = ttk.Frame(xsec, style="Panel.TFrame")
         xrow.pack(fill="x", pady=(8, 0))
         open_btn = ttk.Button(xrow, text="Open Scrivox",
                               command=lambda: scrivox_bridge.open_scrivox(
@@ -738,23 +1093,23 @@ class App(tk.Tk):
             text="Transcription options (model, language, speakers, "
             "API keys, screen-description detail) are configured "
             "inside Scrivox and used automatically here.",
-            style="Muted.TLabel", wraplength=560, justify="left")
+            style="PanelMuted.TLabel", wraplength=int(460 * s), justify="left")
 
         def _scrivox_update_status():
             # Until Scrivox is actually found, the ONLY Scrivox UI anywhere
             # is this location setting - no dead buttons, no explainer text.
             if self._scrivox_exe:
                 scrivox_status.config(
-                    text=f"Scrivox detected:  {self._scrivox_exe}")
+                    text=f"Scrivox found:  {self._scrivox_exe}")
                 if not open_btn.winfo_manager():
-                    open_btn.pack(side="left", padx=(6, 0))
+                    open_btn.pack(side="left", padx=(8, 0))
                 if not scrivox_info.winfo_manager():
-                    scrivox_info.pack(anchor="w", pady=(6, 0))
+                    scrivox_info.pack(anchor="w", pady=(8, 0))
             else:
                 scrivox_status.config(
-                    text="Scrivox not found. Point 'Scrivox location' at "
-                         "Scrivox.exe (or its folder), or leave it blank to "
-                         "auto-detect an installed/portable Scrivox.")
+                    text="Scrivox isn't installed or wasn't found. Leave the "
+                         "location blank to find it automatically, or point "
+                         "it at Scrivox.exe (or its folder).")
                 open_btn.pack_forget()
                 scrivox_info.pack_forget()
 
@@ -768,49 +1123,113 @@ class App(tk.Tk):
             self._refresh_library()
 
         def _scrivox_browse():
+            cur = self.scrivox_path_var.get().strip()
+            start = (cur if os.path.isdir(cur) else os.path.dirname(cur)) \
+                if cur else os.environ.get("ProgramFiles", "")
             p = filedialog.askopenfilename(
                 parent=win, title="Locate Scrivox.exe",
+                initialdir=start or None,
                 filetypes=[("Scrivox", "Scrivox.exe"),
                            ("Programs", "*.exe"), ("All files", "*.*")])
             if p:
                 self.scrivox_path_var.set(p)
                 _scrivox_redetect()
 
-        ttk.Button(xrow, text="Browse", command=_scrivox_browse).pack(
+        ttk.Button(xrow, text="Browse...", command=_scrivox_browse).pack(
             side="left")
-        ttk.Button(xrow, text="Check", command=_scrivox_redetect).pack(
-            side="left", padx=6)
+        ttk.Button(xrow, text="Check again", command=_scrivox_redetect).pack(
+            side="left", padx=(8, 0))
         _scrivox_update_status()
 
         # --- Resilience ---
-        rsec = self._section(pages["Safety & alerts"], "Resilience")
+        rsec = self._section(pages["Safety & alerts"],
+                             "If something stops working")
         ToggleSwitch(rsec, self.autorestart_var,
-                     text="Auto-restart a subsystem if it fails mid-recording").pack(
-            anchor="w", pady=3)
+                     text="Restart a stopped device or screen capture "
+                          "automatically").pack(anchor="w", pady=3)
         ToggleSwitch(rsec, self.watchdog_var,
-                     text="Run an independent background watchdog process").pack(
-            anchor="w", pady=3)
-        ttk.Label(rsec, text="The watchdog is a separate process that alerts you even "
-                  "if this app freezes.", style="Muted.TLabel").pack(anchor="w",
-                                                                     pady=(4, 0))
+                     text="Run a background watchdog").pack(anchor="w", pady=3)
+        ttk.Label(rsec, text="The watchdog is a separate helper that warns "
+                  "you even if this window freezes.",
+                  style="PanelMuted.TLabel", wraplength=int(460 * s),
+                  justify="left").pack(anchor="w", pady=(4, 0))
 
         # --- Alerts ---
-        al = self._section(pages["Safety & alerts"], "Alert me if recording stops")
+        al = self._section(pages["Safety & alerts"],
+                           "Warn me if recording stops")
         for text, var in (("Play a sound", self.sound_var),
-                          ("Flashing gold banner", self.banner_var),
+                          ("Show a flashing gold bar in this window",
+                           self.banner_var),
                           ("Flash the taskbar button", self.taskbar_var),
-                          ("Watchdog pop-up message box", self.msgbox_var)):
+                          ("Pop up a message from the watchdog",
+                           self.msgbox_var)):
             ToggleSwitch(al, var, text=text).pack(anchor="w", pady=3)
 
+        tab_defaults = {
+            0: [(self.output_mode, "audio_output_mode"),
+                (self.subtype, "audio_subtype"),
+                (self.encoder_var, "screen_encoder"),
+                (self.container_var, "screen_container"),
+                (self.codec_var, "screen_codec"),
+                (self.fps_var, "screen_framerate"),
+                (self.quality_var, "screen_quality"),
+                (self.reliability_var, "screen_reliability")],
+            1: [(self.ask_var, "ask_every_time"),
+                (self.on_stop_var, "on_stop_action")],
+            2: [(self.autorestart_var, "auto_restart"),
+                (self.watchdog_var, "watchdog_enabled"),
+                (self.sound_var, "alert_sound"),
+                (self.banner_var, "alert_banner"),
+                (self.taskbar_var, "alert_taskbar_flash"),
+                (self.msgbox_var, "alert_messagebox")],
+            3: [(self.tray_var, "tray_enabled"),
+                (self.ptt_enabled_var, "ptt_enabled"),
+                (self.ptt_hotkey_var, "ptt_hotkey"),
+                (self.ptt_mode_var, "ptt_mode"),
+                (self.ptt_target_var, "ptt_target")],
+            4: [(self.scrivox_path_var, "scrivox_path")],
+        }
+
+        def _restore_tab():
+            i = nb.index(nb.select())
+            name = nb.tab(i, "text")
+            if i == 0 and self.recording:
+                self._notice("Recording in progress",
+                             "Recording settings can be reset after you "
+                             "stop.", parent=win)
+                return
+            if not self._confirm(
+                    "Restore defaults",
+                    f"Put every setting on the '{name}' tab back to how it "
+                    "was when the app was installed?",
+                    yes="Restore defaults", no="Cancel", parent=win):
+                return
+            for var, key in tab_defaults.get(i, []):
+                var.set(DEFAULTS[key])
+            if i == 1:
+                self.folder_var.set(paths.default_recordings_dir())
+            if i == 3:
+                self._populate_ptt_devices()
+            if i == 4:
+                _scrivox_redetect()
+
         def _on_settings_close():
+            try:
+                self._settings_tab = nb.index(nb.select())
+            except tk.TclError:
+                pass
             self._save_settings()
             # Commit any pending (debounced) hotkey change right away.
             if self._hotkey_job:
                 try:
                     self.after_cancel(self._hotkey_job)
-                except Exception:
+                except tk.TclError:
                     pass
-                self._reconfigure_hotkeys()
+            self._hotkey_status_lbl = None
+            self.settings_win = None
+            self._settings_rec_note = None
+            self._settings_lockables = []
+            self._reconfigure_hotkeys()
             # Apply a hand-edited Scrivox path without needing the Check
             # button: re-detect (skipping the cache) and refresh the library
             # so the Transcribe button appears/disappears immediately.
@@ -818,64 +1237,349 @@ class App(tk.Tk):
                 self._scrivox_exe = scrivox_bridge.find_scrivox(
                     self.cfg.get("scrivox_path"), force=True)
             self._refresh_library()
-            self.settings_win = None
             win.destroy()
         win.protocol("WM_DELETE_WINDOW", _on_settings_close)
         win.bind("<Escape>", lambda e: _on_settings_close())
 
-    IDLE_TEXT = "Ready - press RECORD (or F9) to start. Everything saves automatically."
+        # Size to the content (not a fixed pixel box that clipped at 150%),
+        # clamped to the screen so Close is always reachable.
+        win.update_idletasks()
+        try:
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            mon_h = sh if sh < 2000 else sh // 2  # stacked-monitor clamp
+            need_w = max(b.winfo_reqwidth() for b in bodies) + int(60 * s)
+            need_h = (max(b.winfo_reqheight() for b in bodies)
+                      + bottom.winfo_reqheight() + int(110 * s))
+            w = min(max(need_w, int(600 * s)), sw - 40)
+            h = min(max(need_h, int(440 * s)), mon_h - 80)
+            x = self.winfo_rootx() + max(0, (self.winfo_width() - w) // 2)
+            y = self.winfo_rooty() + max(0, (self.winfo_height() - h) // 4)
+            x = max(0, min(x, sw - w))
+            y = max(0, min(y, mon_h - h - 40))
+            win.geometry(f"{w}x{h}+{x}+{y}")
+            win.minsize(min(int(520 * s), w), min(int(380 * s), h))
+        except (tk.TclError, ValueError):
+            win.geometry("760x640")
+        try:
+            nb.select(tab if tab is not None else self._settings_tab)
+        except tk.TclError:
+            pass
+        self._sync_settings_lock()
+        win.deiconify()
+        set_dark_titlebar(win)
+        win.focus_set()
 
-    def _build_record(self, parent):
-        inner = self._section(parent, "Record")
-        self.record_btn = tk.Button(inner, text="●  RECORD", command=self._toggle_record,
-                                    bg=COLORS["green"], fg="#0b0b0b",
-                                    font=("Segoe UI", 20, "bold"), relief="flat",
-                                    height=2, activebackground="#7fd687",
-                                    cursor="hand2", takefocus=1,
-                                    highlightthickness=2,
-                                    highlightbackground=COLORS["bg"],
-                                    highlightcolor=COLORS["fg"])
-        self.record_btn.pack(fill="x", pady=4)
-        # F9 works everywhere (a bare Space would fight with text entries).
-        self.bind("<F9>", lambda e: self._toggle_record())
-        self.status_lbl = ttk.Label(inner, text=self.IDLE_TEXT,
-                                    style="Muted.TLabel")
-        self.status_lbl.pack(anchor="w", pady=(6, 0))
-        # Where files go - the top question from new users. Click to open.
-        self.saveto_lbl = ttk.Label(
-            inner, style="Muted.TLabel", cursor="hand2",
-            text=f"Saving to: {self.cfg.resolved_save_folder()}")
-        self.saveto_lbl.pack(anchor="w", pady=(2, 0))
+    def _capture_hotkey(self, parent):
+        """'Press a key...' dialog: records the next key combination in the
+        exact format the global hotkey library expects."""
+        win = self._modal_dialog("Set hotkey", parent=parent)
+        frm = ttk.Frame(win, style="TFrame", padding=24)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text="Press the key or key combination to use",
+                  style="Section.TLabel").pack(anchor="w")
+        shown = ttk.Label(frm, text="Waiting for a key...",
+                          style="Header.TLabel")
+        shown.pack(anchor="w", pady=(12, 4))
+        ttk.Label(frm, text="Function keys (F1-F12) work best. Esc cancels.",
+                  style="Muted.TLabel").pack(anchor="w")
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x", pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+
+        def on_key(e):
+            if e.keysym == "Escape":
+                win.destroy()
+                return "break"
+            combo = ux.hotkey_from_event(e.keysym, int(e.state),
+                                         windows=(sys.platform == "win32"))
+            if combo:
+                shown.configure(text=combo)
+                self.ptt_hotkey_var.set(combo)
+                if not self.ptt_enabled_var.get():
+                    self.ptt_enabled_var.set(True)
+                win.after(350, win.destroy)
+            return "break"
+        win.bind("<KeyPress>", on_key)
+        self._finish_dialog(win, lambda: None, focus=win,
+                            bind_return=False)
+        win.wait_window()
+
+    def _sync_settings_lock(self):
+        """While recording, grey out the Settings that only apply when a take
+        starts and say so, instead of silently ignoring the change."""
+        on = not (self.recording or self._starting)
+        for w in list(self._settings_lockables):
+            try:
+                if not w.winfo_exists():
+                    continue
+                if isinstance(w, SegmentedControl):
+                    w.set_enabled(on)
+                elif isinstance(w, ttk.Combobox):
+                    w.configure(state="readonly" if on else "disabled")
+                else:
+                    w.state(["!disabled"] if on else ["disabled"])
+            except tk.TclError:
+                pass
+        note = self._settings_rec_note
+        if note is not None:
+            try:
+                if not on:
+                    note.pack(fill="x", padx=16, pady=(12, 0),
+                              before=self._settings_nb)
+                else:
+                    note.pack_forget()
+            except tk.TclError:
+                pass
+
+    # Kept for callers/tests that referenced the old constant.
+    IDLE_TEXT = "Ready - press Record (or F9) to start. Everything saves automatically."
+
+    def _make_record_icons(self):
+        """Red dot (idle) and white square (recording) images for the big
+        button - the red record dot every Windows recorder uses."""
+        size = max(14, int(16 * self._s))
+        try:
+            from PIL import Image, ImageDraw, ImageTk
+        except ImportError:
+            return None, None
+        dot = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        ImageDraw.Draw(dot).ellipse([1, 1, size - 2, size - 2],
+                                    fill=(239, 83, 80, 255))
+        sq = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        m = max(2, size // 6)
+        ImageDraw.Draw(sq).rectangle([m, m, size - 1 - m, size - 1 - m],
+                                     fill=(255, 255, 255, 255))
+        # A transparent spacer keeps the button's pixel width while it
+        # shows "Starting..." / "Saving..." (no image = width in characters).
+        self._rec_blank = ImageTk.PhotoImage(
+            Image.new("RGBA", (size, size), (0, 0, 0, 0)))
+        return ImageTk.PhotoImage(dot), ImageTk.PhotoImage(sq)
+
+    def _build_record(self, bar):
+        """The command bar: Record/Stop, big timer, status, save location."""
+        s = self._s
+        bar.columnconfigure(1, weight=1)
+        self._rec_blank = None
+        self._rec_dot, self._rec_square = self._make_record_icons()
+        self.record_btn = tk.Button(
+            bar, command=self._toggle_record, relief="flat", bd=0,
+            font=("Segoe UI Semibold", 14), compound="left",
+            padx=int(18 * s), pady=int(10 * s), cursor="hand2", takefocus=1,
+            highlightthickness=2, highlightbackground=COLORS["panel"],
+            highlightcolor=COLORS["fg"], disabledforeground="#c7ccd4")
+        self.record_btn.grid(row=0, column=0, rowspan=3, sticky="nsw",
+                             padx=(0, 20))
+        self._style_record_btn("idle")
+        Tooltip(self.record_btn, "Start or stop recording (F9 works from "
+                                 "anywhere in this window).")
+
+        self.elapsed_lbl = ttk.Label(bar, text="00:00:00", style="Timer.TLabel")
+        self.elapsed_lbl.grid(row=0, column=1, sticky="w")
+        self.status_lbl = ttk.Label(bar, text=self._idle_text(),
+                                    style="Bar.TLabel")
+        self.status_lbl.grid(row=1, column=1, sticky="ew")
+        self.status_lbl.bind("<Configure>", lambda e: self.status_lbl.configure(
+            wraplength=max(200, e.width - 4)))
+
+        # Where files go - the top question from new users. Looks like a
+        # link, opens the folder; "Change..." picks another one.
+        srow = ttk.Frame(bar, style="Bar.TFrame")
+        srow.grid(row=2, column=1, sticky="ew", pady=(2, 0))
+        self._saveto_row = srow
+        self._saveto_prefix = ttk.Label(srow, text="Saving to", style="BarMuted.TLabel")
+        self._saveto_prefix.pack(side="left")
+        self.saveto_lbl = ttk.Label(srow, style="Link.TLabel", cursor="hand2",
+                                    text=self.cfg.resolved_save_folder())
+        self.saveto_lbl.pack(side="left", padx=(6, 0))
         self.saveto_lbl.bind(
             "<Button-1>",
             lambda e: self._open_folder(self.cfg.resolved_save_folder()))
-        self.folder_var.trace_add(
-            "write", lambda *a: self.saveto_lbl.config(
-                text=f"Saving to: {self.cfg.resolved_save_folder()}"))
-        Tooltip(self.saveto_lbl, "Click to open this folder.")
-        # One shared busy area for combine/convert/transcribe background jobs:
-        # motion while something runs, and a way to drop what hasn't started.
-        self.busy_row = ttk.Frame(inner, style="TFrame")
-        self.busy_bar = ttk.Progressbar(self.busy_row, mode="indeterminate",
-                                        style="Busy.Horizontal.TProgressbar")
-        self.busy_bar.pack(side="left", fill="x", expand=True)
-        self.busy_cancel = ttk.Button(self.busy_row, text="Cancel queued",
-                                      command=self._cancel_queued_jobs)
-        self.busy_cancel.pack(side="left", padx=(8, 0))
+        Tooltip(self.saveto_lbl, "Open the recordings folder (Ctrl+O).")
+        self._saveto_change = ttk.Label(srow, text="Change...",
+                                        style="Link.TLabel", cursor="hand2")
+        self._saveto_change.pack(side="left", padx=(12, 0))
+        self._saveto_change.bind("<Button-1>", lambda e: self._browse_folder())
+        self._saveto_font = tkfont.Font(family=FONT, size=10, underline=True)
+        srow.bind("<Configure>", lambda e: self._update_saveto())
+        self.folder_var.trace_add("write", lambda *a: self._update_saveto())
+
+        right = ttk.Frame(bar, style="Bar.TFrame")
+        right.grid(row=0, column=2, rowspan=3, sticky="ne", padx=(16, 0))
+        self.settings_btn = ttk.Button(right, text="Settings",
+                                       command=self._open_settings)
+        self.settings_btn.pack(anchor="e")
+        Tooltip(self.settings_btn, "Settings (Ctrl+,)")
+        lights = ttk.Frame(right, style="Bar.TFrame")
+        lights.pack(anchor="e", pady=(10, 0))
+        self.audio_light = StatusLight(lights, "Audio", bg=COLORS["panel"])
+        self.audio_light.pack(anchor="w")
+        self.screen_light = StatusLight(lights, "Screen", bg=COLORS["panel"])
+        self.screen_light.pack(anchor="w", pady=(2, 0))
+        self._idle_lights()
+
+    def _style_record_btn(self, mode):
+        """idle: neutral button with a red dot. recording: red Stop.
+        busy: disabled with a word saying what is happening."""
+        b = self.record_btn
+        s = self._s
+        common = {"width": int(150 * s)} if self._rec_dot else {"width": 10}
+        if mode == "recording":
+            b.config(text="  Stop", image=self._rec_square or "", cursor="hand2",
+                     bg=COLORS["red"], fg="#ffffff",
+                     activebackground="#ff7b72", activeforeground="#ffffff",
+                     state="normal", **common)
+        elif mode in ("starting", "saving"):
+            # Stays "normal" (a disabled image is drawn stippled); the start
+            # and stop latches already ignore clicks while busy.
+            b.config(text="Starting..." if mode == "starting"
+                     else "Saving...", image=self._rec_blank or "",
+                     bg=COLORS["panel3"], fg=COLORS["muted"],
+                     activebackground=COLORS["panel3"],
+                     activeforeground=COLORS["muted"], cursor="watch",
+                     state="normal", **common)
+            return
+        else:
+            b.config(text="  Record", image=self._rec_dot or "", cursor="hand2",
+                     bg=COLORS["panel3"], fg=COLORS["fg"],
+                     activebackground="#3a404b", activeforeground=COLORS["fg"],
+                     state="normal", **common)
+            if not self._rec_dot:
+                b.config(text="●  Record")
+
+    def _update_saveto(self):
+        """Middle-ellipsize the save path to the space available so both the
+        drive and the folder name stay readable."""
+        try:
+            path = self.cfg.resolved_save_folder()
+            avail = (self._saveto_row.winfo_width()
+                     - self._saveto_prefix.winfo_reqwidth()
+                     - self._saveto_change.winfo_reqwidth() - int(30 * self._s))
+            if avail < 60:
+                avail = int(360 * self._s)
+            self.saveto_lbl.config(text=ux.middle_ellipsize(
+                path, avail, self._saveto_font.measure))
+        except tk.TclError:
+            pass
+
+    def _idle_text(self):
+        """'Ready - 2 sources + screen. Press Record or F9.'"""
+        try:
+            n = len(self._gather_sources())
+        except (AttributeError, tk.TclError):
+            n = 0
+        bits = []
+        if n:
+            bits.append(ux.plural(n, "audio source"))
+        try:
+            if self.screen_enabled.get():
+                bits.append("the screen")
+        except AttributeError:
+            pass
+        if not bits:
+            return "Add a microphone or turn on screen recording to start."
+        return f"Ready to record {' + '.join(bits)}. Press Record or F9."
+
+    @staticmethod
+    def _open_path(path):
+        """Open a file or folder with the system's default app (Explorer for
+        folders) on every OS - os.startfile only exists on Windows."""
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            if sys.platform == "win32":
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", path])
+            else:
+                subprocess.Popen(["xdg-open", path])
+            return True
+        except OSError as e:
+            log.warning("open failed for %s: %s", path, e)
+            return False
 
     def _open_folder(self, path):
-        try:
-            if path and os.path.isdir(path):
-                os.startfile(path)
-        except Exception as e:
-            log.warning("open folder failed: %s", e)
+        if path and os.path.isdir(path):
+            self._open_path(path)
 
-    def _set_busy(self, on):
-        """Show/hide the animated busy bar under the status label."""
+    def _build_strip(self, parent):
+        """A slim result strip under the command bar: 'Saved - 2 tracks -
+        3:12 - 41 MB  [Open folder] [Rename] [Play]'. Hidden until needed."""
+        s = self._s
+        self.strip = tk.Frame(parent, bg=COLORS["panel2"],
+                              highlightthickness=0)
+        self._strip_accent = tk.Frame(self.strip, bg=COLORS["green"],
+                                      width=max(3, int(4 * s)))
+        self._strip_accent.pack(side="left", fill="y")
+        inner = ttk.Frame(self.strip, style="StripOk.TFrame",
+                          padding=(12, 8, 8, 8))
+        inner.pack(side="left", fill="both", expand=True)
+        self._strip_title = ttk.Label(inner, style="StripOk.TLabel")
+        self._strip_title.pack(side="left")
+        self._strip_text = ttk.Label(inner, style="Strip.TLabel")
+        self._strip_text.pack(side="left", padx=(10, 0), fill="x", expand=True)
+        self._strip_close = ttk.Button(inner, text="✕", width=3,
+                                       style="Toolbar.TButton",
+                                       command=self._hide_strip)
+        self._strip_close.pack(side="right")
+        Tooltip(self._strip_close, "Dismiss")
+        self._strip_actions = ttk.Frame(inner, style="StripOk.TFrame")
+        self._strip_actions.pack(side="right", padx=(8, 8))
+
+    def _show_strip(self, kind, title, text, actions=(), timeout_ms=None):
+        """kind: 'ok' (green), 'warn' (gold) or 'info' (accent)."""
+        color = {"ok": COLORS["green"], "warn": COLORS["gold"]}.get(
+            kind, COLORS["accent"])
+        style = {"ok": "StripOk", "warn": "StripWarn"}.get(kind, "StripInfo")
         try:
+            self._strip_accent.configure(bg=color)
+            self._strip_title.configure(text=title, style=f"{style}.TLabel")
+            self._strip_text.configure(text=text)
+            for w in self._strip_actions.winfo_children():
+                w.destroy()
+            for i, (label, fn) in enumerate(actions):
+                ttk.Button(self._strip_actions, text=label,
+                           style="Accent.TButton" if i == 0 else "Toolbar.TButton",
+                           command=fn).pack(side="left", padx=(0, 6))
+            if not self.strip.winfo_manager():
+                self.strip.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+            if self._strip_job:
+                self.after_cancel(self._strip_job)
+                self._strip_job = None
+            if timeout_ms:
+                self._strip_job = self.after(timeout_ms, self._hide_strip)
+        except tk.TclError:
+            pass
+
+    def _hide_strip(self):
+        self._strip_job = None
+        try:
+            self.strip.grid_remove()
+        except tk.TclError:
+            pass
+
+    def _set_status_note(self, text, ms=4000):
+        """Briefly show a note in the status line, then go back to whatever
+        is really happening (instead of a stale message staying forever)."""
+        if self.recording or self._finalizing or self._starting:
+            return
+        self.status_lbl.config(text=text)
+        self.after(ms, lambda: None if (self.recording or self._finalizing)
+                   else self._restore_status())
+
+    def _set_busy(self, on, text=None):
+        """Show/hide the background-job progress in the Recordings footer.
+        Its row keeps its height either way, so nothing jumps."""
+        if not hasattr(self, "busy_bar"):
+            return  # called while the window is still being built
+        try:
+            if text is not None:
+                self.busy_lbl.config(text=text)
             if on:
-                if not self.busy_row.winfo_manager():
-                    self.busy_row.pack(fill="x", pady=(6, 0))
+                if not self.busy_bar.winfo_manager():
+                    self.busy_lbl.pack(side="left", padx=(0, 8))
+                    self.busy_bar.pack(side="left")
+                    self.busy_cancel.pack(side="left", padx=(8, 0))
                     if str(self.busy_bar.cget("mode")) == "indeterminate":
                         self.busy_bar.start(12)
                 if not self._transcribe_busy:
@@ -884,10 +1588,11 @@ class App(tk.Tk):
             else:
                 self.busy_bar.stop()
                 self.busy_bar.config(mode="indeterminate", value=0)
-                self.busy_cancel.config(text="Cancel queued",
+                self.busy_cancel.config(text="Cancel remaining",
                                         command=self._cancel_queued_jobs)
-                self.busy_row.pack_forget()
-        except Exception:
+                for w in (self.busy_lbl, self.busy_bar, self.busy_cancel):
+                    w.pack_forget()
+        except tk.TclError:
             pass
 
     def _cancel_queued_jobs(self):
@@ -899,109 +1604,154 @@ class App(tk.Tk):
             self._combine_results.append((False, out,
                                           "Cancelled before it started."))
         if dropped:
-            self.status_lbl.config(
-                text="Finishing the current job... (queued ones cancelled)")
+            self.busy_lbl.config(text="Finishing the current job...")
         self.busy_cancel.config(state="disabled")
 
-    # ----------------------------------------------------- recordings library #
     def _build_library(self, parent):
-        inner = self._section(parent, "Recordings library")
-        desc = ttk.Label(
-            inner, style="Muted.TLabel", justify="left",
-            text="Past recordings stay listed here so you can keep recording, "
-            "then tick any (click anywhere on a row) and use the buttons "
-            "below. Double-click renames; right-click for more options. "
-            "Entries whose files are moved are removed automatically.")
-        desc.pack(fill="x", anchor="w")
-        # Wrap the text to the actual panel width instead of a fixed value, so it
-        # fills the column rather than hugging the left edge.
-        desc.bind("<Configure>",
-                  lambda e, w=desc: w.configure(wraplength=max(200, e.width - 4)))
-
-        self.lib_holder = ScrollFrame(inner)
-        self.lib_holder.configure(height=150)
-        self.lib_holder.pack(fill="x", pady=(8, 0))
-        self.lib_body = self.lib_holder.body
-        self.lib_empty = ttk.Label(
-            inner, style="Muted.TLabel", justify="left",
-            text="No recordings yet. Your first one will appear here the "
-                 "moment you press STOP - nothing to save manually.")
-        self.lib_empty.pack(anchor="w", pady=(4, 0))
-
-        selrow = ttk.Frame(inner, style="TFrame")
-        selrow.pack(fill="x", pady=(6, 0))
-        ttk.Button(selrow, text="Select all", width=10,
-                   command=lambda: self._set_all_ticks(True)).pack(side="left")
-        ttk.Button(selrow, text="Clear", width=8,
-                   command=lambda: self._set_all_ticks(False)).pack(
-            side="left", padx=6)
-        self.lib_sel_lbl = ttk.Label(selrow, text="Nothing selected.",
-                                     style="Muted.TLabel")
-        self.lib_sel_lbl.pack(side="left", padx=(10, 0))
-
-        b = ttk.Frame(inner, style="TFrame")
-        b.pack(fill="x", pady=(4, 0))
-        self.lib_btn_video = ttk.Button(
-            b, text="Make one video with sound",
-            command=lambda: self._combine_selected_library("video"),
-            state="disabled")
-        self.lib_btn_video.pack(fill="x", pady=2)
-        self.lib_btn_multi = ttk.Button(
-            b, text="Combine audio into one multitrack file",
-            command=lambda: self._combine_selected_library("multitrack"),
-            state="disabled")
-        self.lib_btn_multi.pack(fill="x", pady=2)
-        self.lib_btn_mix = ttk.Button(
-            b, text="Mix all audio into one stereo file",
-            command=lambda: self._combine_selected_library("mix"),
-            state="disabled")
-        self.lib_btn_mix.pack(fill="x", pady=2)
-        self.lib_btn_convert = ttk.Button(
-            b, text="Convert to...  (MP4, MP3, MKV, WAV ...)",
-            command=self._convert_selected_library, state="disabled")
-        self.lib_btn_convert.pack(fill="x", pady=2)
-        # Only shown when a Scrivox install is detected (see _refresh_library).
-        self.lib_btn_transcribe = ttk.Button(
-            b, text="Transcribe with Scrivox...",
-            command=self._transcribe_selected_library, state="disabled")
-
-        b2 = ttk.Frame(inner, style="TFrame")
-        b2.pack(fill="x", pady=(2, 0))
-        open_btn = ttk.Button(b2, text="Open folder", width=12,
-                              command=self._open_selected_library)
-        open_btn.pack(side="left")
-        remove_btn = ttk.Button(b2, text="Remove", width=10,
-                                command=self._remove_selected_library)
-        remove_btn.pack(side="left", padx=6)
+        """Recordings as a real Windows list: multi-select with Ctrl/Shift,
+        sortable columns, double-click opens, F2 renames, Del removes."""
+        s = self._s
+        head = ttk.Frame(parent, style="TFrame")
+        head.grid(row=0, column=0, sticky="ew")
+        ttk.Label(head, text="Recordings", style="Section.TLabel").pack(
+            side="left")
+        self.lib_count_lbl = ttk.Label(head, text="", style="Muted.TLabel")
+        self.lib_count_lbl.pack(side="left", padx=(8, 0), pady=(3, 0))
         refresh_btn = ttk.Button(
-            b2, text="Refresh", width=10,
+            head, text="Refresh", style="Toolbar.TButton",
             command=lambda: self._refresh_library(rescan=True))
         refresh_btn.pack(side="right")
-
-        # Disabled buttons should say WHY on hover; the text is updated in
-        # _update_library_buttons as the selection changes.
-        self._lib_tips = {
-            "video": Tooltip(self.lib_btn_video,
-                             "Joins the ticked recordings end to end into one "
-                             "video with their sound."),
-            "multi": Tooltip(self.lib_btn_multi,
-                             "One WAV where every ticked track keeps its own "
-                             "channel - great for editing."),
-            "mix": Tooltip(self.lib_btn_mix,
-                           "Everything summed into one stereo file."),
-            "convert": Tooltip(self.lib_btn_convert,
-                               "Export each ticked recording to another "
-                               "format (MP4, MP3, MKV, WAV...)."),
-            "transcribe": Tooltip(self.lib_btn_transcribe,
-                                  "Turn the ticked recordings into text with "
-                                  "Scrivox - saved next to each recording."),
-        }
-        Tooltip(remove_btn, "Removes from this list only - never deletes "
-                            "files on disk.")
-        Tooltip(refresh_btn, "Re-scan the save folder for recordings made "
+        Tooltip(refresh_btn, "Look in the save folder for recordings made "
                              "outside this app.")
-        Tooltip(open_btn, "Open the selected recording's folder.")
+
+        tb = ttk.Frame(parent, style="TFrame")
+        tb.grid(row=1, column=0, sticky="ew", pady=(8, 8))
+        self.lib_btn_open = ttk.Button(tb, text="Open folder",
+                                       style="Toolbar.TButton",
+                                       command=self._open_selected_library)
+        self.lib_btn_open.pack(side="left")
+        Tooltip(self.lib_btn_open, "Open the selected recording's folder "
+                                   "(or double-click it).")
+        self.lib_btn_combine = ttk.Menubutton(tb, text="Combine",
+                                              direction="below")
+        self.lib_btn_combine.pack(side="left", padx=(8, 0))
+        self.lib_combine_menu = tk.Menu(
+            self.lib_btn_combine, tearoff=0, bg=COLORS["panel2"],
+            fg=COLORS["fg"], activebackground=COLORS["accent"],
+            activeforeground="#06120f", disabledforeground="#6b717c", bd=0)
+        self.lib_combine_menu.add_command(
+            label="Make one video with sound",
+            command=lambda: self._combine_selected_library("video"))
+        self.lib_combine_menu.add_command(
+            label="Combine audio into one multitrack file",
+            command=lambda: self._combine_selected_library("multitrack"))
+        self.lib_combine_menu.add_command(
+            label="Mix all audio into one stereo file",
+            command=lambda: self._combine_selected_library("mix"))
+        self.lib_btn_combine["menu"] = self.lib_combine_menu
+        Tooltip(self.lib_btn_combine, "Join the selected recordings into one "
+                                      "file. Your originals are kept.")
+        self.lib_btn_convert = ttk.Button(
+            tb, text="Convert...", style="Toolbar.TButton",
+            command=self._convert_selected_library)
+        self.lib_btn_convert.pack(side="left", padx=(8, 0))
+        Tooltip(self.lib_btn_convert, "Export each selected recording to "
+                                      "another format (MP4, MP3, MKV, WAV...).")
+        # Only shown when a Scrivox install is detected (see _refresh_library).
+        self.lib_btn_transcribe = ttk.Button(
+            tb, text="Transcribe...", style="Toolbar.TButton",
+            command=self._transcribe_selected_library)
+        Tooltip(self.lib_btn_transcribe, "Turn the selected recordings into "
+                                         "text with Scrivox.")
+        self.lib_btn_remove = ttk.Button(tb, text="Remove",
+                                         style="Toolbar.TButton",
+                                         command=self._remove_selected_library)
+        self.lib_btn_remove.pack(side="right")
+        Tooltip(self.lib_btn_remove, "Remove from this list (Del). Files on "
+                                     "disk are never deleted.")
+
+        tf = ttk.Frame(parent, style="TFrame")
+        tf.grid(row=2, column=0, sticky="nsew")
+        tf.columnconfigure(0, weight=1)
+        tf.rowconfigure(0, weight=1)
+        cols = ("name", "created", "length", "contents", "size")
+        tree = ttk.Treeview(tf, columns=cols, show="headings",
+                            selectmode="extended")
+        self.lib_tree = tree
+        spec = {"name": ("Name", 200, True, "w"),
+                "created": ("Recorded", 140, False, "w"),
+                "length": ("Length", 70, False, "e"),
+                "contents": ("Contents", 130, False, "w"),
+                "size": ("Size", 76, False, "e")}
+        for c in cols:
+            title, width, stretch, anchor = spec[c]
+            tree.heading(c, text=title, anchor=anchor,
+                         command=lambda c=c: self._sort_library(c))
+            tree.column(c, width=int(width * s), minwidth=int(56 * s),
+                        stretch=stretch, anchor=anchor)
+        vsb = ttk.Scrollbar(tf, orient="vertical", command=tree.yview)
+
+        def _yset(lo, hi):
+            vsb.set(lo, hi)
+            if float(lo) <= 0.0 and float(hi) >= 1.0:
+                vsb.grid_remove()
+            else:
+                vsb.grid()
+        tree.configure(yscrollcommand=_yset)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        self.lib_empty = ttk.Label(
+            tf, style="CardMuted.TLabel", justify="center",
+            text="No recordings yet.\nPress Record - each recording shows "
+                 "up here the moment you stop.")
+
+        tree.bind("<<TreeviewSelect>>", lambda e: self._update_library_buttons())
+        tree.bind("<Double-1>", self._on_library_double)
+        tree.bind("<Return>", lambda e: self._open_selected_library())
+        tree.bind("<F2>", lambda e: self._rename_selected_library())
+        tree.bind("<Delete>", lambda e: self._remove_selected_library())
+        tree.bind("<Control-a>", lambda e: (self._set_all_ticks(True), "break")[1])
+        tree.bind("<Button-3>", self._on_library_right_click)
+
+        foot = ttk.Frame(parent, style="TFrame")
+        foot.grid(row=3, column=0, sticky="ew", pady=(8, 0))
+        # One shared busy area for combine/convert/transcribe background
+        # jobs. Packed first so the selection text can never squeeze it.
+        self.busy_row = ttk.Frame(foot, style="TFrame")
+        self.busy_row.pack(side="right")
+        self.lib_sel_lbl = ttk.Label(foot, text="", style="Muted.TLabel",
+                                     justify="left", wraplength=int(300 * s))
+        self.lib_sel_lbl.pack(side="left", fill="x", expand=True)
+        self.lib_sel_lbl.bind("<Configure>", lambda e: self.lib_sel_lbl.configure(
+            wraplength=max(160, e.width - 4)))
+        self.busy_lbl = ttk.Label(self.busy_row, text="", style="Muted.TLabel")
+        self.busy_bar = ttk.Progressbar(self.busy_row, mode="indeterminate",
+                                        length=int(120 * s),
+                                        style="Busy.Horizontal.TProgressbar")
+        self.busy_cancel = ttk.Button(self.busy_row, text="Cancel remaining",
+                                      style="Toolbar.TButton",
+                                      command=self._cancel_queued_jobs)
+        # Reserve the row height so showing the progress never shifts the list.
+        foot.update_idletasks()
+        foot.rowconfigure(0, minsize=self.busy_cancel.winfo_reqheight())
+        ttk.Frame(foot, height=self.busy_cancel.winfo_reqheight(),
+                  width=1, style="TFrame").pack(side="right")
         self._refresh_library()
+
+    def _on_library_double(self, event):
+        iid = self.lib_tree.identify_row(event.y)
+        if iid and iid in self._lib_iids:
+            self._open_entry_folder(self._lib_iids[iid])
+        return "break"
+
+    def _on_library_right_click(self, event):
+        iid = self.lib_tree.identify_row(event.y)
+        if not iid or iid not in self._lib_iids:
+            return
+        if iid not in self.lib_tree.selection():
+            self.lib_tree.selection_set(iid)
+        self.lib_tree.focus(iid)
+        self._show_library_menu(event, self._lib_iids[iid])
 
     def _add_to_library(self, select_new=False):
         audio = [a for a in (self.last_outputs.get("audio") or [])
@@ -1014,7 +1764,7 @@ class App(tk.Tk):
                             + (self.last_outputs.get("videos_extra") or []))
                 if v and os.path.isfile(v)]
         if not audio and not vids:
-            return
+            return None
         self._lib_seq += 1
         entry = library.make_entry(
             entry_id=f"rec{self._lib_seq}-{int(self._record_start_mono)}",
@@ -1023,152 +1773,230 @@ class App(tk.Tk):
             audio=audio, video=(vids[0] if vids else ""),
             video_segments=vids,
             created=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        if self._last_take_secs:
+            self._lib_meta[entry["id"]] = (self._meta_key(entry),
+                                           self._last_take_secs,
+                                           ux.total_size(audio + vids))
         self._library.append(entry)
         self.cfg.set("recordings", self._library)
         self._refresh_library()
-        # Auto-tick the recording that was just made so its actions are ready.
+        # Select the recording that was just made so its actions are ready.
         if select_new:
-            for r in self._lib_rows:
-                if r["entry"].get("id") == entry["id"]:
-                    r["var"].set(True)
+            for iid, e in self._lib_iids.items():
+                if e.get("id") == entry["id"]:
+                    self.lib_tree.selection_set(iid)
+                    self.lib_tree.focus(iid)
+                    self.lib_tree.see(iid)
                     break
             self._update_library_buttons()
+        return entry
+
+    @staticmethod
+    def _meta_key(entry):
+        return tuple(entry.get("audio") or []) + tuple(
+            entry.get("video_segments") or [entry.get("video") or ""])
 
     def _refresh_library(self, rescan=False):
-        # Remember which entries are ticked so a refresh (e.g. right after a
-        # long merge finishes) doesn't make the user re-find their selection.
-        ticked = set()
-        for r in self._lib_rows:
-            try:
-                if r["var"].get():
-                    ticked.add(r["entry"].get("id"))
-            except Exception:
-                pass
-        # Prune anything whose files vanished, then rebuild the checklist.
-        self._library, pruned = library.prune(self._library)
         if rescan:
-            try:
-                known = {e.get("out_dir") for e in self._library}
-                found = library.scan_folder(self.cfg.resolved_save_folder(),
-                                            existing_dirs=known)
-                if found:
-                    self._library.extend(found)
-                    # Keep the whole list chronological so back-filled old
-                    # recordings don't show up above yesterday's takes.
-                    self._library.sort(key=lambda e: e.get("created") or "")
-                    pruned = True
-            except Exception as e:
-                log.warning("Library rescan failed: %s", e)
+            # Disk-bound: scan (and re-detect Scrivox) on a worker, then come
+            # back here with the result.
+            known = {e.get("out_dir") for e in self._library}
+            folder = self.cfg.resolved_save_folder()
+            override = self.cfg.get("scrivox_path")
+            self._set_status_note("Looking for recordings...")
+
+            def work():
+                try:
+                    exe = scrivox_bridge.find_scrivox(override, force=True)
+                except Exception:
+                    exe = None
+                try:
+                    found = library.scan_folder(folder, existing_dirs=known)
+                except Exception as e:
+                    log.warning("Library rescan failed: %s", e)
+                    found = []
+                self._safe_after(lambda: self._apply_scan(found, exe,
+                                                          announce=True))
+            threading.Thread(target=work, name="library-scan",
+                             daemon=True).start()
+            return
+        tree = self.lib_tree
+        # Remember the selection so a refresh (e.g. right after a long merge
+        # finishes) doesn't make the user re-find it.
+        selected = {e.get("id") for e in self._selected_library_entries()}
+        focus_id = self._lib_iids.get(tree.focus(), {}).get("id")
+        # Prune anything whose files vanished, then rebuild the list.
+        self._library, pruned = library.prune(self._library)
         if pruned:
             self.cfg.set("recordings", self._library)
-        for r in self._lib_rows:
-            try:
-                r["frame"].destroy()
-            except Exception:
-                pass
+        tree.delete(*tree.get_children())
+        self._lib_iids = {}
         self._lib_rows = []
-        for e in reversed(self._library):  # newest first
-            row = ttk.Frame(self.lib_body, style="Card.TFrame", padding=6)
-            row.pack(fill="x", pady=2)
-            var = tk.BooleanVar(value=(e.get("id") in ticked))
-            cb = ToggleSwitch(row, var, command=self._update_library_buttons)
-            cb.pack(side="left")
-            # Name + muted metadata on separate lines: the date is how people
-            # actually remember a take, and long names get middle-ellipsized
-            # instead of pushing everything off-screen.
-            txt = ttk.Frame(row, style="Card.TFrame")
-            txt.pack(side="left", padx=(10, 0), fill="x", expand=True)
-            name_lbl = ttk.Label(txt, text=_ellipsize(e["name"]),
-                                 style="Card.TLabel")
-            name_lbl.pack(anchor="w")
-            created = (e.get("created") or "")[:16]
-            meta = library.summarize(e) + (f"   ·   {created}" if created else "")
-            meta_lbl = tk.Label(txt, text=meta, bg=COLORS["panel2"],
-                                fg=COLORS["muted"], font=(FONT, 9))
-            meta_lbl.pack(anchor="w")
-            # Click anywhere on the row to tick it (the tiny toggle was the
-            # only target before). Double-click still renames: the two rapid
-            # clicks toggle twice (net unchanged), then the dialog opens.
-            def _toggle(ev, v=var):
-                v.set(not v.get())
-                self._update_library_buttons()
-            for w in (row, txt, name_lbl, meta_lbl):
-                w.bind("<Button-1>", _toggle)
-                w.bind("<Double-Button-1>",
-                       lambda ev, ent=e: self._rename_entry(ent))
-            # Right-click a row for a context menu (rename / open / show).
-            for w in (row, txt, name_lbl, meta_lbl, cb,
-                      getattr(cb, "label", None), getattr(cb, "canvas", None)):
-                if w is not None:
-                    w.bind("<Button-3>",
-                           lambda ev, ent=e: self._show_library_menu(ev, ent))
-            self._lib_rows.append({"frame": row, "var": var, "entry": e})
-        has = bool(self._library)
-        self.lib_empty.pack_forget() if has else self.lib_empty.pack(
-            anchor="w", pady=(4, 0))
+        col, desc = self._lib_sort
+        entries = sorted(self._library, key=lambda e: self._lib_sort_key(e, col),
+                         reverse=desc)
+        for i, e in enumerate(entries):
+            iid = f"e{i}"
+            self._lib_iids[iid] = e
+            tree.insert("", "end", iid=iid, values=self._lib_values(e))
+            if e.get("id") in selected:
+                tree.selection_add(iid)
+            if e.get("id") == focus_id:
+                tree.focus(iid)
+            self._lib_rows.append({"iid": iid, "entry": e, "frame": tree,
+                                   "var": _TreeSelVar(tree, iid)})
+        for c in ("name", "created", "length", "contents", "size"):
+            title = tree.heading(c, "text").rstrip(" ▲▼")
+            if c == col:
+                title += " ▼" if desc else " ▲"
+            tree.heading(c, text=title)
+        n = len(self._library)
+        self.lib_count_lbl.config(text=f"({n})" if n else "")
+        if n:
+            self.lib_empty.place_forget()
+        else:
+            self.lib_empty.place(relx=0.5, rely=0.45, anchor="center")
         # Re-detect Scrivox on every rebuild so dropping it next to the app (or
         # installing it) starts working without a restart - and removing it
-        # hides the button again. Cached in the bridge; the Refresh button
-        # (rescan=True) forces a fresh sweep. Never re-detect mid-transcription.
-        if not self._transcribe_busy:
+        # hides the button again. Cached in the bridge; never re-detect
+        # mid-transcription or before the background detection has run.
+        if self._scrivox_checked and not self._transcribe_busy:
             self._scrivox_exe = scrivox_bridge.find_scrivox(
-                self.cfg.get("scrivox_path"), force=rescan)
+                self.cfg.get("scrivox_path"))
         if self._scrivox_exe:
             if not self.lib_btn_transcribe.winfo_manager():
-                self.lib_btn_transcribe.pack(fill="x", pady=2)
+                self.lib_btn_transcribe.pack(side="left", padx=(8, 0))
         else:
             self.lib_btn_transcribe.pack_forget()
         self._update_library_buttons()
+        self._fill_library_meta()
+
+    def _lib_values(self, e):
+        meta = self._lib_meta.get(e.get("id"))
+        if meta and meta[0] == self._meta_key(e):
+            length, size = ux.fmt_duration(meta[1]) if meta[1] else "", \
+                ux.fmt_bytes(meta[2])
+        else:
+            length, size = "...", "..."
+        n_audio = len(e.get("audio") or [])
+        return (ux.friendly_recording_name(e.get("name", "")),
+                ux.friendly_created(e.get("created") or ""),
+                length, ux.contents_text(n_audio, 1 if e.get("video") else 0),
+                size)
+
+    def _lib_sort_key(self, e, col):
+        if col == "name":
+            return ux.friendly_recording_name(e.get("name", "")).lower()
+        if col in ("length", "size"):
+            meta = self._lib_meta.get(e.get("id"))
+            if not meta:
+                return -1.0
+            return float((meta[1] if col == "length" else meta[2]) or 0)
+        if col == "contents":
+            return (len(e.get("audio") or []), 1 if e.get("video") else 0)
+        return e.get("created") or ""
+
+    def _sort_library(self, col):
+        cur, desc = self._lib_sort
+        desc = (not desc) if col == cur else (col in ("created", "length",
+                                                        "size"))
+        self._lib_sort = (col, desc)
+        self.cfg.set("library_sort", ("-" if desc else "") + col)
+        self._refresh_library()
+
+    def _fill_library_meta(self):
+        """Length and size come from the files (WAV headers, file sizes), so
+        they are read on a worker and filled in as they arrive."""
+        todo = [e for e in self._library
+                if (self._lib_meta.get(e.get("id")) or (None,))[0]
+                != self._meta_key(e)]
+        if not todo or self._lib_meta_busy:
+            return
+        self._lib_meta_busy = True
+
+        def work():
+            out = {}
+            for e in todo:
+                files = list(e.get("audio") or []) + list(
+                    e.get("video_segments") or [e.get("video") or ""])
+                secs = 0.0
+                for a in e.get("audio") or []:
+                    try:
+                        import soundfile
+                        secs = float(soundfile.info(a).duration)
+                        break
+                    except Exception as ex:
+                        log.debug("no duration for %s: %s", a, ex)
+                        continue
+                out[e.get("id")] = (self._meta_key(e), secs,
+                                    ux.total_size([f for f in files if f]))
+            self._safe_after(lambda: self._apply_library_meta(out))
+        threading.Thread(target=work, name="library-meta", daemon=True).start()
+
+    def _apply_library_meta(self, meta):
+        self._lib_meta_busy = False
+        self._lib_meta.update(meta)
+        for iid, e in self._lib_iids.items():
+            if e.get("id") in meta and self.lib_tree.exists(iid):
+                self.lib_tree.item(iid, values=self._lib_values(e))
+        if self._lib_sort[0] in ("length", "size"):
+            self._refresh_library()
 
     def _update_library_buttons(self):
-        """Light the library action buttons based on what is currently ticked."""
+        """Enable the actions that fit the current selection, and say in
+        words why the others are unavailable."""
         sel = self._selected_library_entries()
         n = len(sel)
+        states = {}
         if n == 0:
-            self.lib_sel_lbl.config(text="Tick recordings above to combine them.")
-            for btn in (self.lib_btn_video, self.lib_btn_multi, self.lib_btn_mix,
-                        self.lib_btn_convert, self.lib_btn_transcribe):
-                btn.config(state="disabled")
+            hint = ("Select recordings to combine, convert or transcribe. "
+                    "Ctrl+click picks several; double-click opens one."
+                    if self._library else "")
+            self.lib_sel_lbl.config(text=hint)
+            for i in range(3):
+                self.lib_combine_menu.entryconfigure(i, state="disabled")
+            for btn in (self.lib_btn_combine, self.lib_btn_convert,
+                        self.lib_btn_transcribe, self.lib_btn_remove):
+                btn.state(["disabled"])
             return
         all_video = all(e.get("video") for e in sel)
+        any_video = any(e.get("video") for e in sel)
         total_audio = sum(len(e.get("audio", [])) for e in sel)
-        word = "recording" if n == 1 else "recordings"
-        self.lib_sel_lbl.config(text=f"{n} {word} selected.")
-        # Video: only when every selected take has a video.
-        self.lib_btn_video.config(state=("normal" if all_video else "disabled"))
-        if not all_video:
-            self._lib_tips["video"].set_text(
-                "Needs a screen recording in EVERY ticked take - untick the "
-                "audio-only ones, or use an audio button instead.")
-        else:
-            self._lib_tips["video"].set_text(
-                "Joins the ticked recordings end to end into one video with "
-                "their sound.")
-        # Multitrack: needs at least two audio tracks across the selection.
-        self.lib_btn_multi.config(state=("normal" if total_audio >= 2 else "disabled"))
-        self._lib_tips["multi"].set_text(
-            "One WAV where every ticked track keeps its own channel - great "
-            "for editing." if total_audio >= 2 else
-            "Needs at least two audio tracks across the ticked recordings.")
-        # Mix: any audio present.
-        self.lib_btn_mix.config(state=("normal" if total_audio >= 1 else "disabled"))
-        self._lib_tips["mix"].set_text(
-            "Everything summed into one stereo file." if total_audio else
-            "No audio in the current selection.")
-        # Convert: each ticked recording is exported on its own.
-        self.lib_btn_convert.config(state="normal")
-        # Transcribe: anything with audio or video qualifies.
+        states["video"] = all_video
+        states["multi"] = total_audio >= 2
+        states["mix"] = total_audio >= 1
+        for i, key in enumerate(("video", "multi", "mix")):
+            self.lib_combine_menu.entryconfigure(
+                i, state="normal" if states[key] else "disabled")
+        self.lib_btn_combine.state(["!disabled"] if any(states.values())
+                                   else ["disabled"])
+        self.lib_btn_convert.state(["!disabled"])
+        self.lib_btn_remove.state(["!disabled"])
         has_media = any(e.get("audio") or e.get("video") for e in sel)
-        self.lib_btn_transcribe.config(
-            state=("normal" if has_media else "disabled"))
+        self.lib_btn_transcribe.state(["!disabled"] if has_media
+                                      else ["disabled"])
+        text = f"{ux.plural(n, 'recording')} selected."
+        if any_video and not all_video:
+            text += (" 'Make one video' needs a screen recording in every "
+                     "selected one.")
+        elif n == 1 and total_audio < 2 and not all_video:
+            text += " Select another to combine them."
+        self.lib_sel_lbl.config(text=text)
 
     def _set_all_ticks(self, on):
-        for r in self._lib_rows:
-            r["var"].set(on)
+        tree = self.lib_tree
+        if on:
+            tree.selection_set(tree.get_children())
+        else:
+            tree.selection_remove(tree.selection())
         self._update_library_buttons()
 
     def _selected_library_entries(self):
-        return [r["entry"] for r in self._lib_rows if r["var"].get()]
+        try:
+            return [self._lib_iids[i] for i in self.lib_tree.selection()
+                    if i in self._lib_iids]
+        except (AttributeError, tk.TclError):
+            return []
 
     def _all_selected_audio(self, sel):
         files = []
@@ -1183,8 +2011,8 @@ class App(tk.Tk):
         multichannel WAV), or 'mix' (one stereo mix). Acts on ticked rows."""
         sel = self._selected_library_entries()
         if not sel:
-            messagebox.showinfo("Combine recordings",
-                                "Tick at least one recording first.")
+            self._notice("Combine recordings",
+                                "Select at least one recording first.")
             return
         out_dir = sel[0].get("out_dir") or self.cfg.resolved_save_folder()
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -1196,10 +2024,10 @@ class App(tk.Tk):
 
         if mode == "video":
             if not all(e.get("video") for e in sel):
-                messagebox.showinfo(
+                self._notice(
                     "Need video",
-                    "Every ticked recording must have a video for this. "
-                    "Untick the audio-only ones, or use an audio option instead.")
+                    "Every selected recording must have a screen video for this. "
+                    "Deselect the audio-only ones, or use an audio option instead.")
                 return
             ext = self.container_var.get()
             out = self._unique_path(
@@ -1217,7 +2045,7 @@ class App(tk.Tk):
         elif mode == "multitrack":
             audio = self._all_selected_audio(sel)
             if len(audio) < 2:
-                messagebox.showinfo("Need more tracks",
+                self._notice("Need more tracks",
                                     "Select recordings with at least two audio "
                                     "tracks between them.")
                 return
@@ -1228,7 +2056,7 @@ class App(tk.Tk):
         else:  # mix
             audio = self._all_selected_audio(sel)
             if not audio:
-                messagebox.showinfo("No audio", "No audio in the selection.")
+                self._notice("No audio", "No audio in the selection.")
                 return
             out = self._unique_path(
                 os.path.join(out_dir, f"{prefix}_mixed_{stamp}.wav"))
@@ -1240,14 +2068,14 @@ class App(tk.Tk):
         """Transcribe every ticked recording with the detected Scrivox."""
         sel = self._selected_library_entries()
         if not sel:
-            messagebox.showinfo("Transcribe",
-                                "Tick at least one recording first.")
+            self._notice("Transcribe",
+                                "Select at least one recording first.")
             return
         self._transcribe_entries(sel)
 
     def _transcribe_entries(self, entries):
         if self._transcribe_busy:
-            messagebox.showinfo("Please wait",
+            self._notice("Please wait",
                                 "A transcription is already running.")
             return
         exe = self._scrivox_exe
@@ -1255,11 +2083,11 @@ class App(tk.Tk):
             # Scrivox was moved/removed since detection; re-check and hide.
             self._refresh_library()
             if not self._scrivox_exe:
-                messagebox.showinfo(
+                self._notice(
                     "Scrivox not found",
                     "Scrivox is no longer where it was detected. Put it back, "
-                    "reinstall it, or set its location in Settings > Saving > "
-                    "Transcription (Scrivox), then try again.")
+                    "reinstall it, or set its location in Settings > "
+                    "Transcription, then try again.")
                 return
             exe = self._scrivox_exe
         any_video = any(e.get("video") for e in entries)
@@ -1319,23 +2147,32 @@ class App(tk.Tk):
 
     def _transcribe_status(self, text):
         # Recording status always wins the label; transcription is background.
-        if not self.recording and not self._finalizing:
+        try:
+            self.busy_lbl.config(text=text if len(text) < 70
+                                 else text[:67] + "...")
+        except tk.TclError:
+            pass
+        if not self.recording and not self._finalizing and not self._starting:
             self.status_lbl.config(text=text)
 
     def _restore_status(self):
         """Put the status label back to whatever is still going on, in
         priority order, so finishing one background job never hides another."""
+        if not hasattr(self, "status_lbl"):
+            return
         if self.recording:
-            self.status_lbl.config(text="Recording...")
+            self.status_lbl.config(text=self._recording_status_text())
+        elif self._starting:
+            self.status_lbl.config(text="Starting...")
         elif self._finalizing:
-            self.status_lbl.config(text="Finalizing recording...")
+            self.status_lbl.config(text="Saving your recording...")
         elif self._combine_busy:
             self.status_lbl.config(
                 text="Combining... (this can take a while for video)")
         elif self._transcribe_busy:
             self.status_lbl.config(text="Transcribing with Scrivox...")
         else:
-            self.status_lbl.config(text=self.IDLE_TEXT)
+            self.status_lbl.config(text=self._idle_text())
         if not self._combine_busy and not self._transcribe_busy:
             self._set_busy(False)
 
@@ -1346,88 +2183,261 @@ class App(tk.Tk):
         # produce several per recording); failure detail is an error string.
         done = [(n, d) for n, ok, d in results if ok]
         failed = [(n, d) for n, ok, d in results if not ok]
-        paths = [p for _, ps in done for p in ps]
-        for p in paths:
+        paths_ = [p for _, ps in done for p in ps]
+        for p in paths_:
             log.info("Transcript saved: %s", p)
         for n, d in failed:
             log.error("Transcription failed for '%s': %s", n, str(d)[:800])
-        if done and not failed:
-            shown = paths if len(paths) <= 12 else (
-                paths[:12] + [f"... and {len(paths) - 12} more"])
-            if messagebox.askyesno(
-                    "Transcription complete",
-                    f"Saved {len(paths)} transcript"
-                    + ("" if len(paths) == 1 else "s") + ":\n"
-                    + "\n".join(shown)
-                    + "\n\nShow the first one in its folder?"):
-                self._reveal_path(paths[0])
-        elif done:
-            messagebox.showwarning(
-                "Transcription partly done",
-                f"Saved {len(paths)} transcript(s), but "
-                f"{len(failed)} recording(s) failed:\n\n"
-                + "\n".join(f"{n}: {str(d)[:200]}" for n, d in failed))
-        else:
-            messagebox.showerror(
-                "Transcription failed",
-                "No transcripts were made.\n\n"
-                + "\n".join(f"{n}: {str(d)[:300]}" for n, d in failed))
+        if paths_:
+            first = paths_[0]
+            names = ", ".join(os.path.basename(p) for p in paths_[:2])
+            if len(paths_) > 2:
+                names += f" and {len(paths_) - 2} more"
+            self._show_strip(
+                "ok" if not failed else "warn",
+                "Transcribed" if not failed else "Partly transcribed",
+                f"Saved {ux.plural(len(paths_), 'transcript')}: {names}",
+                [("Show in folder", lambda: self._reveal_path(first)),
+                 ("Open", lambda: self._open_path(first))])
+        if failed:
+            self._error(
+                "Transcription failed" if not done else
+                "Some transcriptions failed",
+                ("No transcripts were made." if not done else
+                 f"{ux.plural(len(failed), 'recording')} could not be "
+                 "transcribed."),
+                "Check that Scrivox works on its own (Open Scrivox in "
+                "Settings > Transcription), then try again.",
+                details="\n\n".join(f"{n}:\n{str(d)[-1500:]}"
+                                    for n, d in failed))
 
     def _reveal_path(self, path):
+        """Show a file highlighted in Explorer (Finder on macOS)."""
         try:
             if sys.platform == "win32":
                 subprocess.Popen(["explorer", "/select,", os.path.normpath(path)])
             elif sys.platform == "darwin":
                 subprocess.Popen(["open", "-R", path])
             else:
-                os.startfile(os.path.dirname(path))
-        except Exception as e:
-            log.warning("reveal transcript failed: %s", e)
+                self._open_path(os.path.dirname(path))
+        except OSError as e:
+            log.warning("reveal failed: %s", e)
 
-    def _modal_dialog(self, title):
-        """Shared boilerplate for the app's small option dialogs."""
-        win = tk.Toplevel(self)
+    def _modal_dialog(self, title, parent=None):
+        """Shared boilerplate for the app's small themed dialogs. Created
+        hidden and shown centered by _finish_dialog (no flash at 0,0)."""
+        master = parent or self
+        win = tk.Toplevel(master)
+        win.withdraw()
+        win._srr_dialog = True
         win.title(title)
         win.configure(bg=COLORS["bg"])
-        win.transient(self)
-        win.grab_set()
+        try:
+            # A transient of a minimized/hidden window is invisible on
+            # Windows - only tie the dialog to a master that is on screen.
+            if master.winfo_viewable():
+                win.transient(master)
+        except tk.TclError:
+            pass
         win.resizable(False, False)
         try:
             ip = paths.icon_path()
             if ip:
                 win.iconbitmap(ip)
-        except Exception:
+        except tk.TclError:
             pass
         return win
 
-    def _finish_dialog(self, win, ok_fn, focus=None):
-        """Keyboard parity + centering: Enter confirms, Escape cancels."""
-        win.bind("<Return>", lambda e: ok_fn())
-        win.bind("<Escape>", lambda e: win.destroy())
-        win.protocol("WM_DELETE_WINDOW", win.destroy)
+    def _finish_dialog(self, win, ok_fn, focus=None, cancel_fn=None,
+                       bind_return=True):
+        """Keyboard parity + centering: Enter confirms (or presses the focused
+        button), Escape cancels. Then show, grab and focus."""
+        cancel = cancel_fn or win.destroy
+
+        def on_return(_e):
+            w = win.focus_get()
+            if isinstance(w, ttk.Button):
+                w.invoke()
+            else:
+                ok_fn()
+            return "break"
+        if bind_return:
+            win.bind("<Return>", on_return)
+        win.bind("<Escape>", lambda e: cancel())
+        win.protocol("WM_DELETE_WINDOW", cancel)
         win.update_idletasks()
         try:
-            x = self.winfo_rootx() + (self.winfo_width() - win.winfo_width()) // 2
-            y = self.winfo_rooty() + (self.winfo_height() - win.winfo_height()) // 3
+            master = win.master if win.master.winfo_viewable() else None
+            ww, wh = win.winfo_reqwidth(), win.winfo_reqheight()
+            if master is not None:
+                x = master.winfo_rootx() + (master.winfo_width() - ww) // 2
+                y = master.winfo_rooty() + (master.winfo_height() - wh) // 3
+            else:
+                x = (win.winfo_screenwidth() - ww) // 2
+                y = (win.winfo_screenheight() - wh) // 3
             win.geometry(f"+{max(0, x)}+{max(0, y)}")
-        except Exception:
+        except tk.TclError:
             pass
+        win.deiconify()
+        set_dark_titlebar(win)
+        win.lift()
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass  # not viewable yet; the dialog still works without a grab
         (focus or win).focus_set()
+
+    def _dialog_body(self, win, heading, message, kind="info"):
+        """Heading + wrapped message in a padded frame; returns the frame."""
+        s = self._s
+        frm = ttk.Frame(win, style="TFrame", padding=(24, 20, 24, 16))
+        frm.pack(fill="both", expand=True)
+        color = {"warning": COLORS["gold"], "error": COLORS["red"]}.get(kind)
+        head = ttk.Frame(frm, style="TFrame")
+        head.pack(fill="x")
+        if color:
+            tk.Frame(head, bg=color, width=max(3, int(4 * s))).pack(
+                side="left", fill="y", padx=(0, 10))
+        ttk.Label(head, text=heading, style="Section.TLabel",
+                  wraplength=int(440 * s), justify="left").pack(
+            side="left", anchor="w")
+        if message:
+            ttk.Label(frm, text=message, style="TLabel", justify="left",
+                      wraplength=int(440 * s), font=(FONT, 10)).pack(
+                anchor="w", pady=(10, 0))
+        return frm
+
+    def _confirm(self, heading, message, yes="OK", no="Cancel",
+                 default="no", parent=None, check=None, kind="info"):
+        """Themed yes/no with verb buttons and a SAFE default: Enter and
+        Escape pick `no` unless default='yes'. With check='text', returns
+        (answer, checked)."""
+        win = self._modal_dialog(heading, parent=parent)
+        frm = self._dialog_body(win, heading, message, kind=kind)
+        result = {"v": False}
+        check_var = tk.BooleanVar(value=False)
+        if check:
+            ttk.Checkbutton(frm, text=check, variable=check_var).pack(
+                anchor="w", pady=(12, 0))
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x", pady=(20, 0))
+
+        def answer(v):
+            result["v"] = v
+            win.destroy()
+        no_btn = ttk.Button(btns, text=no, command=lambda: answer(False),
+                            style="Accent.TButton" if default == "no"
+                            else "TButton")
+        yes_btn = ttk.Button(btns, text=yes, command=lambda: answer(True),
+                             style="Accent.TButton" if default == "yes"
+                             else "TButton")
+        no_btn.pack(side="right")
+        yes_btn.pack(side="right", padx=(0, 8))
+        focus = yes_btn if default == "yes" else no_btn
+        self._finish_dialog(win, focus.invoke, focus=focus,
+                            cancel_fn=lambda: answer(False))
+        win.wait_window()
+        return (result["v"], check_var.get()) if check else result["v"]
+
+    def _notice(self, heading, message, kind="info", parent=None):
+        """Themed replacement for messagebox.showinfo/showwarning."""
+        win = self._modal_dialog(heading, parent=parent)
+        frm = self._dialog_body(win, heading, message, kind=kind)
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x", pady=(20, 0))
+        ok = ttk.Button(btns, text="OK", style="Accent.TButton",
+                        command=win.destroy)
+        ok.pack(side="right")
+        self._finish_dialog(win, win.destroy, focus=ok)
+        win.wait_window()
+
+    def _error(self, heading, what, todo=None, details=None, parent=None):
+        """Plain-language error: what happened, what to do, and the technical
+        details folded away (with Copy and Open log) for support."""
+        s = self._s
+        win = self._modal_dialog(heading, parent=parent)
+        msg = what + (f"\n\n{todo}" if todo else "")
+        frm = self._dialog_body(win, heading, msg, kind="error")
+        det = None
+        if details:
+            det = ttk.Frame(frm, style="TFrame")
+            txt = tk.Text(det, height=7, width=60, wrap="word",
+                          bg="#101216", fg="#c9ced6", relief="flat",
+                          font=("Consolas", 9), padx=8, pady=6,
+                          highlightthickness=1,
+                          highlightbackground=COLORS["border"])
+            txt.insert("1.0", str(details).strip())
+            txt.configure(state="disabled")
+            txt.pack(fill="both", expand=True)
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x", pady=(20, 0))
+        if det is not None:
+            def toggle():
+                if det.winfo_manager():
+                    det.pack_forget()
+                    more.config(text="Show details")
+                else:
+                    det.pack(fill="both", expand=True, pady=(12, 0),
+                             before=btns)
+                    more.config(text="Hide details")
+            more = ttk.Button(btns, text="Show details",
+                              style="Toolbar.TButton", command=toggle)
+            more.pack(side="left")
+
+            def copy():
+                self.clipboard_clear()
+                self.clipboard_append(str(details))
+            ttk.Button(btns, text="Copy details", style="Toolbar.TButton",
+                       command=copy).pack(side="left", padx=(8, 0))
+        ttk.Button(btns, text="Open log", style="Toolbar.TButton",
+                   command=lambda: self._open_path(paths.logs_dir())).pack(
+            side="left", padx=(8, 0))
+        ok = ttk.Button(btns, text="OK", style="Accent.TButton",
+                        command=win.destroy)
+        ok.pack(side="right", padx=(int(24 * s), 0))
+        self._finish_dialog(win, win.destroy, focus=ok)
+        win.wait_window()
+
+    def _ask_text(self, heading, prompt, initial="", ok_text="OK"):
+        """Themed one-line text input (replaces simpledialog.askstring)."""
+        s = self._s
+        win = self._modal_dialog(heading)
+        frm = self._dialog_body(win, heading, prompt)
+        var = tk.StringVar(value=initial)
+        ent = ttk.Entry(frm, textvariable=var, width=46, font=(FONT, 10))
+        ent.pack(fill="x", pady=(12, 0), ipady=int(2 * s))
+        result = {"v": None}
+
+        def ok():
+            result["v"] = var.get()
+            win.destroy()
+        btns = ttk.Frame(frm, style="TFrame")
+        btns.pack(fill="x", pady=(20, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side="right")
+        ttk.Button(btns, text=ok_text, style="Accent.TButton",
+                   command=ok).pack(side="right", padx=(0, 8))
+        self._finish_dialog(win, ok, focus=ent)
+        ent.select_range(0, "end")
+        ent.icursor("end")
+        win.wait_window()
+        return result["v"]
 
     _SCRIVOX_USE_SETTING = "Use Scrivox setting"
 
     def _transcribe_dialog(self, n_entries, any_video, multi_track,
                            any_combinable=False):
-        """Modal dialog for transcription options.
+        """Modal dialog for transcription options: one clear question first
+        (what do you want?), everything else under More settings.
         Returns a scrivox_bridge.default_options()-shaped dict, or None."""
+        s = self._s
         win = self._modal_dialog("Transcribe with Scrivox")
         result = {"value": None}
-        frm = ttk.Frame(win, style="TFrame")
-        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        frm = ttk.Frame(win, style="TFrame", padding=(24, 20, 24, 16))
+        frm.pack(fill="both", expand=True)
 
         word = "recording" if n_entries == 1 else "recordings"
-        ttk.Label(frm, text=f"Transcribe {n_entries} {word}:",
-                  style="Header.TLabel").pack(anchor="w")
+        ttk.Label(frm, text=f"Transcribe {n_entries} {word}",
+                  style="Section.TLabel").pack(anchor="w")
 
         # ---- quick presets: pick the deliverable, tune anything after ----
         fmt_var = tk.StringVar(value="Plain text (.txt)")
@@ -1448,94 +2458,110 @@ class App(tk.Tk):
             else:
                 sum_var.set(self._SCRIVOX_USE_SETTING)
         preset_var.trace_add("write", _apply_preset)
-        SegmentedControl(frm, preset_var, preset_opts).pack(
-            fill="x", pady=(6, 10))
+        ttk.Label(frm, text="What do you want?", style="Header.TLabel").pack(
+            anchor="w", pady=(14, 6))
+        SegmentedControl(frm, preset_var, preset_opts, wraplength=440).pack(
+            fill="x")
 
         mode_var = tk.StringVar(value="audio")
-        options = [("audio", "Transcribe the audio")]
+        vis_var = tk.BooleanVar(value=False)
         if any_video:
-            options.append(("vision",
-                            "Transcribe the audio + describe what's on screen"))
-        SegmentedControl(frm, mode_var, options).pack(fill="x", pady=(0, 4))
+            vis_toggle = ToggleSwitch(
+                frm, vis_var, text="Also describe what's on screen")
+            vis_toggle.pack(anchor="w", pady=(12, 0))
+
+            def _vis_to_mode(*_a):
+                want = "vision" if vis_var.get() else "audio"
+                if mode_var.get() != want:
+                    mode_var.set(want)
+
+            def _mode_to_vis(*_a):
+                want = mode_var.get() == "vision"
+                if vis_var.get() != want:
+                    vis_var.set(want)
+            vis_var.trace_add("write", _vis_to_mode)
+            mode_var.trace_add("write", _mode_to_vis)
+
+        # ---- output format ----
+        save_row = ttk.Frame(frm, style="TFrame")
+        save_row.pack(fill="x", pady=(14, 0))
+        ttk.Label(save_row, text="Save as").pack(side="left")
+        ttk.Combobox(save_row, textvariable=fmt_var, state="readonly",
+                     width=22,
+                     values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
+                     ).pack(side="left", padx=8)
+
+        # ---- More settings (collapsed by default) ----
+        more_btn = ttk.Button(frm, text="More settings  ▸",
+                              style="Toolbar.TButton")
+        more_btn.pack(anchor="w", pady=(14, 0))
+        adv = ttk.Frame(frm, style="TFrame")
+        USE = self._SCRIVOX_USE_SETTING
 
         # ---- what Scrivox reads (shown whenever combining can happen) ----
         input_var = tk.StringVar(value="mix")
         output_var = tk.StringVar(value="separate")
         combo_var = tk.StringVar(value="auto")
         if any_combinable:
+            cbox = ttk.Frame(adv, style="TFrame")
+            cbox.pack(fill="x")
             combined_text = ("One combined file per recording - every audio "
                              "track merged into one, kept next to the "
                              "recording" if not any_video else
                              "One combined file per recording - every audio "
                              "track + the screen video merged into one video "
                              "file, kept next to the recording")
-            ttk.Label(frm, text="What Scrivox transcribes:").pack(
-                anchor="w", pady=(8, 0))
-            SegmentedControl(frm, input_var, [
+            ttk.Label(cbox, text="What Scrivox transcribes").pack(
+                anchor="w", pady=(10, 0))
+            SegmentedControl(cbox, input_var, [
                 ("mix", combined_text),
                 ("tracks", "Each audio track separately (per mic/playback)"),
-            ]).pack(fill="x", pady=(4, 0))
+            ], wraplength=440).pack(fill="x", pady=(4, 0))
 
             # Reuse policy for the combined file. In per-track mode it only
             # matters for the screen-description pass, so it hides unless
             # that pass will actually run.
-            reuse_row = ttk.Frame(frm, style="TFrame")
+            reuse_row = ttk.Frame(cbox, style="TFrame")
             ttk.Label(reuse_row,
-                      text="If a combined file was already made with SRR:"
-                      ).pack(anchor="w", pady=(8, 0))
+                      text="If a combined file was already made with this app"
+                      ).pack(anchor="w", pady=(10, 0))
             SegmentedControl(reuse_row, combo_var, [
-                ("auto", "Use it - only build one if it's missing or older "
-                         "than the tracks"),
+                ("auto", ("Use it - only build one if it's missing or "
+                          "older than the tracks")),
                 ("rebuild", "Build a fresh one now"),
-            ]).pack(fill="x", pady=(4, 0))
+            ], wraplength=440).pack(fill="x", pady=(4, 0))
 
-            out_row = ttk.Frame(frm, style="TFrame")
-            ttk.Label(out_row, text="Per-track results:").pack(
-                anchor="w", pady=(8, 0))
+            out_row = ttk.Frame(cbox, style="TFrame")
+            ttk.Label(out_row, text="Per-track results").pack(
+                anchor="w", pady=(10, 0))
             SegmentedControl(out_row, output_var, [
                 ("separate", "A transcript file per track"),
-                ("merged", "One combined file: screen descriptions + every "
-                           "track's transcript"),
-            ]).pack(fill="x", pady=(4, 0))
+                ("merged", ("One combined file: screen descriptions + "
+                            "every track's transcript")),
+            ], wraplength=440).pack(fill="x", pady=(4, 0))
 
             def _relayout(*_a):
                 per_track = input_var.get() == "tracks"
                 # Repack in a fixed order so the rows never swap positions:
-                # [what Scrivox transcribes] -> reuse -> per-track -> Save as.
+                # [what Scrivox transcribes] -> reuse -> per-track.
                 reuse_row.pack_forget()
                 out_row.pack_forget()
                 if not per_track or mode_var.get() == "vision":
-                    reuse_row.pack(fill="x", before=save_row)
+                    reuse_row.pack(fill="x")
                 if per_track:
-                    out_row.pack(fill="x", before=save_row)
+                    out_row.pack(fill="x")
                 win.geometry("")  # re-fit the dialog to its content
             input_var.trace_add("write", _relayout)
             mode_var.trace_add("write", _relayout)
-
-        # ---- output format (after the input choices - it describes results)
-        save_row = ttk.Frame(frm, style="TFrame")
-        save_row.pack(fill="x", pady=(8, 0))
-        ttk.Label(save_row, text="Save as:").pack(side="left")
-        ttk.Combobox(save_row, textvariable=fmt_var, state="readonly",
-                     width=22,
-                     values=list(scrivox_bridge.TRANSCRIBE_FORMATS.keys())
-                     ).pack(side="left", padx=6)
-        if any_combinable:
             _relayout()
 
-        # ---- More settings (collapsed by default) ----
-        more_btn = ttk.Button(frm, text="More settings  ▸")
-        more_btn.pack(anchor="w", pady=(12, 0))
-        adv = ttk.Frame(frm, style="TFrame")
-        USE = self._SCRIVOX_USE_SETTING
-
         r1 = ttk.Frame(adv, style="TFrame")
-        r1.pack(fill="x", pady=(8, 0))
-        ttk.Label(r1, text="Identify speakers:").pack(side="left")
+        r1.pack(fill="x", pady=(10, 0))
+        ttk.Label(r1, text="Identify speakers").pack(side="left")
         dia_var = tk.StringVar(value=USE)
         ttk.Combobox(r1, textvariable=dia_var, state="readonly", width=18,
-                     values=[USE, "On", "Off"]).pack(side="left", padx=6)
-        ttk.Label(r1, text="How many:").pack(side="left", padx=(10, 0))
+                     values=[USE, "On", "Off"]).pack(side="left", padx=8)
+        ttk.Label(r1, text="How many").pack(side="left", padx=(8, 0))
         spk_var = tk.StringVar(value="")
         ttk.Spinbox(r1, from_=1, to=20, width=4,
                     textvariable=spk_var).pack(side="left", padx=4)
@@ -1564,12 +2590,12 @@ class App(tk.Tk):
 
         r3 = ttk.Frame(adv, style="TFrame")
         r3.pack(fill="x", pady=(6, 0))
-        ttk.Label(r3, text="Model:").pack(side="left")
+        ttk.Label(r3, text="Model").pack(side="left")
         model_var = tk.StringVar(value=USE)
         ttk.Combobox(r3, textvariable=model_var, state="readonly", width=18,
                      values=[USE, "large-v3", "large-v3-turbo", "medium",
-                             "small", "base", "tiny"]).pack(side="left", padx=6)
-        ttk.Label(r3, text="Language:").pack(side="left", padx=(10, 0))
+                             "small", "base", "tiny"]).pack(side="left", padx=8)
+        ttk.Label(r3, text="Language").pack(side="left", padx=(8, 0))
         lang_var = tk.StringVar(value="")
         ttk.Entry(r3, textvariable=lang_var, width=6).pack(side="left", padx=4)
         ttk.Label(r3, text="e.g. en, ko - blank = auto",
@@ -1577,10 +2603,10 @@ class App(tk.Tk):
 
         r4 = ttk.Frame(adv, style="TFrame")
         r4.pack(fill="x", pady=(6, 0))
-        ttk.Label(r4, text="Meeting summary:").pack(side="left")
+        ttk.Label(r4, text="Meeting summary").pack(side="left")
         sum_var = tk.StringVar(value=USE)
         ttk.Combobox(r4, textvariable=sum_var, state="readonly", width=18,
-                     values=[USE, "On", "Off"]).pack(side="left", padx=6)
+                     values=[USE, "On", "Off"]).pack(side="left", padx=8)
 
         adv_open = {"on": False}
 
@@ -1595,27 +2621,28 @@ class App(tk.Tk):
             win.geometry("")
         more_btn.config(command=_toggle_adv)
 
-        ttk.Label(frm, style="Muted.TLabel", justify="left", wraplength=460,
+        ttk.Label(frm, style="Muted.TLabel", justify="left",
+                  wraplength=int(440 * s),
                   text="Each transcript is saved next to its recording. "
                   "Anything left on 'Use Scrivox setting' (and the API keys) "
                   "comes from Scrivox - use the button below to change those."
-                  ).pack(anchor="w", pady=(10, 8))
+                  ).pack(anchor="w", pady=(14, 0))
 
         btns = ttk.Frame(frm, style="TFrame")
-        btns.pack(fill="x")
+        btns.pack(fill="x", pady=(16, 0))
 
         def open_settings():
             if not scrivox_bridge.open_scrivox(self._scrivox_exe):
-                messagebox.showerror("Scrivox", "Could not launch Scrivox.",
-                                     parent=win)
+                self._notice("Scrivox", "Scrivox could not be started.",
+                             kind="error", parent=win)
 
-        ttk.Button(btns, text="Open Scrivox settings",
+        ttk.Button(btns, text="Open Scrivox settings", style="Toolbar.TButton",
                    command=open_settings).pack(side="left")
 
         def _num(var, cast):
-            s = var.get().strip()
+            s_ = var.get().strip()
             try:
-                return cast(s) if s else None
+                return cast(s_) if s_ else None
             except ValueError:
                 return None
 
@@ -1628,11 +2655,11 @@ class App(tk.Tk):
             opts["merge"] = (output_var.get() == "merged")
             if (opts["input_mode"] == "tracks" and opts["merge"]
                     and fmt not in ("txt", "md")):
-                messagebox.showwarning(
+                self._notice(
                     "Combined file needs a text format",
                     "One combined file only works for Plain text or Markdown. "
                     "Pick one of those formats, or keep a file per track.",
-                    parent=win)
+                    kind="warning", parent=win)
                 return
             opts["use_precombined"] = (combo_var.get() == "auto")
             # The interval only exists for vision; a stale value alongside
@@ -1647,9 +2674,9 @@ class App(tk.Tk):
             m = model_var.get()
             opts["model"] = None if m == USE else m
             opts["language"] = lang_var.get().strip() or None
-            s = sum_var.get()
-            opts["summarize"] = (True if s == "On"
-                                 else False if s == "Off" else None)
+            sm = sum_var.get()
+            opts["summarize"] = (True if sm == "On"
+                                 else False if sm == "Off" else None)
             result["value"] = opts
             win.destroy()
 
@@ -1668,7 +2695,7 @@ class App(tk.Tk):
         Each recording becomes its own output file; several run back to back."""
         sel = self._selected_library_entries()
         if not sel:
-            messagebox.showinfo("Convert", "Tick at least one recording first.")
+            self._notice("Convert", "Select at least one recording first.")
             return
         n_audio = max(len([a for a in e.get("audio", []) if a]) for e in sel)
         has_video = any(e.get("video") for e in sel)
@@ -1693,10 +2720,10 @@ class App(tk.Tk):
         win = self._modal_dialog(
             "Convert recording" + ("" if n_entries == 1 else "s"))
         result = {"value": None}
-        frm = ttk.Frame(win, style="TFrame")
-        frm.pack(fill="both", expand=True, padx=16, pady=14)
+        frm = ttk.Frame(win, style="TFrame", padding=(24, 20, 24, 16))
+        frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="Convert to format:", style="Header.TLabel").pack(
+        ttk.Label(frm, text="Convert to", style="Section.TLabel").pack(
             anchor="w")
         fmt_var = tk.StringVar(value="MP4 (H.264 + AAC)")
         labels = list(combine.CONVERT_FORMATS.keys())
@@ -1704,16 +2731,16 @@ class App(tk.Tk):
                                  state="readonly", width=34)
         fmt_combo.pack(anchor="w", pady=(4, 10))
 
-        ttk.Label(frm, text="Audio handling:", style="Header.TLabel").pack(
+        ttk.Label(frm, text="Audio", style="Header.TLabel").pack(
             anchor="w")
         mode_var = tk.StringVar(value="mix")
         SegmentedControl(frm, mode_var, [
             ("mix", "Mix all audio into one stereo track"),
             ("tracks", "Keep each audio source as its own track"),
-        ]).pack(fill="x", pady=(4, 8))
+        ], wraplength=360).pack(fill="x", pady=(4, 8))
 
         info = ttk.Label(frm, style="Muted.TLabel", justify="left",
-                         wraplength=360)
+                         wraplength=int(360 * self._s))
         info.pack(anchor="w", pady=(0, 10))
 
         def describe(*_):
@@ -1737,7 +2764,7 @@ class App(tk.Tk):
         describe()
 
         btns = ttk.Frame(frm, style="TFrame")
-        btns.pack(fill="x")
+        btns.pack(fill="x", pady=(8, 0))
 
         def ok():
             result["value"] = (fmt_var.get(), mode_var.get())
@@ -1755,68 +2782,87 @@ class App(tk.Tk):
 
     def _open_selected_library(self):
         sel = self._selected_library_entries()
-        target = sel[0] if sel else (self._library[-1] if self._library else None)
-        if not target:
+        if not sel:
+            # Nothing selected: open the recordings folder itself.
+            self._open_folder(self.cfg.resolved_save_folder())
             return
-        d = target.get("out_dir") or ""
-        try:
-            if d and os.path.isdir(d):
-                os.startfile(d)
-        except Exception as e:
-            log.warning("open library folder failed: %s", e)
+        self._open_entry_folder(sel[0])
+
+    def _rename_selected_library(self):
+        sel = self._selected_library_entries()
+        if sel:
+            self._rename_entry(sel[0])
+        return "break"
 
     def _remove_selected_library(self):
         sel = self._selected_library_entries()
         if not sel:
             return
-        if not messagebox.askyesno(
-                "Remove from list",
-                f"Remove {len(sel)} entr" + ("y" if len(sel) == 1 else "ies")
-                + " from the list?\n\nThis does NOT delete the files on disk."):
+        n = len(sel)
+        if not self._confirm(
+                "Remove from the list?",
+                f"Remove {ux.plural(n, 'recording')} from this list?\n\n"
+                "This does NOT delete the files on disk - they stay in their "
+                "folder" + ("s" if n > 1 else "") + ".",
+                yes="Remove from list", no="Cancel"):
             return
         sel_ids = {e["id"] for e in sel}
         self._library = [e for e in self._library if e["id"] not in sel_ids]
         self.cfg.set("recordings", self._library)
         self._refresh_library()
 
-    # --- library right-click context menu -------------------------------- #
     def _show_library_menu(self, event, entry):
         menu = tk.Menu(self, tearoff=0, bg=COLORS["panel2"], fg=COLORS["fg"],
                        activebackground=COLORS["accent"], activeforeground="#06120f",
-                       bd=0)
-        menu.add_command(label="Rename...",
-                         command=lambda: self._rename_entry(entry))
+                       disabledforeground="#6b717c", bd=0)
         menu.add_command(label="Open folder",
                          command=lambda: self._open_entry_folder(entry))
-        menu.add_command(label="Show folder location",
+        menu.add_command(label="Play", command=lambda: self._play_entry(entry))
+        menu.add_command(label="Show in folder",
                          command=lambda: self._reveal_entry_folder(entry))
+        menu.add_separator()
+        menu.add_command(label="Rename...", accelerator="F2",
+                         command=lambda: self._rename_entry(entry))
+        menu.add_command(label="Convert...",
+                         command=self._convert_selected_library)
         if self._scrivox_exe:
-            menu.add_separator()
             menu.add_command(
                 label="Transcribe with Scrivox...",
                 command=lambda: self._transcribe_entries([entry]))
+        menu.add_separator()
+        menu.add_command(label="Remove from list...", accelerator="Del",
+                         command=self._remove_selected_library)
         try:
             menu.tk_popup(event.x_root, event.y_root)
         finally:
             menu.grab_release()
 
+    def _play_entry(self, entry):
+        """Open the recording in the default player: the screen video when
+        there is one, else the first audio track."""
+        target = entry.get("video") or next(
+            (a for a in entry.get("audio") or [] if os.path.isfile(a)), "")
+        if not target or not self._open_path(target):
+            self._notice("Can't play this recording",
+                         "Its files are no longer where they were saved.",
+                         kind="warning")
+            self._refresh_library()
+
     def _open_entry_folder(self, entry):
         d = entry.get("out_dir") or ""
         if not d or not os.path.isdir(d):
-            messagebox.showinfo("Open folder",
-                                "This recording's folder no longer exists.")
+            self._notice("Folder not found",
+                         "This recording's folder no longer exists.",
+                         kind="warning")
             self._refresh_library()
             return
-        try:
-            os.startfile(d)
-        except Exception as e:
-            log.warning("open folder failed: %s", e)
+        self._open_path(d)
 
     def _reveal_entry_folder(self, entry):
         """Show the recording's folder highlighted in the file manager."""
         d = entry.get("out_dir") or ""
         if not d or not os.path.isdir(d):
-            messagebox.showinfo("Show folder location",
+            self._notice("Show folder location",
                                 "This recording's folder no longer exists.")
             self._refresh_library()
             return
@@ -1829,39 +2875,35 @@ class App(tk.Tk):
                 subprocess.Popen(["xdg-open", os.path.dirname(d) or d])
         except Exception as e:
             log.warning("reveal folder failed: %s", e)
-            try:
-                os.startfile(os.path.dirname(d) or d)
-            except Exception:
-                pass
+            self._open_path(os.path.dirname(d) or d)
 
     def _rename_entry(self, entry):
         """Rename a recording's folder AND every file inside it to match, so the
         folder and its tracks share one name. Keeps all library-tracked paths
         pointing at the renamed files. Non-destructive otherwise."""
-        from tkinter import simpledialog
         if getattr(self, "_combine_busy", False):
-            messagebox.showinfo(
+            self._notice(
                 "Please wait",
                 "A merge/convert is running - rename when it finishes so its "
                 "output isn't pulled out from under it.")
             return
         if getattr(self, "_transcribe_busy", False):
-            messagebox.showinfo(
+            self._notice(
                 "Please wait",
                 "A transcription is running - rename when it finishes so its "
                 "transcript isn't written into a folder that no longer exists.")
             return
         old_dir = entry.get("out_dir") or ""
         if not old_dir or not os.path.isdir(old_dir):
-            messagebox.showinfo("Rename", "This recording's folder no longer exists.")
+            self._notice("Rename", "This recording's folder no longer exists.")
             self._refresh_library()
             return
         parent_dir = os.path.dirname(old_dir)
         old_base = os.path.basename(old_dir)
-        new_name = simpledialog.askstring(
+        new_name = self._ask_text(
             "Rename recording",
-            "New name (applies to the folder and every track inside):",
-            initialvalue=old_base, parent=self)
+            "New name for the folder and every track inside it:",
+            initial=old_base, ok_text="Rename")
         if not new_name:
             return
         # Sanitize to a safe, cross-platform name (no reserved chars).
@@ -1870,7 +2912,7 @@ class App(tk.Tk):
         while "  " in safe:
             safe = safe.replace("  ", " ")
         if not safe:
-            messagebox.showinfo(
+            self._notice(
                 "Rename", "That name has no usable characters - use letters, "
                 "numbers, spaces, - _ . ( ).")
             return
@@ -1879,7 +2921,7 @@ class App(tk.Tk):
                 "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
                 "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7",
                 "LPT8", "LPT9"):
-            messagebox.showinfo("Rename",
+            self._notice("Rename",
                                 f"'{safe}' is a reserved name on Windows - "
                                 "pick another.")
             return
@@ -1888,7 +2930,7 @@ class App(tk.Tk):
         new_dir = os.path.join(parent_dir, safe)
         case_only = safe.lower() == old_base.lower()
         if os.path.exists(new_dir) and not case_only:
-            messagebox.showerror("Rename", f"A folder named '{safe}' already exists.")
+            self._error("Rename", f"A folder named '{safe}' already exists.")
             return
         try:
             if case_only:
@@ -1900,7 +2942,7 @@ class App(tk.Tk):
             else:
                 os.rename(old_dir, new_dir)
         except Exception as e:
-            messagebox.showerror("Rename failed",
+            self._error("Rename failed",
                                  f"Could not rename the folder:\n{e}")
             return
 
@@ -1952,13 +2994,14 @@ class App(tk.Tk):
         except Exception as e:
             log.warning("Rename pass over folder failed: %s", e)
         if failures:
-            messagebox.showwarning(
+            self._notice(
                 "Some files kept their old names",
                 "The folder was renamed, but these files are open in another "
                 "program and kept their old names:\n\n  "
                 + "\n  ".join(failures[:8])
                 + ("\n  ..." if len(failures) > 8 else "")
-                + "\n\nClose the program using them and rename again.")
+                + "\n\nClose the program using them and rename again.",
+                kind="warning")
 
         # Remap tracked paths: move into new_dir and apply the filename map.
         def remap(p):
@@ -1973,29 +3016,66 @@ class App(tk.Tk):
         entry["audio"] = [remap(a) for a in entry.get("audio", [])]
         if entry.get("video"):
             entry["video"] = remap(entry["video"])
+        # Every screen segment moves with the folder too - leaving these on
+        # the old path silently dropped restart segments from later combines.
+        if entry.get("video_segments"):
+            entry["video_segments"] = [remap(v) for v in entry["video_segments"]]
+        self._lib_meta.pop(entry.get("id"), None)
         self.cfg.set("recordings", self._library)
         self._refresh_library()
         log.info("Renamed recording '%s' -> '%s' (%d file(s) renamed)",
                  old_base, safe, len(name_map))
 
     def _build_log(self, parent):
-        inner = self._section(parent, "Live log")
-        self.log_text = tk.Text(inner, height=16, bg="#141414", fg="#d0d0d0",
-                                insertbackground="#d0d0d0", relief="flat", wrap="word",
-                                font=("Consolas", 9))
-        self.log_text.pack(fill="both", expand=True)
-        self.log_text.configure(state="disabled")
+        """The activity log is a diagnostic, so it lives in a drawer that is
+        closed by default (Ctrl+L), with a count of new warnings."""
+        head = ttk.Frame(parent, style="TFrame")
+        head.pack(fill="x")
+        self.log_toggle_btn = ttk.Button(head, style="Toolbar.TButton",
+                                         command=self._toggle_log)
+        self.log_toggle_btn.pack(side="left")
+        Tooltip(self.log_toggle_btn, "Show or hide the activity log (Ctrl+L).")
+        self.log_body = ttk.Frame(parent, style="TFrame")
+        self.log_text = tk.Text(self.log_body, height=8, bg="#101216",
+                                fg="#d0d0d0", insertbackground="#d0d0d0",
+                                relief="flat", wrap="word", padx=8, pady=6,
+                                font=("Consolas", 9), highlightthickness=1,
+                                highlightbackground=COLORS["border"])
+        sb = ttk.Scrollbar(self.log_body, orient="vertical",
+                           command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=sb.set, state="disabled")
+        sb.pack(side="right", fill="y")
+        self.log_text.pack(side="left", fill="both", expand=True)
         for tag, col in (("ERROR", COLORS["red"]), ("WARNING", COLORS["gold"]),
                          ("INFO", COLORS["fg"])):
             self.log_text.tag_config(tag, foreground=col)
+        self._apply_log_visibility()
 
-    # -------------------------------------------------------------- config #
+    def _toggle_log(self):
+        self.log_open_var.set(not self.log_open_var.get())
+        self.cfg.set("log_open", bool(self.log_open_var.get()))
+        self._apply_log_visibility()
+
+    def _apply_log_visibility(self):
+        if self.log_open_var.get():
+            self._log_unseen = 0
+            if not self.log_body.winfo_manager():
+                self.log_body.pack(fill="both", expand=True, pady=(6, 0))
+            self.log_toggle_btn.config(text="▾  Activity log")
+            self.log_text.see("end")
+        else:
+            self.log_body.pack_forget()
+            extra = (f"  ({ux.plural(self._log_unseen, 'new warning')})"
+                     if self._log_unseen else "")
+            self.log_toggle_btn.config(text="▸  Activity log" + extra)
+
     def _restore_from_config(self):
         saved = self.cfg.get("audio_sources") or []
+        pool = (self.inputs, self.outputs)
         any_added = False
         self._unresolved_sources = []
         for sel in saved:
-            if resolve_selection(sel):
+            if resolve_selection(sel, devices=pool):
                 self._add_row(preset=sel)
                 any_added = True
             else:
@@ -2005,8 +3085,12 @@ class App(tk.Tk):
                 log.info("Saved device not present now (kept in config): %s",
                          sel.get("name"))
         if not any_added:
-            self._add_default_mic()
-            self._add_system_playback()
+            di, do = default_devices(devices=pool)
+            for d, kind in ((di, "input"), (do, "loopback")):
+                if d:
+                    self._add_row(preset={"name": d["name"], "kind": kind,
+                                          "hostapi": d["hostapi"]})
+        self._check_duplicate_rows()
 
     def _request_save(self, delay=400):
         """Debounced save; coalesces rapid changes (e.g. dragging a fader)."""
@@ -2103,15 +3187,58 @@ class App(tk.Tk):
         return bool(mutes.get(f'{preset.get("name")}|{preset.get("kind")}', False))
 
     def _add_row(self, preset=None):
+        if preset is None:
+            # '+ Add device': the next device that isn't already in the list
+            # (it used to clone row 1, which the recorder then silently
+            # dropped as a duplicate).
+            d = ux.next_unused_device(self.all_devices,
+                                      self._used_device_ids())
+            if d is None:
+                self._notice("Every device is already added",
+                             "All microphones and speakers this computer "
+                             "reports are already in the list. Plug in "
+                             "another one and press Refresh devices.")
+                return None
+            preset = {"id": d["id"], "name": d["name"], "kind": d["kind"],
+                      "hostapi": d["hostapi"]}
         row = DeviceRow(self.rows_frame, self.all_devices, self._remove_row,
                         on_change=self._on_row_change, preset=preset,
                         gain=self._gain_for(preset), muted=self._muted_for(preset))
-        row.pack(fill="x", pady=3)
+        row.pack(fill="x", pady=(0, 8))
         self._device_rows.append(row)
         row.combo.bind("<<ComboboxSelected>>",
                        lambda e, r=row: self._on_row_change("select", r))
+        if self.recording or self._starting:
+            row.set_editable(False)
         self._save_settings()
+        self._check_duplicate_rows()
         return row
+
+    def _used_device_ids(self):
+        ids = set()
+        for r in self._device_rows:
+            d = r.get_selection()
+            if d:
+                ids.add(d.get("id"))
+        return ids
+
+    def _check_duplicate_rows(self):
+        """Flag rows that pick a device another row already records - they
+        are skipped when recording, and now the user can see that."""
+        seen = set()
+        for r in self._device_rows:
+            d = r.get_selection()
+            key = (d.get("id"), d.get("kind")) if d else None
+            if key and key in seen:
+                r.set_warning("Already added above - this row is skipped. "
+                              "Pick another device or remove it.")
+            else:
+                r.set_warning("")
+            if key:
+                seen.add(key)
+        if not self.recording and not self._finalizing and not self._starting \
+                and not self._combine_busy and not self._transcribe_busy:
+            self.status_lbl.config(text=self._idle_text())
 
     def _on_row_change(self, what, row):
         if what == "gain":
@@ -2133,33 +3260,49 @@ class App(tk.Tk):
                     self.level_monitor.set_muted(label, m)
             self._save_settings()
         else:
+            if self.recording or self._starting:
+                return  # device choice is locked during a take
             self._save_settings()
+            self._check_duplicate_rows()
             self._refresh_monitor()
 
     def _remove_row(self, row):
+        if self.recording or self._starting:
+            return  # the take keeps the devices it started with
         if row in self._device_rows:
             self._device_rows.remove(row)
         row.destroy()
         self._save_settings()
+        self._check_duplicate_rows()
         self._refresh_monitor()
 
     def _add_default_mic(self):
-        di, _ = default_devices()
-        if di:
-            self._add_row(preset={"name": di["name"], "kind": "input",
-                                  "hostapi": di["hostapi"]})
+        di, _ = default_devices(devices=(self.inputs, self.outputs))
+        if not di:
+            self._notice("No microphone found",
+                         "Windows doesn't report any microphone. Plug one in "
+                         "and press Refresh devices.", kind="warning")
+        elif di.get("id") in self._used_device_ids():
+            self._set_status_note(f"'{di['name']}' is already in the list.")
         else:
-            messagebox.showwarning("No microphone", "No input device found.")
+            self._add_row(preset={"id": di["id"], "name": di["name"],
+                                  "kind": "input", "hostapi": di["hostapi"]})
 
     def _add_system_playback(self):
-        _, do = default_devices()
-        if do:
-            self._add_row(preset={"name": do["name"], "kind": "loopback",
-                                  "hostapi": do["hostapi"]})
+        _, do = default_devices(devices=(self.inputs, self.outputs))
+        if not do:
+            self._notice("No speakers found",
+                         "Windows doesn't report any speakers or headphones "
+                         "to record from.", kind="warning")
+        elif do.get("id") in self._used_device_ids():
+            self._set_status_note(f"'{do['name']}' is already in the list.")
         else:
-            messagebox.showwarning("No playback device", "No output device found.")
+            self._add_row(preset={"id": do["id"], "name": do["name"],
+                                  "kind": "loopback", "hostapi": do["hostapi"]})
 
     def _refresh_devices(self):
+        if self.recording or self._starting:
+            return
         self.inputs, self.outputs = list_devices()
         self.all_devices = self.inputs + self.outputs
         sels = [r.get_selection() for r in list(self._device_rows)]
@@ -2171,6 +3314,9 @@ class App(tk.Tk):
                                       "hostapi": d["hostapi"]})
         self._refresh_monitor()
         log.info("Devices refreshed.")
+        self._set_status_note(
+            f"Found {ux.plural(len(self.inputs), 'microphone')} and "
+            f"{ux.plural(len(self.outputs), 'speaker')}.")
 
     def _toggle_live_levels(self):
         self._save_settings()
@@ -2210,25 +3356,33 @@ class App(tk.Tk):
         try:
             mons = screenmod.show_identify_overlays(self)
             self._refresh_monitor_list()
-            self.status_lbl.config(text=f"{len(mons)} monitor(s) detected.")
+            self._set_status_note(f"Found {ux.plural(len(mons), 'screen')}.")
         except Exception as e:
             log.exception("identify screens failed: %s", e)
 
-    def _browse_folder(self):
-        d = filedialog.askdirectory(initialdir=self.folder_var.get() or
-                                    paths.default_recordings_dir())
+    def _browse_folder(self, parent=None):
+        d = filedialog.askdirectory(
+            parent=parent or self, title="Choose where recordings are saved",
+            initialdir=self.folder_var.get() or paths.default_recordings_dir())
         if d:
-            self.folder_var.set(d)
+            self.folder_var.set(os.path.normpath(d))
             self._save_settings()
+            self._update_saveto()
 
-    # ---------------------------------------------------- level monitoring #
     def _stop_monitor(self):
-        if self.level_monitor:
+        """Stop the idle level meters without blocking the window: joining
+        the meter threads takes up to a second per device."""
+        mon, self.level_monitor = self.level_monitor, None
+        if mon is None:
+            return
+        mon.running = False
+
+        def _join():
             try:
-                self.level_monitor.stop()
+                mon.stop()
             except Exception:
-                pass
-            self.level_monitor = None
+                log.debug("level monitor stop failed", exc_info=True)
+        threading.Thread(target=_join, name="meter-stop", daemon=True).start()
 
     def _refresh_monitor(self):
         self._stop_monitor()
@@ -2249,6 +3403,7 @@ class App(tk.Tk):
 
     def _drain_log(self):
         appended = False
+        warned = False
         while True:
             try:
                 msg, levelno = self._log_queue.get_nowait()
@@ -2260,6 +3415,9 @@ class App(tk.Tk):
                 tag = "ERROR"
             elif levelno >= 30:
                 tag = "WARNING"
+            if levelno >= 30 and not self.log_open_var.get():
+                self._log_unseen += 1
+                warned = True
             self.log_text.configure(state="normal")
             self.log_text.insert("end", msg + "\n", tag)
             if int(self.log_text.index("end-1c").split(".")[0]) > 1000:
@@ -2267,6 +3425,8 @@ class App(tk.Tk):
             self.log_text.configure(state="disabled")
         if appended:
             self.log_text.see("end")
+        if warned:
+            self._apply_log_visibility()
 
     # ---------------------------------------------------------- recording #
     def _toggle_record(self):
@@ -2309,29 +3469,49 @@ class App(tk.Tk):
     def start_recording(self):
         # Latch against re-entry: the dialogs below pump the Tk event loop, so
         # a double-click / tray click / hotkey could start a second session.
-        if self.recording or self._starting or self._finalizing:
+        if self.recording or self._starting or self._finalizing \
+                or self._quitting:
             return
         self._starting = True
         try:
-            self._start_recording_inner()
-        finally:
+            plan = self._prepare_start()
+        except BaseException:
             self._starting = False
+            raise
+        if plan is None:
+            self._starting = False
+            self._restore_status()
+            return
+        # Opening devices and spawning ffmpeg (which may try several
+        # encoders, ~1.3 s each) happens on a worker so the window never
+        # shows "Not Responding" right after Record is pressed.
+        self._set_starting_ui(True)
 
-    def _start_recording_inner(self):
+        def work():
+            res = self._start_worker(plan)
+            self._safe_after(lambda: self._finish_start(plan, res))
+        threading.Thread(target=work, name="start", daemon=True).start()
+
+    def _prepare_start(self):
+        """Tk-thread part of starting: checks, dialogs, folders. Returns the
+        plan for the worker, or None when the user cancelled."""
         sources = self._gather_sources()
         if not sources and not self.screen_enabled.get():
-            messagebox.showwarning("Nothing selected",
-                                   "Add at least one audio device or enable screen recording.")
-            return
+            self._notice("Nothing to record",
+                         "Add at least one audio device, or turn on "
+                         "'Record the screen too'.", kind="warning")
+            return None
         self._save_settings()
         self._stop_monitor()  # release devices so the recorder owns them
 
         if self.ask_var.get():
-            d = filedialog.askdirectory(initialdir=self.folder_var.get() or
-                                        paths.default_recordings_dir())
+            d = filedialog.askdirectory(
+                parent=self, title="Choose where to save this recording",
+                initialdir=self.folder_var.get() or
+                paths.default_recordings_dir())
             if not d:
                 self._refresh_monitor()
-                return
+                return None
             out_dir = d
         else:
             out_dir = self.cfg.resolved_save_folder()
@@ -2342,27 +3522,40 @@ class App(tk.Tk):
             free_gb = _sh.disk_usage(out_dir if os.path.isdir(out_dir)
                                      else os.path.dirname(out_dir) or ".").free / 1e9
             if free_gb < 0.5:
-                messagebox.showerror(
+                self._error(
                     "Not enough disk space",
-                    f"Only {free_gb:.1f} GB free where recordings are saved.\n"
-                    "Free up space or choose another folder before recording.")
+                    f"Only {free_gb:.1f} GB is free where recordings are "
+                    "saved.",
+                    "Free up space, or choose another folder in "
+                    "Settings > Saving, then press Record again.")
                 self._refresh_monitor()
-                return
+                return None
             if free_gb < 2.0:
-                if not messagebox.askyesno(
+                if not self._confirm(
                         "Low disk space",
-                        f"Only {free_gb:.1f} GB free. Audio uses ~0.7 GB/hour per "
-                        "device and screen recording much more.\n\nRecord anyway?"):
+                        f"Only {free_gb:.1f} GB is free. Audio uses about "
+                        "0.7 GB per hour for each device, and screen "
+                        "recording much more.",
+                        yes="Record anyway", no="Cancel", kind="warning"):
                     self._refresh_monitor()
-                    return
-        except Exception as e:
+                    return None
+        except OSError as e:
             log.warning("Disk space check skipped: %s", e)
 
         # ISO-style, file-safe session folder + base name (research-backed:
         # YYYY-MM-DD, no spaces or special chars, sorts chronologically).
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         out_dir = os.path.join(out_dir, f"SRR_{stamp}")
-        os.makedirs(out_dir, exist_ok=True)
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError as e:
+            head, advice = ux.friendly_error(e)
+            self._error("Recording did not start",
+                        head or "The recording folder could not be created.",
+                        advice or "Choose another folder in Settings > "
+                        "Saving, then press Record again.", details=str(e))
+            self._refresh_monitor()
+            return None
         base = f"SRR_{stamp}"
         self._session_base = base
 
@@ -2378,69 +3571,123 @@ class App(tk.Tk):
         try:
             if self.banner.winfo_manager():
                 self.banner.stop()
-        except Exception:
+        except tk.TclError:
             pass
         self.last_outputs = {"out_dir": out_dir, "audio": [], "video": None}
+        ext = self.container_var.get()
+        plan = {
+            "sources": sources, "out_dir": out_dir, "base": base,
+            "mode": self.output_mode.get(), "subtype": self.subtype.get(),
+            "samplerate": int(self.cfg.get("audio_target_samplerate")),
+            "screen": bool(self.screen_enabled.get()),
+            "monitor": self._selected_monitor_number(), "ext": ext,
+            "vpath": os.path.join(out_dir, f"{base}_screen.{ext}"),
+            "encoder": self.encoder_var.get(), "codec": self.codec_var.get(),
+            "fps": self._fps(), "quality": self.quality_var.get(),
+            "capture": self.cfg.get("screen_capture_method"),
+            "reliability": self.reliability_var.get(),
+        }
+        if plan["screen"]:
+            self.last_outputs["video"] = plan["vpath"]
+        return plan
 
-        if sources:
+    def _start_worker(self, plan):
+        """Worker thread: open the devices and start ffmpeg. Touches no Tk."""
+        res = {"audio": None, "audio_err": None, "screen": None,
+               "screen_err": None, "fam": None}
+        if plan["sources"]:
+            rec = None
             try:
-                self.audio_rec = AudioRecorder(
-                    sources, self.output_mode.get(), out_dir, base,
-                    target_samplerate=int(self.cfg.get("audio_target_samplerate")),
-                    subtype=self.subtype.get(), on_error=self._on_subsystem_error)
-                self.audio_rec.start()
-                self.last_outputs["audio"] = list(self.audio_rec.output_files)
+                rec = AudioRecorder(
+                    plan["sources"], plan["mode"], plan["out_dir"], plan["base"],
+                    target_samplerate=plan["samplerate"],
+                    subtype=plan["subtype"], on_error=self._on_subsystem_error)
+                rec.start()
+                res["audio"] = rec
             except Exception as e:
                 log.exception("Audio start failed: %s", e)
                 # If capture threads were already spawned, shut them down so
                 # they don't keep the devices open and write orphan files.
                 try:
-                    if self.audio_rec:
-                        self.audio_rec.stop()
+                    if rec:
+                        rec.stop()
                 except Exception:
-                    pass
-                self.audio_rec = None
-                messagebox.showerror("Audio error", f"Could not start audio:\n{e}")
-                self._refresh_monitor()
-                return
-
-        screen_error = None
-        if self.screen_enabled.get():
+                    log.debug("audio cleanup failed", exc_info=True)
+                res["audio_err"] = e
+                return res
+        if plan["screen"]:
+            # The encoder list is probed in the background at startup.
+            self._encoders_ready.wait(25)
             try:
                 mons = list_monitors()
-                num = self._selected_monitor_number()
+                num = plan["monitor"]
                 mon = next((m for m in mons if m["number"] == num),
                            mons[0] if mons else None)
                 if mon is None:
                     raise RuntimeError("No monitor detected.")
-                ext = self.container_var.get()
-                vpath = os.path.join(out_dir, f"{base}_screen.{ext}")
-                self.last_outputs["video"] = vpath
-                self.screen_rec = ScreenRecorder(
-                    mon, vpath, encoder_family=self.encoder_var.get(),
-                    codec=self.codec_var.get(), container=ext,
-                    framerate=self._fps(), quality=self.quality_var.get(),
-                    capture_method=self.cfg.get("screen_capture_method"),
+                srec = ScreenRecorder(
+                    mon, plan["vpath"], encoder_family=plan["encoder"],
+                    codec=plan["codec"], container=plan["ext"],
+                    framerate=plan["fps"], quality=plan["quality"],
+                    capture_method=plan["capture"],
                     on_error=self._on_subsystem_error, available=self.encoders,
-                    reliability=self.reliability_var.get())
-                fam = self.screen_rec.start()
-                self.last_outputs["video"] = self.screen_rec.final_path
-                log.info("Screen recording via %s", fam)
+                    reliability=plan["reliability"])
+                res["fam"] = srec.start()
+                res["screen"] = srec
             except Exception as e:
                 log.exception("Screen start failed: %s", e)
-                self.screen_rec = None
-                screen_error = str(e)
+                res["screen_err"] = str(e)
+        return res
+
+    def _finish_start(self, plan, res):
+        """Back on the Tk thread: enter the recording state, or explain why
+        nothing started."""
+        self._starting = False
+        if self._closing or self._quitting:
+            # The user quit while we were starting: finalize whatever opened.
+            for rec in (res["audio"], res["screen"]):
+                if rec is not None:
+                    threading.Thread(target=rec.stop, daemon=True).start()
+            return
+        if res["audio_err"] is not None:
+            e = res["audio_err"]
+            self._set_starting_ui(False)
+            head, advice = ux.friendly_error(e)
+            self._error(
+                "Recording did not start",
+                head or "The audio devices could not be opened.",
+                advice or "Check the devices are plugged in, press Refresh "
+                "devices, then press Record again.",
+                details=f"{type(e).__name__}: {e}")
+            self._refresh_monitor()
+            return
+        self.audio_rec = res["audio"]
+        self.screen_rec = res["screen"]
+        if self.audio_rec is not None:
+            self.last_outputs["audio"] = list(self.audio_rec.output_files)
+        if self.screen_rec is not None:
+            self.last_outputs["video"] = self.screen_rec.final_path
+            log.info("Screen recording via %s", res["fam"])
+        screen_error = res["screen_err"]
 
         if self.audio_rec is None and self.screen_rec is None:
             # NOTHING actually started. Never enter the recording state - a red
             # button over zero capture is the worst possible lie this app can
             # tell. Surface the failure and bail out cleanly.
-            self.status_lbl.config(text=self.IDLE_TEXT)
-            messagebox.showerror(
+            try:
+                self.banner.stop()
+            except tk.TclError:
+                pass
+            self.alerting = False
+            self._set_starting_ui(False)
+            head, advice = ux.friendly_error(screen_error)
+            self._error(
                 "Recording did NOT start",
-                "Screen recording failed to start and no audio devices are "
-                "selected.\n\n" + (screen_error or "Unknown error.")
-                + "\n\nNothing is being recorded.")
+                head or "Screen recording could not start, and no audio "
+                "device is selected - nothing is being recorded.",
+                advice or "Add a microphone, or try a different video "
+                "encoder in Settings > Recording.",
+                details=screen_error or "Unknown error.")
             self._refresh_monitor()
             return
 
@@ -2452,6 +3699,7 @@ class App(tk.Tk):
         self._screen_last_grow = time.monotonic()
         self._restart_cooldown = {}
         self._restart_counts = {}
+        self._take_id += 1
         self.recording = True
 
         self.heartbeat = watchdog.HeartbeatWriter(self.session_dir,
@@ -2468,12 +3716,37 @@ class App(tk.Tk):
             log.info("Background watchdog process disabled in settings.")
 
         self._set_recording_ui(True)
-        log.info("RECORDING STARTED -> %s", out_dir)
+        log.info("RECORDING STARTED -> %s", plan["out_dir"])
         if screen_error:
             # Raised after recording=True so the auto-restart path can act
             # on a start-time screen failure too (audio is still running).
             self._raise_gold_alert(
-                f"Screen recording failed to start: {screen_error}")
+                "Screen recording failed to start - audio is still "
+                f"recording. ({screen_error.strip()[:160]})")
+
+    def _set_starting_ui(self, on):
+        if on:
+            self._style_record_btn("starting")
+            self.status_lbl.config(text="Starting...")
+            self._hide_strip()
+            self._set_editing_enabled(False)
+        else:
+            self._style_record_btn("idle")
+            self._set_editing_enabled(True)
+            self._restore_status()
+
+    def _set_editing_enabled(self, on):
+        """While a take runs, the device/screen choices are locked: changing
+        them would only change the config, and the window would show
+        something that is not being recorded. Mute and Volume stay live."""
+        for row in self._device_rows:
+            row.set_editable(on)
+        for b in (self.add_dev_btn, self.add_mic_btn, self.add_play_btn,
+                  self.dev_refresh_btn, self.ident_btn):
+            b.state(["!disabled"] if on else ["disabled"])
+        self.screen_toggle.set_enabled(on)
+        self.monitor_combo.configure(state="readonly" if on else "disabled")
+        self._sync_settings_lock()
 
     # Seconds after pressing record during which subsystems are still spinning
     # up; no "stopped" alert is raised in this window (prevents a false alarm the
@@ -2545,10 +3818,12 @@ class App(tk.Tk):
         can take minutes for a long MP4) run on a worker thread so the window
         never goes 'Not responding' right after the user hits STOP - that's
         exactly when a panicked user would End-Task the app mid-finalize.
-        blocking=True (used by on_close) finalizes synchronously instead."""
+        blocking=True finalizes synchronously instead."""
         if not self.recording or self._finalizing:
             return
         log.info("Stopping recording...")
+        self._last_take_secs = float(int(max(
+            0.0, time.monotonic() - self._record_start_mono)))
         self.recording = False
         self._finalizing = True
         if self.heartbeat:
@@ -2568,11 +3843,9 @@ class App(tk.Tk):
         self._set_recording_ui(False)
         # The user must never wonder whether STOP "took": say what's happening
         # on the button itself and keep the busy bar moving until done().
-        self.record_btn.config(state="disabled",
-                               text="Saving your recording...",
-                               bg=COLORS["panel3"])
-        self.status_lbl.config(text="Finalizing recording...")
-        self._set_busy(True)
+        self._style_record_btn("saving")
+        self.status_lbl.config(text="Saving your recording... (don't unplug "
+                                    "anything yet)")
 
         def finalize():
             audio_files, video_path = None, None
@@ -2601,16 +3874,17 @@ class App(tk.Tk):
                 self.last_outputs["video"] = video_path
             self._finalizing = False
             try:
-                self.record_btn.config(state="normal", text="●  RECORD",
-                                       bg=COLORS["green"])
+                self._style_record_btn("idle")
+                self._set_editing_enabled(True)
                 self._restore_status()
-                self._set_busy(False)
-            except Exception:
+            except tk.TclError:
                 pass
-            self._add_to_library(select_new=True)
+            entry = self._add_to_library(select_new=True)
             log.info("RECORDING STOPPED. Outputs: %s", self.last_outputs)
-            self._refresh_monitor()
-            self._offer_stop_combine()
+            self._show_take_saved(entry)
+            if not self._quitting:
+                self._refresh_monitor()
+                self._offer_stop_combine()
 
         if blocking:
             a, v = finalize()
@@ -2620,6 +3894,39 @@ class App(tk.Tk):
                 a, v = finalize()
                 self._safe_after(lambda: done(a, v))
             threading.Thread(target=work, name="finalize", daemon=True).start()
+
+    def _show_take_saved(self, entry):
+        """The 'done' moment: what was saved, how long, how big, where - and
+        one click to open, rename or play it."""
+        self.elapsed_lbl.config(text=_fmt_elapsed(self._last_take_secs))
+        if entry is None:
+            self._show_strip("warn", "Nothing was saved",
+                             "No audio or video reached the disk for this "
+                             "recording. Open the activity log for details.",
+                             [("Show log", lambda: (
+                                 self.log_open_var.get() or self._toggle_log()))])
+            return
+        audio = entry.get("audio") or []
+        vids = entry.get("video_segments") or ([entry["video"]]
+                                               if entry.get("video") else [])
+        text = ux.take_summary(len(audio), 1 if vids else 0,
+                               self._last_take_secs,
+                               ux.total_size(audio + vids))
+        folder = entry.get("out_dir") or ""
+        self._show_strip(
+            "ok", "✓ Saved", f"{text}  ·  {os.path.basename(folder)}",
+            [("Open folder", lambda: self._open_entry_folder(entry)),
+             ("Rename...", lambda: self._rename_entry(entry)),
+             ("Play", lambda: self._play_entry(entry))])
+        if self.tray is not None and self.state() in ("iconic", "withdrawn"):
+            icon = getattr(self.tray, "_icon", None)
+            try:
+                if icon is not None and hasattr(icon, "notify"):
+                    icon.notify(f"Recording saved: {text}", APP_TITLE)
+            except Exception:
+                log.debug("tray notify failed", exc_info=True)
+        self._set_status_note("Saved. Press Record (F9) to start another "
+                              "recording.", ms=8000)
 
     def _offer_stop_combine(self):
         """Honor the 'When screen+audio ends' setting: ask / combine /
@@ -2636,11 +3943,16 @@ class App(tk.Tk):
         if not (segments and audio):
             return
         if action == "ask":
-            if not messagebox.askyesno(
-                    "Combine now?",
-                    "Make one video file with the sound included?\n\n"
-                    "Your separate tracks are kept either way. (You can "
-                    "change this prompt in Settings > Saving.)"):
+            yes, remember = self._confirm(
+                "Make one video with sound?",
+                "Your screen and audio were saved as separate files. "
+                "Combine them into one video now? The separate files are "
+                "kept either way.",
+                yes="Make one video", no="Keep separate", default="yes",
+                check="Don't ask again (change it in Settings > Saving)")
+            if remember:
+                self.on_stop_var.set("combine" if yes else "separate")
+            if not yes:
                 return
         out_dir = (self.last_outputs.get("out_dir")
                    or os.path.dirname(segments[0]))
@@ -2657,24 +3969,54 @@ class App(tk.Tk):
 
     def _set_recording_ui(self, on):
         if on:
-            self.record_btn.config(text="■  STOP", bg=COLORS["red"],
-                                   activebackground="#ff7b72")
-            self.status_lbl.config(text="Recording...")
-        else:
-            self.record_btn.config(text="●  RECORD", bg=COLORS["green"],
-                                   activebackground="#7fd687")
-            self._restore_status()
-            self.audio_light.set_state(COLORS["muted"], ": idle")
-            self.screen_light.set_state(COLORS["muted"], ": off")
+            self._style_record_btn("recording")
             self.elapsed_lbl.config(text="00:00:00")
+            self.status_lbl.config(text=self._recording_status_text())
+            self._hide_strip()
+            self._set_editing_enabled(False)
+        else:
+            self._style_record_btn("idle")
+            self._restore_status()
+            self._idle_lights()
+        self._update_title()
         if self.tray:
             self.tray.set_recording(on)
         self._set_taskbar_recording(on)
 
-    # -------------------------------------------------------- error/alert #
+    def _idle_lights(self):
+        if self.recording or not hasattr(self, "screen_light"):
+            return
+        self.audio_light.set_state(COLORS["muted"], ": ready")
+        self.screen_light.set_state(
+            COLORS["muted"], ": ready" if self.screen_enabled.get() else ": off")
+
+    def _recording_status_text(self):
+        bits = []
+        if self.audio_rec is not None:
+            n = len(getattr(self.audio_rec, "sources", []) or []) or \
+                len(self._gather_sources())
+            bits.append(ux.plural(n, "audio source"))
+        if self.screen_rec is not None:
+            bits.append("the screen")
+        what = " + ".join(bits) if bits else "..."
+        folder = os.path.basename(self.last_outputs.get("out_dir") or "")
+        return f"Recording {what} into {folder}. Press Stop (F9) when done."
+
+    def _update_title(self):
+        """The taskbar hover shows the state: '* REC 00:12:04 - ...'."""
+        try:
+            if self.recording:
+                t = _fmt_elapsed(time.monotonic() - self._record_start_mono)
+                self.title(f"● REC {t} - {APP_TITLE}")
+            else:
+                self.title(APP_TITLE)
+        except tk.TclError:
+            pass
+
     def _on_subsystem_error(self, label, reason):
         self._log_queue.put((f"SUBSYSTEM ERROR [{label}]: {reason}", 40))
-        self._safe_after(lambda: self._raise_gold_alert(f"[{label}] {reason}"))
+        msg = ux.humanize_subsystem_error(label, reason)
+        self._safe_after(lambda: self._raise_gold_alert(msg))
 
     def _root_hwnd(self):
         """Top-level window handle. winfo_id() on a Tk root is the CHILD hwnd,
@@ -2762,90 +4104,152 @@ class App(tk.Tk):
         self.last_outputs["audio"] = merged
 
     def _restart_audio(self):
-        try:
-            sources = self._gather_sources()
-            out_dir = self.last_outputs.get("out_dir")
-            if not sources or not out_dir:
-                return
-            old = self.audio_rec
-            self.audio_rec = None
-            if old is not None:
-                # Stop off the Tk thread (stop() can block seconds per device)
-                # and keep its finalized files - incl. any 4GiB rollover
-                # segments - in last_outputs so the take stays complete.
-                def _stop_old_audio():
-                    try:
-                        files = old.stop()
-                    except Exception:
-                        log.exception("old audio recorder stop failed")
-                        files = []
-                    self._safe_after(lambda: self._merge_audio_outputs(files))
-                threading.Thread(target=_stop_old_audio,
-                                 name="audio-restart-stop", daemon=True).start()
-            base = self._combine_base() + "_restart-" + datetime.now().strftime("%H%M%S")
-            # NOTE: _record_start_mono is deliberately NOT reset here - it is
-            # the take's true start; resetting it lied to the elapsed timer
-            # and re-armed the watchdog's startup grace mid-recording.
-            self.audio_rec = AudioRecorder(
-                sources, self.output_mode.get(), out_dir, base,
-                target_samplerate=int(self.cfg.get("audio_target_samplerate")),
-                subtype=self.subtype.get(), on_error=self._on_subsystem_error)
-            self.audio_rec.start()
-            self.last_outputs.setdefault("audio", []).extend(self.audio_rec.output_files)
-            log.info("Audio subsystem restarted -> %s", self.audio_rec.output_files)
-            self._safe_after(lambda: self._note_recovered("Audio recording"))
-        except Exception as e:
-            log.exception("Audio restart failed: %s", e)
+        """Rebuild the audio recorder mid-take. The new recorder opens on a
+        worker (device opens can take seconds); the old one is finalized off
+        the Tk thread too, so a gold alert never comes with a frozen window."""
+        if self._restart_inflight.get("audio"):
+            return
+        sources = self._gather_sources()
+        out_dir = self.last_outputs.get("out_dir")
+        if not sources or not out_dir:
+            return
+        old = self.audio_rec
+        self.audio_rec = None
+        if old is not None:
+            # Keep its finalized files - incl. any 4GiB rollover segments -
+            # in last_outputs so the take stays complete.
+            def _stop_old_audio():
+                try:
+                    files = old.stop()
+                except Exception:
+                    log.exception("old audio recorder stop failed")
+                    files = []
+                self._safe_after(lambda: self._merge_audio_outputs(files))
+            threading.Thread(target=_stop_old_audio,
+                             name="audio-restart-stop", daemon=True).start()
+        base = self._combine_base() + "_restart-" + datetime.now().strftime("%H%M%S")
+        # NOTE: _record_start_mono is deliberately NOT reset here - it is
+        # the take's true start; resetting it lied to the elapsed timer
+        # and re-armed the watchdog's startup grace mid-recording.
+        mode, subtype = self.output_mode.get(), self.subtype.get()
+        sr = int(self.cfg.get("audio_target_samplerate"))
+        take = self._take_id
+        self._restart_inflight["audio"] = True
+
+        def work():
+            rec = None
+            try:
+                rec = AudioRecorder(sources, mode, out_dir, base,
+                                    target_samplerate=sr, subtype=subtype,
+                                    on_error=self._on_subsystem_error)
+                rec.start()
+            except Exception as e:
+                log.exception("Audio restart failed: %s", e)
+                rec = None
+            self._safe_after(lambda: self._restart_audio_done(take, rec))
+        threading.Thread(target=work, name="audio-restart", daemon=True).start()
+
+    def _restart_audio_done(self, take, rec):
+        self._restart_inflight["audio"] = False
+        if rec is None:
+            return
+        if not self.recording or take != self._take_id:
+            # The take ended while the new recorder was opening: finalize it
+            # and keep the files with the take they belong to.
+            log.info("Audio restart finished after stop; finalizing it.")
+
+            def _stop():
+                try:
+                    rec.stop()
+                except Exception:
+                    log.exception("late audio recorder stop failed")
+            threading.Thread(target=_stop, daemon=True).start()
+            return
+        self.audio_rec = rec
+        self.last_outputs.setdefault("audio", []).extend(rec.output_files)
+        log.info("Audio subsystem restarted -> %s", rec.output_files)
+        self._note_recovered("Audio recording")
 
     def _restart_screen(self):
-        try:
-            out_dir = self.last_outputs.get("out_dir")
-            mons = list_monitors()
-            mon = next((m for m in mons if m["number"] == self._selected_monitor_number()),
-                       mons[0] if mons else None)
-            if mon is None or not out_dir:
-                return
-            old = self.screen_rec
-            self.screen_rec = None
-            if old is not None:
-                # Finalize the dead recorder's file off-thread: for hybrid MP4
-                # this runs the remux, so the pre-crash segment stays playable
-                # on disk instead of being abandoned as a .recording fragment.
-                def _stop_old_screen():
-                    try:
-                        p = old.stop()
-                    except Exception:
-                        log.exception("old screen recorder stop failed")
-                        p = None
-                    if p:
-                        self._safe_after(
-                            lambda: self.last_outputs.setdefault(
-                                "videos_extra", []).append(p))
-                threading.Thread(target=_stop_old_screen,
-                                 name="screen-restart-stop", daemon=True).start()
-            ext = self.container_var.get()
-            vpath = os.path.join(
-                out_dir,
-                f"{self._combine_base()}_screen-restart-{datetime.now():%H%M%S}.{ext}")
-            self.screen_rec = ScreenRecorder(
-                mon, vpath, encoder_family=self.encoder_var.get(),
-                codec=self.codec_var.get(), container=ext,
-                framerate=self._fps(), quality=self.quality_var.get(),
-                capture_method=self.cfg.get("screen_capture_method"),
-                on_error=self._on_subsystem_error, available=self.encoders,
-                reliability=self.reliability_var.get())
-            self.screen_rec.start()
-            # Reset growth tracking: the new (smaller) file must not have to
-            # out-grow the old one's byte count before it registers as alive.
-            self._screen_last_size = -1
-            self._screen_last_grow = time.monotonic()
-            # Track the new segment so a later combine joins EVERY segment of
-            # this take, not just the pre-restart one.
-            self.last_outputs.setdefault("videos_extra", []).append(vpath)
-            log.info("Screen subsystem restarted -> %s", vpath)
-            self._safe_after(lambda: self._note_recovered("Screen recording"))
-        except Exception as e:
-            log.exception("Screen restart failed: %s", e)
+        """Restart screen capture mid-take on a worker (the encoder chain can
+        take several seconds); see _restart_audio."""
+        if self._restart_inflight.get("screen"):
+            return
+        out_dir = self.last_outputs.get("out_dir")
+        if not out_dir:
+            return
+        old = self.screen_rec
+        self.screen_rec = None
+        if old is not None:
+            # Finalize the dead recorder's file off-thread: for hybrid MP4
+            # this runs the remux, so the pre-crash segment stays playable
+            # on disk instead of being abandoned as a .recording fragment.
+            def _stop_old_screen():
+                try:
+                    p = old.stop()
+                except Exception:
+                    log.exception("old screen recorder stop failed")
+                    p = None
+                if p:
+                    self._safe_after(
+                        lambda: self.last_outputs.setdefault(
+                            "videos_extra", []).append(p))
+            threading.Thread(target=_stop_old_screen,
+                             name="screen-restart-stop", daemon=True).start()
+        ext = self.container_var.get()
+        vpath = os.path.join(
+            out_dir,
+            f"{self._combine_base()}_screen-restart-{datetime.now():%H%M%S}.{ext}")
+        kw = {"encoder_family": self.encoder_var.get(),
+              "codec": self.codec_var.get(), "container": ext,
+              "framerate": self._fps(), "quality": self.quality_var.get(),
+              "capture_method": self.cfg.get("screen_capture_method"),
+              "on_error": self._on_subsystem_error, "available": self.encoders,
+              "reliability": self.reliability_var.get()}
+        num = self._selected_monitor_number()
+        take = self._take_id
+        self._restart_inflight["screen"] = True
+
+        def work():
+            rec = None
+            try:
+                mons = list_monitors()
+                mon = next((m for m in mons if m["number"] == num),
+                           mons[0] if mons else None)
+                if mon is not None:
+                    rec = ScreenRecorder(mon, vpath, **kw)
+                    rec.start()
+            except Exception as e:
+                log.exception("Screen restart failed: %s", e)
+                rec = None
+            self._safe_after(lambda: self._restart_screen_done(take, rec,
+                                                               vpath))
+        threading.Thread(target=work, name="screen-restart", daemon=True).start()
+
+    def _restart_screen_done(self, take, rec, vpath):
+        self._restart_inflight["screen"] = False
+        if rec is None:
+            return
+        if not self.recording or take != self._take_id:
+            log.info("Screen restart finished after stop; finalizing it.")
+
+            def _stop():
+                try:
+                    rec.stop()
+                except Exception:
+                    log.exception("late screen recorder stop failed")
+            threading.Thread(target=_stop, daemon=True).start()
+            return
+        self.screen_rec = rec
+        # Reset growth tracking: the new (smaller) file must not have to
+        # out-grow the old one's byte count before it registers as alive.
+        self._screen_last_size = -1
+        self._screen_last_grow = time.monotonic()
+        # Track the new segment so a later combine joins EVERY segment of
+        # this take, not just the pre-restart one.
+        self.last_outputs.setdefault("videos_extra", []).append(vpath)
+        log.info("Screen subsystem restarted -> %s", vpath)
+        self._note_recovered("Screen recording")
 
     def _note_recovered(self, what):
         """The watchdog stopped a stalled subsystem and the app already
@@ -2949,21 +4353,22 @@ class App(tk.Tk):
             a = self.audio_rec.get_status()
             secs = (time.monotonic() - a["last_write"]) if a["last_write"] else 999
             if a["any_active"] and secs < 3:
-                self.audio_light.set_state(COLORS["green"], ": REC")
+                self.audio_light.set_state(COLORS["red"], ": recording")
             else:
-                self.audio_light.set_state(COLORS["gold"], ": NO DATA")
+                self.audio_light.set_state(COLORS["gold"], ": no sound arriving")
             self.elapsed_lbl.config(text=_fmt_elapsed(a["elapsed"]))
         else:
             self.audio_light.set_state(COLORS["muted"], ": off")
         if self.screen_rec:
             s = self.screen_rec.get_status()
             if s["alive"]:
-                self.screen_light.set_state(COLORS["green"],
-                                            f": REC {s['size']//1024//1024}MB")
+                self.screen_light.set_state(
+                    COLORS["red"], f": recording {ux.fmt_bytes(s['size'])}")
             else:
-                self.screen_light.set_state(COLORS["gold"], ": STOPPED")
+                self.screen_light.set_state(COLORS["gold"], ": stopped")
         else:
             self.screen_light.set_state(COLORS["muted"], ": off")
+        self._update_title()
 
     def _check_watchdog_alert(self):
         if not self.session_dir:
@@ -3010,13 +4415,14 @@ class App(tk.Tk):
             # Queue it instead of refusing: several jobs (e.g. converting many
             # ticked recordings) run back to back with one summary at the end.
             self._combine_queue.append((fn, out))
-            self.status_lbl.config(
-                text=f"Combining... ({len(self._combine_queue)} more queued)")
-            self._set_busy(True)
+            self._combine_total += 1
+            self._set_busy(True, text=self._combine_progress_text())
             return
+        if not self._combine_results:
+            self._combine_total = 1 + len(self._combine_queue)
         self._combine_busy = True
-        self.status_lbl.config(text="Combining... (this can take a while for video)")
-        self._set_busy(True)
+        self._restore_status()
+        self._set_busy(True, text=self._combine_progress_text())
         log.info("Combine started -> %s", out)
 
         def work():
@@ -3026,6 +4432,11 @@ class App(tk.Tk):
                 ok, detail = False, str(e)
             self._safe_after(lambda: self._combine_done(ok, out, detail))
         threading.Thread(target=work, name="combine", daemon=True).start()
+
+    def _combine_progress_text(self):
+        total = max(1, self._combine_total)
+        i = min(total, len(self._combine_results) + 1)
+        return "Combining..." if total == 1 else f"Combining {i} of {total}..."
 
     def _combine_done(self, ok, out, detail):
         self._combine_busy = False
@@ -3042,83 +4453,136 @@ class App(tk.Tk):
             self._run_combine(fn, nxt)
             return
         results, self._combine_results = self._combine_results, []
+        self._combine_total = 0
         self._restore_status()
         self._refresh_library()  # the merged files may add new session folders
         saved = [o for k, o, _ in results if k]
-        failed = [(o, d) for k, o, d in results if not k]
-        if saved and not failed:
-            word = "it" if len(saved) == 1 else "the first one"
-            # Basenames + one folder line: full absolute paths per file wrap
-            # horribly for deep folders.
-            names = "\n".join("  " + os.path.basename(o) for o in saved)
-            if messagebox.askyesno(
-                    "Merge complete",
-                    f"Saved:\n{names}\n\nIn: {os.path.dirname(saved[0])}"
-                    + f"\n\nShow {word} in the folder?"):
-                folder = os.path.dirname(saved[0])
-                try:
-                    if os.path.isdir(folder):
-                        os.startfile(folder)
-                except Exception as e:
-                    log.warning("open folder failed: %s", e)
-        elif saved:
-            messagebox.showwarning(
-                "Merge partly complete",
-                "Saved:\n" + "\n".join(saved) + "\n\nFailed:\n"
-                + "\n".join(f"{os.path.basename(o)}: {str(d)[-200:]}"
-                            for o, d in failed))
-        else:
-            messagebox.showerror(
-                "Combine failed",
-                "The merge did not complete.\n\n"
-                + "\n\n".join(str(d)[-400:] for _, d in failed))
+        failed = [(o, d) for k, o, d in results if not k
+                  and d != "Cancelled before it started."]
+        cancelled = len(results) - len(saved) - len(failed)
+        if saved:
+            first = saved[0]
+            names = ", ".join(os.path.basename(o) for o in saved[:2])
+            if len(saved) > 2:
+                names += f" and {len(saved) - 2} more"
+            extra = f"  ({cancelled} cancelled)" if cancelled else ""
+            self._show_strip(
+                "ok" if not failed else "warn",
+                "✓ Combined" if not failed else "Partly combined",
+                f"Saved {names}{extra}",
+                [("Show in folder", lambda: self._reveal_path(first)),
+                 ("Play", lambda: self._open_path(first))])
+        elif cancelled and not failed:
+            self._show_strip("info", "Cancelled",
+                             "Nothing was combined.", timeout_ms=8000)
+        if failed:
+            text = "\n\n".join(f"{os.path.basename(o)}:\n{str(d)[-1500:]}"
+                               for o, d in failed)
+            head, advice = ux.friendly_error(text)
+            self._error(
+                "Couldn't combine" if not saved else "Some files weren't made",
+                head or ("The combined file could not be made." if not saved
+                         else f"{ux.plural(len(failed), 'file')} could not "
+                         "be made."),
+                advice or "Your original recordings are untouched. Try "
+                "again, or pick a different option.",
+                details=text)
 
-    # ------------------------------------------------------------- close #
     def on_close(self):
-        # The teardown below must ONLY run when the user really is quitting.
-        # (A previous version ran it from a finally: even when the user
-        # answered "No, keep recording" - destroying the window and orphaning
-        # the recording. Never put the cancel return inside that try.)
-        if getattr(self, "_closing", False):
+        """Quit, but never lose a take: confirm with a safe default, then
+        finalize on the worker while a small 'Saving...' window is shown."""
+        if self._closing or self._quitting:
+            return
+        if self._starting:
+            # Let the start finish; then the normal prompt below applies.
+            self.after(250, self.on_close)
             return
         if self.recording:
-            if not messagebox.askyesno("Quit",
-                                       "Recording is active. Stop and quit?"):
+            if not self._confirm(
+                    "Stop recording and quit?",
+                    "A recording is in progress. Quitting stops it and "
+                    "saves everything recorded so far.",
+                    yes="Stop and quit", no="Keep recording", kind="warning"):
                 return
         if self._combine_busy:
-            if not messagebox.askyesno(
-                    "Quit",
-                    "A merge/convert is still running and will be abandoned "
-                    "if you quit now.\n\nQuit anyway?"):
+            if not self._confirm(
+                    "Quit while combining?",
+                    "A combine or convert is still running and will be "
+                    "abandoned if you quit now. Your original recordings "
+                    "are not affected.",
+                    yes="Quit anyway", no="Keep working"):
                 return
         if self._transcribe_busy:
-            if not messagebox.askyesno(
-                    "Quit",
-                    "A transcription is still running. If you quit now, "
-                    "Scrivox keeps working in the background and the "
-                    "transcript will still be saved next to the recording - "
-                    "but this app won't be around to tell you when it's "
-                    "done.\n\nQuit anyway?"):
+            if not self._confirm(
+                    "Quit while transcribing?",
+                    "If you quit now, Scrivox keeps working in the "
+                    "background and the transcript is still saved next to "
+                    "the recording - but this app won't be around to tell "
+                    "you when it's done.",
+                    yes="Quit anyway", no="Keep working"):
                 return
-        if self.recording:
-            try:
-                self.stop_recording(blocking=True)
-            except Exception:
-                log.exception("stop during close failed")
-        elif self._finalizing:
-            # A background finalize is still flushing files - wait for it so
-            # quitting can't truncate the recording it just made.
-            deadline = time.monotonic() + 30.0
-            while self._finalizing and time.monotonic() < deadline:
-                try:
-                    self.update()
-                except Exception:
-                    break
-                time.sleep(0.05)
+        if self.recording or self._finalizing:
+            self._quitting = True
+            if self.recording:
+                self.stop_recording()
+            self._show_closing_window()
+        self._quitting = True
+        self._close_when_idle()
+
+    def _show_closing_window(self):
+        """Hide the main window and show a small progress window while the
+        recording is finalized, so quitting never looks like a hang."""
+        try:
+            self._save_window_state()
+            self.withdraw()
+            win = tk.Toplevel(self)
+            win.title(APP_TITLE)
+            win.configure(bg=COLORS["bg"])
+            win.resizable(False, False)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+            frm = ttk.Frame(win, style="TFrame", padding=24)
+            frm.pack(fill="both", expand=True)
+            ttk.Label(frm, text="Saving your recording before closing...",
+                      style="Section.TLabel").pack(anchor="w")
+            ttk.Label(frm, text="This usually takes a few seconds. Please "
+                      "don't turn off the computer.",
+                      style="Muted.TLabel").pack(anchor="w", pady=(6, 12))
+            bar = ttk.Progressbar(frm, mode="indeterminate",
+                                  length=int(360 * self._s),
+                                  style="Busy.Horizontal.TProgressbar")
+            bar.pack(fill="x")
+            bar.start(12)
+            win.update_idletasks()
+            x = (win.winfo_screenwidth() - win.winfo_reqwidth()) // 2
+            y = (win.winfo_screenheight() - win.winfo_reqheight()) // 3
+            win.geometry(f"+{x}+{y}")
+            set_dark_titlebar(win)
+        except tk.TclError:
+            pass
+
+    def _close_when_idle(self):
+        if self._finalizing:
+            self.after(150, self._close_when_idle)
+            return
+        self._teardown()
+
+    def _save_window_state(self):
+        try:
+            state = self.state()
+            if state == "withdrawn":
+                return
+            geom = self._normal_geom if state == "zoomed" else self.geometry()
+            self.cfg.update({"window_geometry": geom or "",
+                             "window_zoomed": state == "zoomed"})
+        except tk.TclError:
+            pass
+
+    def _teardown(self):
+        self._save_window_state()
         try:
             self._save_settings()
         except Exception:
-            pass
+            log.debug("final settings save failed", exc_info=True)
         # Stop the after() poll/meter loops cleanly so they don't fire on a
         # destroyed window (which would raise TclError during shutdown).
         self._closing = True
@@ -3127,15 +4591,15 @@ class App(tk.Tk):
             try:
                 self.hotkeys.stop()
             except Exception:
-                pass
+                log.debug("hotkey stop failed", exc_info=True)
         if self.tray:
             try:
                 self.tray.stop()
             except Exception:
-                pass
+                log.debug("tray stop failed", exc_info=True)
         try:
             self.destroy()
-        except Exception:
+        except tk.TclError:
             pass
 
 
@@ -3172,14 +4636,18 @@ def run():
             crash = os.path.join(paths.data_dir(), "startup_crash.txt")
             with open(crash, "w", encoding="utf-8") as fh:
                 fh.write(tb)
-        except Exception:
+        except OSError:
             crash = "(could not write crash file)"
         try:
             from tkinter import messagebox as _mb
             _mb.showerror(
-                "SimpleReliableRecorder failed to start",
-                f"{e}\n\nDetails written to:\n{crash}")
-        except Exception:
+                APP_TITLE + " could not start",
+                "Something went wrong while opening the app.\n\n"
+                f"{type(e).__name__}: {e}\n\n"
+                "Try starting it again. If it keeps happening, send this "
+                f"file to support:\n{crash}")
+            e._srr_reported = True  # main() must not show a second box
+        except tk.TclError:
             pass
         raise
     app.mainloop()
