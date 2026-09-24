@@ -3,6 +3,37 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [0.0.18] - 2026-09-24
+
+No app changes; this release adds GitLab CI/CD. The app works exactly as in
+0.0.17.
+
+### CI
+- New GitLab pipeline (`.gitlab-ci.yml`) on the self-hosted runners, since
+  CI/CD is moving off GitHub Actions. It runs on release tags (bare `X.Y.Z`
+  or `vX.Y.Z`) and when started by hand; plain pushes and merge requests do
+  not start it.
+- A test job runs the unit tests on Python 3.12 first, and a tag build fails
+  if `recorder.__version__` does not match the tag.
+- Builds for Linux x64 (Ubuntu 22.04, so it runs on glibc 2.35 and newer),
+  Windows x64 (portable zip and installer) and macOS Apple Silicon and Intel.
+  Each build runs the tests again on its own Python before packaging.
+- Every build bundles a static ffmpeg checked for the right architecture, no
+  extra libraries and that it runs, with the same sources as the GitHub
+  workflow. A new check fails the build if ffmpeg, the icon or the audio,
+  tray or hotkey packages are missing from the app.
+- The Windows and macOS runners install their build tools on first use from
+  pinned, checksum-verified downloads (`ci/tools-windows.ps1`,
+  `ci/tools-macos.sh`).
+- Tag pipelines publish the release files to the GitLab package registry and
+  create or update the GitLab Release, using this changelog's section for
+  the tag as the notes. Republishing updates links and never deletes any.
+- Windows arm64 and Linux arm64 are not built on GitLab (no arm64 runners).
+
+### Docs
+- README: new "Building / Releases (GitLab CI)" section explaining when the
+  pipeline runs, what each job does and which files a release contains.
+
 ## [0.0.17] - 2026-09-24
 
 Everything that changed since 0.0.16 (commit 918a73e).
