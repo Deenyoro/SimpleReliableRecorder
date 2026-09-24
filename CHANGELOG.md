@@ -1,0 +1,97 @@
+# Changelog
+
+All notable changes to SimpleReliableRecorder are listed here. Versions match
+the git release tags (bare `X.Y.Z`, no `v` prefix).
+
+## [0.0.17] - 2026-09-24
+
+Everything that changed since 0.0.16 (commit 918a73e).
+
+### Fixed
+- Mute and Volume clicks (and push-to-talk) made while Record is still
+  starting, or during an automatic audio restart, now apply to the take
+  instead of only changing the card. This was a privacy problem.
+- Mute and Volume follow the card that is actually recorded: a muted
+  duplicate card ("Already added above") no longer silences the whole take,
+  and two different devices with the same name keep their own settings.
+- Library takes whose first screen segment was deleted are kept when later
+  screen-restart segments still exist; missing segments are dropped from the
+  entry instead of lingering forever.
+- Renaming a recording also moves its screen-restart segments in the library,
+  so a later combine still joins every segment.
+- The window no longer freezes: opening devices, starting ffmpeg, mid-take
+  restarts, quitting while recording, and startup scans run in the background.
+- Worker threads no longer call Tk directly (could crash or hang on Windows);
+  results go through a queue on the UI thread, and that queue keeps flowing
+  while an error dialog is open.
+- Push-to-talk reacts within one capture block (queue drained every 10 ms
+  while recording, 40 ms when idle), so first syllables are not clipped.
+- Only one "Stop recording and quit?" question is shown at a time; extra X
+  clicks during "Starting..." no longer queue several close attempts.
+- The window is restored where it was, fully visible, on the right monitor
+  (including secondary monitors left of the primary); 4K screens are no
+  longer treated as two stacked monitors.
+- The window can snap to half the screen at 125% and 150% scaling.
+- The progress bar keeps moving for every queued combine/convert job, and the
+  header and footer show the same progress text.
+- The Recorded column shows when the take started (matching its name), not
+  when Stop was pressed.
+- Hotkeys the hotkey library cannot use are refused with a clear reason
+  instead of being saved and blamed on "another app".
+- Dialog access keys (Alt+letter) work with Caps Lock on.
+- Recordings list, Saved strip and header fit snapped and minimum-size
+  windows: buttons wrap or move to their own line instead of being cut off,
+  and names end in "..." instead of being cut mid-letter.
+- Length/Size no longer stay "..." for rows added while metadata was loading.
+
+### Added
+- Real percentage and time left while combining or converting
+  ("Combining 1 of 3 - 42%, about 2 min left").
+- Cancel stops the combine or convert that is running (not only queued ones),
+  removes the unfinished output and never touches the original recordings.
+- Splash screen as soon as the Windows exe is double-clicked (not shown for
+  the watchdog child process; `SRR_NO_SPLASH=1` builds without it).
+- "Saved - 2 tracks - 3:12 - 41 MB" strip after Stop with Open folder,
+  Rename and Play.
+- Recordings list as a real Windows list: multi-select, sortable columns
+  (sort remembered), F2 rename, Del remove (files are never deleted),
+  Enter/double-click opens the folder, right-click menu.
+- Themed dialogs with verb buttons, Alt+letter access keys, error details,
+  Copy and Open log.
+- "Set key..." button to capture a hotkey, a Transcription tab in Settings,
+  Restore defaults per tab, keyboard shortcuts Ctrl+L (activity log),
+  Ctrl+, (Settings) and Ctrl+O (recordings folder).
+- The window title shows "REC 00:12:04" while recording.
+- Window size, position and maximized state, the activity-log drawer and the
+  list sort order are remembered (new optional config keys; old config files
+  load unchanged).
+- Dark title bar on Windows 10/11.
+
+### Changed
+- Main window reworked around the record flow: large Record/Stop button with a
+  status line, Sources | Recordings split, activity log as a drawer.
+- Plain-language wording everywhere: friendly recording names and dates,
+  device labels ("Mic: ...", "Sound from: ..."), Settings labels instead of
+  config tokens (config.json keeps the same values), and recording-problem
+  alerts and errors in everyday sentences (raw details still go to the log).
+- Device choice, Remove and screen options are locked during a take; Mute and
+  Volume stay live. "+ Add device" adds the next unused device and duplicates
+  are flagged.
+- Dark theme: dark dropdown lists, Segoe UI fonts, DPI-scaled widgets, and
+  scrollbars only when content overflows. Record stands out again.
+- Audio devices are enumerated once at startup instead of 3-5 times.
+- Removed an unused import and a dead variable in `ui/widgets.py`.
+- Internal tidy-ups: one shared splash helper (`ui/splash.py`), Record
+  colours moved into the colour tokens, toggle-switch cleanup on destroy.
+- Version in code (`recorder.__version__`) and the installer's default
+  version now read 0.0.17 (previously an unused "1.0.0" and "0.0.0").
+
+### Tests
+- New stdlib unittest suite under `tests/`: crash-safe WAV writer, recordings
+  library, plain-language helpers, combine progress, hotkeys, watchdog
+  messages, app logic (mute/volume during start, duplicate cards) and Tk
+  widget/app tests (skipped without a display).
+
+### CI
+- The release build runs the unit tests on every platform before building
+  binaries.
