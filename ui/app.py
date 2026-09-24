@@ -3636,9 +3636,9 @@ class App(tk.Tk):
             label = row.current_source_label()
             g = row.get_gain()
             if label:
-                self._set_pending_level(label, gain=g)
+                self._set_pending_level(row, gain=g)
                 if self.recording and self.audio_rec:
-                    self.audio_rec.set_gain(label, g)
+                    self._set_row_level(self.audio_rec.sources, row, gain=g)
                 elif self.level_monitor:
                     self.level_monitor.set_gain(label, g)
             self._request_save()
@@ -3646,9 +3646,9 @@ class App(tk.Tk):
             label = row.current_source_label()
             m = row.is_muted()
             if label:
-                self._set_pending_level(label, muted=m)
+                self._set_pending_level(row, muted=m)
                 if self.recording and self.audio_rec:
-                    self.audio_rec.set_muted(label, m)
+                    self._set_row_level(self.audio_rec.sources, row, muted=m)
                 if self.level_monitor:
                     self.level_monitor.set_muted(label, m)
             self._save_settings()
@@ -3659,17 +3659,43 @@ class App(tk.Tk):
             self._check_duplicate_rows()
             self._refresh_monitor()
 
-    def _set_pending_level(self, label, gain=None, muted=None):
+    def _row_source_key(self, row):
+        """(device id, kind) this card records, or None when the card has no
+        device or is a duplicate that _gather_sources skips. Mute and Volume
+        are matched on this key, not on the "name [kind]" label: a skipped
+        duplicate card, or another device with the same name, must never
+        change what the recorded card captures."""
+        d = row.get_selection()
+        if not d:
+            return None
+        key = (d.get("id"), d.get("kind"))
+        for r in self._device_rows:
+            other = r.get_selection()
+            if other and (other.get("id"), other.get("kind")) == key:
+                return key if r is row else None
+        return None
+
+    def _set_row_level(self, sources, row, gain=None, muted=None):
+        """Apply one card's Mute/Volume to the matching source(s) only."""
+        key = self._row_source_key(row)
+        if key is None:
+            return
+        for src in sources:
+            if (src.device_id, src.kind) != key:
+                continue
+            if gain is not None:
+                src.gain = float(gain)
+            if muted is not None:
+                if bool(muted) != src.muted:
+                    log.info("Device %s %s", src.label,
+                             "muted" if muted else "unmuted")
+                src.muted = bool(muted)
+
+    def _set_pending_level(self, row, gain=None, muted=None):
         """Apply a Mute/Volume change to sources a worker is still opening
         (the recorder reads these objects, so it takes effect at once)."""
         for sources in self._pending_sources:
-            for src in sources:
-                if src.label != label:
-                    continue
-                if gain is not None:
-                    src.gain = float(gain)
-                if muted is not None:
-                    src.muted = bool(muted)
+            self._set_row_level(sources, row, gain=gain, muted=muted)
 
     def _drop_pending(self, sources):
         self._pending_sources = [p for p in self._pending_sources
@@ -3682,12 +3708,9 @@ class App(tk.Tk):
         if rec is None:
             return
         for row in self._device_rows:
-            label = row.current_source_label()
-            if not label:
-                continue
             try:
-                rec.set_gain(label, row.get_gain())
-                rec.set_muted(label, row.is_muted())
+                self._set_row_level(rec.sources, row, gain=row.get_gain(),
+                                    muted=row.is_muted())
             except Exception:
                 log.debug("re-applying levels failed", exc_info=True)
 
