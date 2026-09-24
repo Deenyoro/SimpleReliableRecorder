@@ -1,0 +1,301 @@
+# GitLab CI for SimpleReliableRecorder.
+#
+# Port of .github/workflows/build.yml to the self-hosted GitLab runners:
+#   linux    -> Kubernetes executor on the cluster (test gate, linux-x64 build
+#               in ubuntu:22.04 so the binary keeps the glibc 2.35 floor)
+#   windows  -> shell runner on the Windows laptop (windows-x64 portable zip
+#               + Inno Setup installer)
+#   macos    -> shell runner on the M1 MacBook (macos-arm64 natively,
+#               macos-x64 with an x86_64 Python under Rosetta, as in Tagestry)
+# Every build stages a STATIC ffmpeg with the same sources and portability
+# gates as the GitHub workflow (ci/stage-ffmpeg-*), runs the unit tests on
+# the Python that builds it, then packages with build.py.
+#
+# Not ported (no runners of those architectures): windows-arm64 and
+# linux-arm64. ci/stage-ffmpeg-{windows,linux} still accept arm64 for when
+# such runners exist.
+#
+# Runs on release tags and when started from the web UI / API (never on
+# plain pushes or MRs). This project's tags are bare X.Y.Z (0.0.17); v-tags
+# (v0.0.18) are accepted too, like the GitHub workflow's "v*" / "[0-9]+.*".
+# Set RELEASE_VERSION=0.0.18 on a manual run started ON that tag to publish
+# (or republish) its release. The laptop jobs bootstrap their own toolchains
+# the first time (ci/tools-windows.ps1, ci/tools-macos.sh), with pinned,
+# SHA-256 checked downloads.
+#
+# The GitHub Actions workflow (.github/workflows/build.yml) is separate and
+# unchanged.
+
+stages: [test, build, release]
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\./
+    - if: $CI_PIPELINE_SOURCE == "web"
+    - if: $CI_PIPELINE_SOURCE == "api"
+
+variables:
+  GIT_DEPTH: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_ROOT_USER_ACTION: ignore
+
+# ───────────────────────────── shared pieces ─────────────────────────────
+
+.version: &version
+  # 0.0.18 or v0.0.18 -> 0.0.18; untagged runs get a valid semver prerelease.
+  - |
+    if [ -n "$RELEASE_VERSION" ]; then VERSION="${RELEASE_VERSION#v}"; elif [ -n "$CI_COMMIT_TAG" ]; then VERSION="${CI_COMMIT_TAG#v}"; else VERSION="0.0.0-${CI_COMMIT_SHORT_SHA}"; fi
+    echo "App version: $VERSION"
+
+.version_ps: &version_ps
+  - |
+    if ($env:RELEASE_VERSION) { $env:VERSION = $env:RELEASE_VERSION -replace '^v','' } elseif ($env:CI_COMMIT_TAG) { $env:VERSION = $env:CI_COMMIT_TAG -replace '^v','' } else { $env:VERSION = "0.0.0-$env:CI_COMMIT_SHORT_SHA" }
+    Write-Host "App version: $env:VERSION"
+
+.linux:
+  tags: [linux]
+  interruptible: true
+
+.windows:
+  tags: [windows]
+  interruptible: true
+  variables:
+    GIT_STRATEGY: fetch
+  before_script:
+    - . .\ci\tools-windows.ps1
+    - *version_ps
+
+.macos:
+  tags: [macos]
+  interruptible: true
+  variables:
+    GIT_STRATEGY: fetch
+  before_script:
+    - source ci/tools-macos.sh
+    - *version
+
+# ───────────────────────────── tests (gate) ─────────────────────────────
+
+# Fail before any runner spends a build if the crash-safe WAV writer, the
+# recordings library or the UI logic regress. Each build job runs the same
+# suite again on the Python that packages it (as the GitHub workflow does).
+test:
+  extends: .linux
+  stage: test
+  image: python:3.12
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  cache:
+    key: pip-py312
+    paths: [.cache/pip/]
+  script:
+    - *version
+    # A manual RELEASE_VERSION run must be started on that tag (bare or
+    # v-prefixed); refuse here, before the laptops spend a build on the
+    # wrong ref (the release job re-checks the tag's commit before publishing).
+    - |
+      if [ -n "$RELEASE_VERSION" ] && [ "$CI_COMMIT_TAG" != "$VERSION" ] && [ "$CI_COMMIT_TAG" != "v$VERSION" ]; then
+        echo "RELEASE_VERSION=$RELEASE_VERSION but this pipeline runs on '${CI_COMMIT_TAG:-$CI_COMMIT_REF_NAME}'. Run it on the tag $VERSION."; exit 1
+      fi
+    # Release builds must carry the release's version inside the app too
+    # (recorder.__version__). Untagged 0.0.0-<sha> builds are not checked.
+    - |
+      case "$VERSION" in
+        0.0.0-*) echo "untagged build; skipping version check" ;;
+        *) APP_VERSION=$(python -c "import recorder; print(recorder.__version__)")
+           [ "$APP_VERSION" = "$VERSION" ] || { echo "recorder.__version__ is $APP_VERSION but this release is $VERSION: bump recorder/__init__.py first"; exit 1; } ;;
+      esac
+    - pip install -q -r requirements.txt
+    - python -m unittest discover -s tests -t . -v
+
+# ───────────────────────────── Linux ─────────────────────────────
+
+# Built on Ubuntu 22.04 (glibc 2.35), like the GitHub build, so the binary
+# also runs on Ubuntu 22.04+ / Debian 12+. A PyInstaller binary only runs
+# where glibc is at least as new as on the build machine; building on 24.04
+# (glibc 2.39) would silently drop all of those. Python 3.12 + tkinter
+# (Tk 8.6) come from the deadsnakes PPA; libpython3.12 provides the shared
+# library PyInstaller needs.
+# REVISIT before April 2027, when jammy leaves standard support (and
+# deadsnakes typically stops publishing for it).
+build-linux:
+  extends: .linux
+  stage: build
+  image: ubuntu:22.04
+  needs: [test]
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+    LABEL: linux-x64
+  cache:
+    key: pip-py312-jammy
+    paths: [.cache/pip/]
+  script:
+    - *version
+    - apt-get update -qq && apt-get install -y -qq software-properties-common ca-certificates curl >/dev/null
+    - add-apt-repository -y ppa:deadsnakes/ppa >/dev/null
+    # binutils: PyInstaller needs objdump/objcopy. file + xz-utils: the
+    # ffmpeg staging gates / extraction. libportaudio2, libsndfile1,
+    # libpulse0: the audio stack (soundcard loads libpulse when PyInstaller
+    # collects it), as in the GitHub workflow.
+    - apt-get update -qq && apt-get install -y -qq python3.12 python3.12-venv python3.12-dev python3.12-tk libpython3.12 binutils file xz-utils libportaudio2 libsndfile1 libpulse0 >/dev/null
+    - python3.12 -m venv /opt/venv
+    - export PATH="/opt/venv/bin:$PATH"
+    - python -c "import tkinter, sys; print(sys.version.split()[0], 'Tk', tkinter.TkVersion); sys.exit(tkinter.TkVersion != 8.6)"
+    - bash ci/stage-ffmpeg-linux.sh x64
+    - pip install -q -r requirements.txt
+    - python -m unittest discover -s tests -t . -v
+    - python build.py --clean
+    - python ci/check_bundle.py dist/SimpleReliableRecorder
+    - |
+      set -e
+      mkdir -p out
+      tar -czf "out/SimpleReliableRecorder-$LABEL-portable.tar.gz" -C dist SimpleReliableRecorder
+      ls -la out/
+  artifacts:
+    name: simplereliablerecorder-linux-x64-$CI_COMMIT_SHORT_SHA
+    paths: [out/]
+    expire_in: 30 days
+
+# ───────────────────────────── Windows ─────────────────────────────
+
+build-windows:
+  extends: .windows
+  stage: build
+  needs: [test]
+  variables:
+    LABEL: windows-x64
+  script:
+    - .\ci\stage-ffmpeg-windows.ps1 -Arch x64
+    - python -m venv .venv-ci
+    - .\.venv-ci\Scripts\python.exe -m pip install -q -r requirements.txt
+    - if ($LASTEXITCODE -ne 0) { throw "pip install failed (exit $LASTEXITCODE)" }
+    - .\.venv-ci\Scripts\python.exe -m unittest discover -s tests -t . -v
+    - if ($LASTEXITCODE -ne 0) { throw "unit tests failed (exit $LASTEXITCODE)" }
+    - .\.venv-ci\Scripts\python.exe build.py --clean
+    - if ($LASTEXITCODE -ne 0) { throw "build.py failed (exit $LASTEXITCODE)" }
+    - |
+      $exe = Get-Item dist\SimpleReliableRecorder.exe -ErrorAction SilentlyContinue
+      if (-not $exe) { throw "dist\SimpleReliableRecorder.exe was not produced" }
+      .\.venv-ci\Scripts\python.exe ci\check_bundle.py dist\SimpleReliableRecorder.exe
+      if ($LASTEXITCODE -ne 0) { throw "bundle check failed" }
+    - |
+      New-Item -ItemType Directory -Force out | Out-Null
+      Compress-Archive -Path dist\SimpleReliableRecorder.exe -DestinationPath "out\SimpleReliableRecorder-$env:LABEL-portable.zip" -Force
+    - |
+      & $env:ISCC "/DMyAppVersion=$env:VERSION" installer\windows.iss
+      if ($LASTEXITCODE -ne 0) { throw "ISCC failed (exit $LASTEXITCODE)" }
+      $setup = Get-Item "installer\installer_out\SimpleReliableRecorder-$env:VERSION-windows-x64-setup.exe" -ErrorAction SilentlyContinue
+      if (-not $setup) { throw "installer was not produced" }
+      Copy-Item $setup.FullName out\ -Force
+      Get-ChildItem out
+  artifacts:
+    name: simplereliablerecorder-windows-x64-$CI_COMMIT_SHORT_SHA
+    paths: [out/]
+    expire_in: 30 days
+
+# ───────────────────────────── macOS ─────────────────────────────
+
+build-macos:
+  extends: .macos
+  stage: build
+  needs: [test]
+  parallel:
+    matrix:
+      - MAC_ARCH: [arm64, x64]
+  script:
+    - LABEL="macos-$MAC_ARCH"; want=$([ "$MAC_ARCH" = x64 ] && echo x86_64 || echo arm64)
+    - bash ci/stage-ffmpeg-macos.sh "$MAC_ARCH"
+    - '"$PY" -m pip install -q -r requirements.txt'
+    - '"$PY" -m unittest discover -s tests -t . -v'
+    - '"$PY" build.py --clean'
+    - test -f dist/SimpleReliableRecorder || { echo "dist/SimpleReliableRecorder was not produced"; exit 1; }
+    # PyInstaller builds for the interpreter's arch; make sure that is the
+    # one this job ships (an x64 job must not quietly produce arm64).
+    - lipo -archs dist/SimpleReliableRecorder | grep -qw "$want" || { echo "dist/SimpleReliableRecorder is $(lipo -archs dist/SimpleReliableRecorder), need $want"; exit 1; }
+    - '"$PY" ci/check_bundle.py dist/SimpleReliableRecorder'
+    # Ad-hoc signature: without at least this, Gatekeeper kills the binary
+    # on Apple Silicon ("is damaged"). Not notarized (no Apple Developer
+    # account); users right-click > Open the first time.
+    - chmod +x dist/SimpleReliableRecorder
+    - codesign --force --deep --sign - --timestamp=none dist/SimpleReliableRecorder
+    - codesign --verify --verbose dist/SimpleReliableRecorder
+    - mkdir -p out && tar -czf "out/SimpleReliableRecorder-$LABEL-portable.tar.gz" -C dist SimpleReliableRecorder
+    - ls -la out/
+  artifacts:
+    name: simplereliablerecorder-macos-$MAC_ARCH-$CI_COMMIT_SHORT_SHA
+    paths: [out/]
+    expire_in: 30 days
+
+# ───────────────────────────── release ─────────────────────────────
+
+# Uploads every build to the project's generic package registry and creates
+# (or updates) the GitLab release for the tag, with links to them and the
+# tag's CHANGELOG.md section as notes.
+release:
+  extends: .linux
+  stage: release
+  image: alpine:3.20
+  needs:
+    - build-linux
+    - build-windows
+    - build-macos
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v/
+    - if: $CI_COMMIT_TAG =~ /^[0-9]+\./
+    - if: $RELEASE_VERSION
+  # Never auto-cancel a half-finished publish.
+  interruptible: false
+  script:
+    - apk add --no-cache curl jq >/dev/null
+    - |
+      set -e
+      # Publish under the tag this pipeline runs on (bare 0.0.18 or v0.0.18).
+      TAG="$CI_COMMIT_TAG"
+      [ -n "$TAG" ] || { echo "Not a tag pipeline; start the RELEASE_VERSION run on the tag itself."; exit 1; }
+      VERSION="${TAG#v}"
+      if [ -n "$RELEASE_VERSION" ] && [ "${RELEASE_VERSION#v}" != "$VERSION" ]; then
+        echo "RELEASE_VERSION=$RELEASE_VERSION does not match tag $TAG"; exit 1
+      fi
+      API="$CI_API_V4_URL/projects/$CI_PROJECT_ID"; H="JOB-TOKEN: $CI_JOB_TOKEN"
+      PKG="$API/packages/generic/SimpleReliableRecorder/$VERSION"
+      TAG_JSON=$(curl -fsS -H "$H" "$API/repository/tags/$TAG") || { echo "Tag $TAG does not exist in this project"; exit 1; }
+      TAG_SHA=$(printf '%s' "$TAG_JSON" | jq -r '.commit.id')
+      [ "$TAG_SHA" = "$CI_COMMIT_SHA" ] || { echo "Tag $TAG points at $TAG_SHA but this pipeline built $CI_COMMIT_SHA. Run the pipeline on the tag ref $TAG."; exit 1; }
+      ls -la out/
+      : > links.ndjson
+      for f in out/*; do
+        [ -f "$f" ] || continue
+        name=$(basename "$f")
+        echo "uploading $name ($(du -h "$f" | cut -f1))"
+        curl -fsS -H "$H" --upload-file "$f" "$PKG/$name" >/dev/null
+        # Link the API download URL (what the release mirror accepts), not the web one.
+        jq -cn --arg n "$name" --arg u "$PKG/$name" '{name:$n, url:$u, link_type:"package"}' >> links.ndjson
+      done
+      test -s links.ndjson || { echo "No builds to publish"; exit 1; }
+      ASSETS=$(jq -s -c . links.ndjson)
+      # Notes: this version's CHANGELOG.md section (## [X.Y.Z] ... up to the next ## [).
+      CHANGES=$(awk -v v="$VERSION" 'index($0, "## [" v "]") == 1 {on=1; next} on && /^## \[/ {exit} on {print}' CHANGELOG.md | sed '/./,$!d')
+      [ -n "$CHANGES" ] || CHANGES="See CHANGELOG.md."
+      NOTES=$(printf 'SimpleReliableRecorder %s\n\n%s\n\n### Downloads\n- Windows x64: installer (setup.exe) and portable zip\n- macOS: Apple Silicon (arm64) and Intel (x64) portable tar.gz, ad-hoc signed (right-click > Open the first time)\n- Linux x64: portable tar.gz (glibc 2.35+)\n\nffmpeg is bundled in every build. Built on GitLab CI.' "$VERSION" "$CHANGES")
+      BODY=$(jq -cn --arg tag "$TAG" --arg name "SimpleReliableRecorder $VERSION" --arg desc "$NOTES" --argjson links "$ASSETS" '{tag_name:$tag, name:$name, description:$desc, assets:{links:$links}}')
+      if curl -fsS -o /dev/null -H "$H" "$API/releases/$TAG" 2>/dev/null; then
+        # Republish: update the notes, then point each same-named link at the
+        # fresh upload (or add it). Existing links are never deleted.
+        curl -fsS -X PUT -H "$H" -H "Content-Type: application/json" "$API/releases/$TAG" \
+          -d "$(jq -cn --arg name "SimpleReliableRecorder $VERSION" --arg desc "$NOTES" '{name:$name, description:$desc}')" | jq -r '"updated release " + .tag_name'
+        EXISTING=$(curl -fsS -H "$H" "$API/releases/$TAG/assets/links?per_page=100")
+        while read -r l; do
+          name=$(printf '%s' "$l" | jq -r '.name')
+          id=$(printf '%s' "$EXISTING" | jq -r --arg n "$name" 'map(select(.name == $n)) | .[0].id // empty')
+          if [ -n "$id" ]; then
+            curl -fsS -X PUT -H "$H" -H "Content-Type: application/json" "$API/releases/$TAG/assets/links/$id" -d "$l" >/dev/null
+          else
+            curl -fsS -X POST -H "$H" -H "Content-Type: application/json" "$API/releases/$TAG/assets/links" -d "$l" >/dev/null
+          fi
+        done < links.ndjson
+      else
+        curl -fsS -X POST -H "$H" -H "Content-Type: application/json" "$API/releases" -d "$BODY" | jq -r '"created release " + .tag_name'
+      fi
+      echo "Published $TAG with:"; jq -r '.name' links.ndjson | sed 's/^/  /'

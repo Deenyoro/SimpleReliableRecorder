@@ -69,6 +69,46 @@ python build.py --clean
 `build.py` stages an ffmpeg binary from `FFMPEG_EXE`, `./ffmpeg/`, or your PATH.
 Use a full build (gyan.dev "full"/"git" or BtbN) so NVENC/QSV/AMF are present.
 
+## Building / Releases (GitLab CI)
+
+`.gitlab-ci.yml` builds the app on the self-hosted GitLab runners. It is a
+port of `.github/workflows/build.yml` (which is kept unchanged).
+
+- **When it runs**: on a release tag (this project uses bare `X.Y.Z` tags such
+  as `0.0.17`; `vX.Y.Z` also works) and when started by hand from the GitLab
+  UI (Build > Pipelines > Run pipeline) or the API. Plain pushes and merge
+  requests do not start it.
+- **test**: the unit tests on Python 3.12. A tag build also checks that
+  `recorder/__init__.py`'s `__version__` equals the tag, so bump it before
+  tagging.
+- **build-linux** (`linux-x64`): Ubuntu 22.04 container, so the binary runs on
+  glibc 2.35+ (Ubuntu 22.04+, Debian 12+).
+- **build-windows** (`windows-x64`): the Windows runner; portable zip plus the
+  Inno Setup installer. Python 3.12 with Tk and Inno Setup are installed on
+  first use by `ci/tools-windows.ps1` (pinned, SHA-256 checked).
+- **build-macos** (`macos-arm64`, `macos-x64`): the Apple Silicon runner; the
+  x64 build uses an x86_64 Python under Rosetta 2. Python comes from a pinned
+  `uv` (`ci/tools-macos.sh`). Binaries are ad-hoc signed, not notarized.
+- Every build downloads a **static** ffmpeg (`ci/stage-ffmpeg-*`) with the same
+  sources and checks as the GitHub workflow: right architecture, no
+  non-system libraries, and it must run. If no source passes, the build fails
+  rather than bundling a system ffmpeg. The unit tests then run again on the
+  build's own Python, `python build.py --clean` packages the app, and
+  `ci/check_bundle.py` confirms that ffmpeg, the icon and the audio, tray and
+  hotkey packages are inside the executable.
+- **release** (tag pipelines only): uploads every file to the project's
+  Generic Package Registry (`SimpleReliableRecorder/<version>/`) and creates
+  or updates the GitLab Release for the tag. The release notes are the tag's
+  `CHANGELOG.md` section. To republish an existing tag, run the pipeline on
+  that tag with `RELEASE_VERSION=<version>`.
+- **Not built on GitLab**: `windows-arm64` and `linux-arm64`, because there
+  are no arm64 runners. Only the GitHub workflow produces those.
+
+Release files: `SimpleReliableRecorder-<version>-windows-x64-setup.exe`,
+`SimpleReliableRecorder-windows-x64-portable.zip`, and
+`SimpleReliableRecorder-<label>-portable.tar.gz` for `linux-x64`,
+`macos-arm64` and `macos-x64`.
+
 ## Where files go
 
 - Recordings: `Videos\SimpleReliableRecorder\<timestamp>\` (changeable, or "ask
