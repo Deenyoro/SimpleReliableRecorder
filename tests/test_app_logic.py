@@ -31,8 +31,8 @@ except (ImportError, OSError, RuntimeError) as e:  # pragma: no cover
 
 
 class FakeRow:
-    def __init__(self, name, kind, gain=1.0, muted=False):
-        self._dev = {"id": name, "name": name, "kind": kind,
+    def __init__(self, name, kind, gain=1.0, muted=False, dev_id=None):
+        self._dev = {"id": dev_id or name, "name": name, "kind": kind,
                      "hostapi": "WASAPI", "channels": 2}
         self.gain, self.muted = gain, muted
 
@@ -77,6 +77,8 @@ def _stand_in(rows):
         _set_pending_level = App._set_pending_level
         _drop_pending = App._drop_pending
         _apply_row_levels = App._apply_row_levels
+        _row_source_key = App._row_source_key
+        _set_row_level = App._set_row_level
 
         def _request_save(self):
             pass
@@ -94,9 +96,17 @@ def _stand_in(rows):
 
 
 def _sources_for(rows):
-    return [CaptureSource.from_device(r.get_selection(), gain=r.get_gain(),
-                                      muted=r.is_muted(), track_name="t")
-            for r in rows]
+    """Like App._gather_sources: the first card per (id, kind) wins."""
+    out, seen = [], set()
+    for r in rows:
+        d = r.get_selection()
+        if (d["id"], d["kind"]) in seen:
+            continue
+        seen.add((d["id"], d["kind"]))
+        out.append(CaptureSource.from_device(d, gain=r.get_gain(),
+                                             muted=r.is_muted(),
+                                             track_name="t"))
+    return out
 
 
 @unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
@@ -142,6 +152,56 @@ class MuteWhileStartingTests(unittest.TestCase):
         mic.gain = 1.8
         app._on_row_change("gain", mic)
         self.assertAlmostEqual(sources[0].gain, 1.8)
+
+
+
+@unittest.skipIf(App is None, f"ui.app not importable: {_IMPORT_ERR}")
+class LevelsFollowTheRecordedCardTests(unittest.TestCase):
+    """Mute/Volume are matched per device, never by the "name [kind]" label:
+    a skipped duplicate card, or another device with the same name, must not
+    change what the recorded card captures."""
+
+    def test_muted_duplicate_card_does_not_silence_the_take(self):
+        first = FakeRow("Mic A", "input", muted=False)
+        dup = FakeRow("Mic A", "input", muted=True, gain=0.2)
+        app = _stand_in([first, dup])
+        sources = _sources_for([first, dup])
+        self.assertEqual(len(sources), 1)
+        app._pending_sources.append(sources)
+        rec = FakeRecorder(sources)
+        app._apply_row_levels(rec)
+        self.assertFalse(rec.sources[0].muted)
+        self.assertAlmostEqual(rec.sources[0].gain, 1.0)
+        # A click on the skipped card changes nothing that is recorded.
+        app._on_row_change("mute", dup)
+        app._on_row_change("gain", dup)
+        app.recording, app._starting, app.audio_rec = True, False, rec
+        app._on_row_change("mute", dup)
+        self.assertFalse(rec.sources[0].muted)
+        self.assertAlmostEqual(rec.sources[0].gain, 1.0)
+
+    def test_same_name_devices_keep_their_own_mute(self):
+        for first_muted in (True, False):
+            a = FakeRow("USB Mic", "input", muted=first_muted, dev_id="id-1")
+            b = FakeRow("USB Mic", "input", muted=not first_muted,
+                        dev_id="id-2")
+            app = _stand_in([a, b])
+            sources = _sources_for([a, b])
+            self.assertEqual(len(sources), 2)
+            rec = FakeRecorder(sources)
+            app._apply_row_levels(rec)
+            self.assertEqual(rec.sources[0].muted, first_muted)
+            self.assertEqual(rec.sources[1].muted, not first_muted)
+            # Live toggle during the take touches only that device.
+            app.recording, app._starting, app.audio_rec = True, False, rec
+            a.muted = not first_muted
+            app._on_row_change("mute", a)
+            self.assertEqual(rec.sources[0].muted, not first_muted)
+            self.assertEqual(rec.sources[1].muted, not first_muted)
+            b.muted = first_muted
+            app._on_row_change("mute", b)
+            self.assertEqual(rec.sources[0].muted, not first_muted)
+            self.assertEqual(rec.sources[1].muted, first_muted)
 
 
 if __name__ == "__main__":
