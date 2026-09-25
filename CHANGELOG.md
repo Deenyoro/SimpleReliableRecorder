@@ -3,6 +3,11 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [0.0.21] - 2026-09-25
+
+### Changed
+- CI: pipelines run on merge requests (tests/Linux builds; Windows/macOS manual; nothing published).
+
 ## [0.0.20] - 2026-09-25
 
 ### Fixed
