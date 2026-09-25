@@ -4,7 +4,7 @@
 ; places it, makes shortcuts, and registers an uninstaller.
 
 #ifndef MyAppVersion
-  #define MyAppVersion "0.0.18"
+  #define MyAppVersion "0.0.19"
 #endif
 
 #define MyAppName "SimpleReliableRecorder"
