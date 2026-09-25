@@ -77,6 +77,9 @@ variables:
     # The shell runners run as a service with no interactive desktop: Tk windows
     # never map (Windows) or Tk aborts (macOS). The Tk UI tests run on Linux.
     SRR_SKIP_GUI_TESTS: "1"
+    # The keyboard library aborts the process on macOS without a login session
+    # (it reads the keyboard layout); hotkeys are not under test here.
+    SRR_DISABLE_HOTKEYS: "1"
   before_script:
     - source ci/tools-macos.sh
     - *version
