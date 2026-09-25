@@ -62,6 +62,9 @@ variables:
   interruptible: true
   variables:
     GIT_STRATEGY: fetch
+    # The shell runners run as a service with no interactive desktop: Tk windows
+    # never map (Windows) or Tk aborts (macOS). The Tk UI tests run on Linux.
+    SRR_SKIP_GUI_TESTS: "1"
   before_script:
     - . .\ci\tools-windows.ps1
     - *version_ps
@@ -71,6 +74,9 @@ variables:
   interruptible: true
   variables:
     GIT_STRATEGY: fetch
+    # The shell runners run as a service with no interactive desktop: Tk windows
+    # never map (Windows) or Tk aborts (macOS). The Tk UI tests run on Linux.
+    SRR_SKIP_GUI_TESTS: "1"
   before_script:
     - source ci/tools-macos.sh
     - *version

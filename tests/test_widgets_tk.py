@@ -7,6 +7,7 @@ with), but Mute and Volume must stay live because they apply mid-recording.
 Skipped automatically where Tk cannot open a display (headless Linux CI).
 """
 
+import os
 import tkinter as tk
 import unittest
 
@@ -21,6 +22,9 @@ DEVICES = [
 
 
 def _root_or_skip(test):
+    # See tests/test_app_tk.py: must be checked before tk.Tk() on desktop-less runners.
+    if os.environ.get("SRR_SKIP_GUI_TESTS"):
+        test.skipTest("SRR_SKIP_GUI_TESTS is set (no interactive desktop)")
     try:
         root = tk.Tk()
     except tk.TclError as e:

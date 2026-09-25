@@ -39,6 +39,10 @@ except (ImportError, OSError, RuntimeError) as e:  # pragma: no cover
 
 
 def _root_or_skip(test):
+    # Checked before creating Tk: on a desktop-less macOS runner tk.Tk() aborts
+    # the whole process instead of raising.
+    if os.environ.get("SRR_SKIP_GUI_TESTS"):
+        test.skipTest("SRR_SKIP_GUI_TESTS is set (no interactive desktop)")
     try:
         root = tk.Tk()
     except tk.TclError as e:
@@ -205,7 +209,8 @@ class MnemonicTests(unittest.TestCase):
         App._add_mnemonics(win)
         self.assertEqual(int(stop.cget("underline")), 0)
         self.assertEqual(int(keep.cget("underline")), 0)
-        self.assertEqual(int(ok.cget("underline")), -1)
+        # Newer Tk 8.6 reports an unset underline as "" rather than -1.
+        self.assertEqual(int(ok.cget("underline") or -1), -1)
         for seq in ("<Alt-KeyPress-s>", "<Alt-KeyPress-S>",
                     "<Alt-KeyPress-k>", "<Alt-KeyPress-K>"):
             self.assertTrue(win.bind(seq), seq)

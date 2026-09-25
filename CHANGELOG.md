@@ -3,6 +3,19 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [0.0.19] - 2026-09-25
+
+No app changes; the Windows and macOS CI builds now pass.
+
+### CI
+- The Windows and macOS build jobs skip the Tk UI tests
+  (`SRR_SKIP_GUI_TESTS=1`). Those shell runners run as a service with no
+  interactive desktop, so Tk windows never map on Windows and Tk aborts the
+  test process on macOS; the first real 0.0.18 pipeline failed there. The UI
+  tests still run in the Linux job. The switch is checked before Tk starts.
+- A Tk UI test now accepts newer Tk 8.6 reporting an unset `underline` as an
+  empty string instead of `-1`.
+
 ## [0.0.18] - 2026-09-24
 
 No app changes; this release adds GitLab CI/CD. The app works exactly as in
