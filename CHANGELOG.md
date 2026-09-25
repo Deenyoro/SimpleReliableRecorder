@@ -3,6 +3,19 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [0.0.20] - 2026-09-25
+
+### Fixed
+- Importing the app no longer loads the `keyboard` hotkey library; it loads on
+  first use of global hotkeys. On macOS that library reads the keyboard layout
+  as soon as it is imported and aborts the whole process when there is no login
+  session, which is what made the macOS arm64 CI build crash before any test
+  ran. `SRR_DISABLE_HOTKEYS=1` turns hotkeys off without loading it.
+
+### CI
+- The macOS jobs set `SRR_DISABLE_HOTKEYS=1`. All five jobs (Linux test and
+  build, Windows, macOS arm64 and x64) now pass on the GitLab runners.
+
 ## [0.0.19] - 2026-09-25
 
 No app changes; the Windows and macOS CI builds now pass.

@@ -12,22 +12,42 @@ never touches Tk or the audio engine directly. On Windows the `keyboard` library
 needs no special privileges for normal key capture.
 """
 
+import os
 import threading
 
 from .logging_setup import get_logger
 
 log = get_logger("gui")
 
-try:
-    import keyboard as _kb
-    _AVAILABLE = True
-except Exception as e:  # pragma: no cover - optional dependency
-    _AVAILABLE = False
-    _IMPORT_ERR = e
+# The keyboard library is imported on first use, not when this module is
+# imported: on macOS it reads the current keyboard layout at import time and
+# aborts the whole process (CFData assertion) when there is no login session,
+# e.g. on a CI runner. SRR_DISABLE_HOTKEYS=1 turns hotkeys off without
+# importing it at all.
+_kb = None
+_AVAILABLE = None          # None = not tried yet
+_IMPORT_ERR = None
+
+
+def _load():
+    global _kb, _AVAILABLE, _IMPORT_ERR
+    if _AVAILABLE is None:
+        if os.environ.get("SRR_DISABLE_HOTKEYS"):
+            _AVAILABLE = False
+            _IMPORT_ERR = RuntimeError("disabled by SRR_DISABLE_HOTKEYS")
+        else:
+            try:
+                import keyboard
+                _kb = keyboard
+                _AVAILABLE = True
+            except Exception as e:  # pragma: no cover - optional dependency
+                _AVAILABLE = False
+                _IMPORT_ERR = e
+    return _AVAILABLE
 
 
 def available():
-    return _AVAILABLE
+    return _load()
 
 
 def is_valid_hotkey(hotkey):
@@ -35,7 +55,7 @@ def is_valid_hotkey(hotkey):
     (an unknown key name such as 'adiaeresis'). When it can't tell - lib
     missing, or it needs privileges to build its key table - say True and
     let registration report the real outcome."""
-    if not hotkey or not _AVAILABLE:
+    if not hotkey or not _load():
         return True
     try:
         _kb.parse_hotkey(hotkey)
@@ -72,7 +92,7 @@ class HotkeyManager:
         None keeps the previous behavior (assume unmuted).
         """
         self.clear()
-        if not enabled or not hotkey or not _AVAILABLE:
+        if not enabled or not hotkey or not _load():
             if enabled and not _AVAILABLE:
                 log.warning("Hotkeys unavailable (keyboard lib not installed): %s",
                             _IMPORT_ERR)
