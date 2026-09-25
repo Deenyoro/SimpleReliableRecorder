@@ -136,7 +136,7 @@ test:
 build-linux:
   extends: .linux
   stage: build
-  image: ubuntu:22.04
+  image: ubuntu:26.04
   needs: [test]
   variables:
     DEBIAN_FRONTEND: noninteractive
