@@ -332,7 +332,7 @@ jobs:
             -C dist SimpleReliableRecorder
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.label }}
           path: out/*
@@ -345,7 +345,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist_all
       - name: Publish to GitHub Releases
