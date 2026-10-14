@@ -295,13 +295,18 @@ jobs:
       - name: Build Windows installer
         if: matrix.os == 'windows' && matrix.arch == 'x64'
         shell: pwsh
+        # The ref name is passed through the environment, not interpolated
+        # into the script, so a ref containing quotes cannot alter the script.
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         run: |
           $ErrorActionPreference = "Stop"
           # Version: a tag like v1.2.3 or 1.2.3 -> strip ONE leading "v";
           # anything else (workflow_dispatch from a branch, odd tags) -> a
           # safe placeholder so ISCC never receives an invalid value.
-          $ref = "${{ github.ref_name }}"
-          if ("${{ github.ref_type }}" -eq "tag" -and $ref -match '^v?[0-9][0-9A-Za-z.\-]*$') {
+          $ref = $env:REF_NAME
+          if ($env:REF_TYPE -eq "tag" -and $ref -match '^v?[0-9][0-9A-Za-z.\-]*$') {
             $ver = $ref -replace '^v', ''
           } else {
             $ver = "0.0.0-dev"
