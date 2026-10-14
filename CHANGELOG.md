@@ -3,6 +3,11 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [0.0.22] - 2026-10-14
+
+### Fixed
+- CI: the Windows installer workflow passed the git ref into a shell step by interpolation; it now goes through environment variables.
+
 ## [0.0.21] - 2026-09-25
 
 ### Changed
