@@ -1,6 +1,6 @@
 """Optional Scrivox integration: transcribe library recordings.
 
-Scrivox (https://github.com/Deenyoro/Scrivox) is a standalone GPU transcription
+Scrivox (https://github.com/kawaconnect/Scrivox) is a standalone GPU transcription
 suite by the same author. When a Scrivox install is found near this app, the
 recordings library grows a "Transcribe" action; when it is not found, nothing
 Scrivox-related is shown anywhere - the integration is invisible unless both
@@ -469,7 +469,7 @@ def _run_scrivox(exe, input_path, out_path, args, live=None):
 
 
 def _track_label(name, path):
-    """Short label for one track file: 'keithPTOcall_mic-1.wav' -> 'mic-1'."""
+    """Short label for one track file: 'interview_mic-1.wav' -> 'mic-1'."""
     stem = os.path.splitext(os.path.basename(path))[0]
     if stem.lower().startswith(name.lower() + "_"):
         return stem[len(name) + 1:] or stem

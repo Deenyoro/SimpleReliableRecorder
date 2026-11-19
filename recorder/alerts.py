@@ -127,8 +127,10 @@ def message_box(title, text):
             return
         # Linux: best-effort dialog, then a desktop notification.
         try:
-            subprocess.call(["zenity", "--warning", "--title", str(title),
-                             "--text", str(text)])
+            # --no-markup: device names can contain & or <, which zenity
+            # would otherwise try to parse as Pango markup.
+            subprocess.call(["zenity", "--warning", "--no-markup",
+                             "--title", str(title), "--text", str(text)])
             return
         except FileNotFoundError:
             pass

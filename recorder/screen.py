@@ -333,6 +333,14 @@ class ScreenRecorder:
         os.makedirs(os.path.dirname(self._record_path) or ".", exist_ok=True)
         chain = self._encoder_chain()
         log.info("Screen recorder encoder chain: %s -> %s", self.encoder_family, chain)
+        if (sys.platform.startswith("linux")
+                and os.environ.get("XDG_SESSION_TYPE", "").lower() == "wayland"):
+            # x11grab only sees X11/XWayland windows; native Wayland windows
+            # come out black. Say so up front instead of leaving a silent
+            # black video to be discovered afterwards.
+            log.warning("This is a Wayland session: screen capture uses X11, "
+                        "so native Wayland windows may record as black. Log "
+                        "in with an X11 session for a full screen capture.")
         # Capture methods to try per encoder. A ddagrab failure must not burn
         # the encoder attempt: retry the SAME encoder with gdigrab before
         # advancing the chain (otherwise a cpu-only chain dies entirely when

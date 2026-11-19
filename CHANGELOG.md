@@ -3,6 +3,23 @@
 All notable changes to SimpleReliableRecorder are listed here. Versions match
 the git release tags (bare `X.Y.Z`, no `v` prefix).
 
+## [Unreleased]
+
+### Fixed
+- The "access blocked" error no longer blames Windows on macOS and Linux.
+- A hotkey that cannot be registered on Linux or macOS now says why (root or
+  the Accessibility permission is needed) instead of "another app may own it".
+- Linux: the watchdog's zenity alert no longer treats `&` or `<` in a device
+  name as markup.
+- Linux: starting a screen recording in a Wayland session logs a warning that
+  native Wayland windows may come out black.
+
+### Docs
+- README: requirements, per-platform install, settings and config reference,
+  file locations per platform, troubleshooting, and the CI section now matches
+  the pipeline (merge requests do run it). Scrivox links point at the current
+  repository.
+
 ## [0.0.22] - 2026-10-14
 
 ### Fixed

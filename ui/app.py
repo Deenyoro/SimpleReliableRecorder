@@ -555,6 +555,14 @@ class App(tk.Tk):
         if not hotkeys.is_valid_hotkey(key):
             return (f"'{key}' isn't a key name the hotkey can use. Click "
                     "'Set key...' and pick another key.")
+        if sys.platform.startswith("linux"):
+            return (f"Couldn't use '{key}'. On Linux the global hotkey "
+                    "needs the app to run as root; without that it stays "
+                    "off.")
+        if sys.platform == "darwin":
+            return (f"Couldn't use '{key}'. Allow this app under System "
+                    "Settings > Privacy & Security > Accessibility, then "
+                    "restart it.")
         return (f"Couldn't use '{key}' - another app may own it. Try "
                 "another key.")
 
