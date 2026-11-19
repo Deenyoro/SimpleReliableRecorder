@@ -405,7 +405,7 @@ _ERROR_RULES = [
      "Free up some space or choose another folder in Settings > Saving."),
     (re.compile(r"permission denied|access is denied|errno 13|winerror 5\b",
                 re.IGNORECASE),
-     "Windows blocked access to a file or folder.",
+     "Access to a file or folder was blocked.",
      ("Choose a folder you own in Settings > Saving (for example Videos), "
       "or close any program that has the file open.")),
     (re.compile(r"ffmpeg not found|ffmpeg.*(no such file|cannot find)|"
