@@ -5,6 +5,10 @@ the git release tags (bare `X.Y.Z`, no `v` prefix).
 
 ## [Unreleased]
 
+### Docs
+
+- README: example screenshot in `docs/images/` (example data only).
+
 ### Fixed
 - The "access blocked" error no longer blames Windows on macOS and Linux.
 - A hotkey that cannot be registered on Linux or macOS now says why (root or
