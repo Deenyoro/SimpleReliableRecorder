@@ -10,6 +10,8 @@ an independent watchdog process raises an OS alert even if the app itself
 hangs. Every alert channel (sound, gold banner, taskbar flash, watchdog alert)
 and the background watchdog can be turned on or off in Settings.
 
+![SimpleReliableRecorder main window: a microphone and system sound as sources with volume and mute, screen recording on, and the list of earlier recordings](docs/images/main-window.png)
+
 ## Features
 
 - **Audio**: any number of microphones plus system-playback devices (WASAPI
